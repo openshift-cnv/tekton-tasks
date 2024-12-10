@@ -1,0 +1,30 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: fbc-post-release
+spec:
+  description: WIP
+  params:
+    - name: released_version
+      type: string
+    - name: snapshot
+      type: string
+  tasks:
+    - name: get-info
+      params:
+        - name: SNAPSHOT
+          value: "$(params.snapshot)"
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+        steps:
+          - name: get-info
+            image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+            script: |
+              #!/usr/bin/env sh
+              set -eo pipefail
+
+              echo $(params.SNAPSHOT)
+              get-resource "snapshot" $(params.SNAPSHOT)

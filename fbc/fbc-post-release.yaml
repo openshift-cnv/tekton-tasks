@@ -6,8 +6,6 @@ metadata:
 spec:
   description: WIP
   params:
-    - name: released_version
-      type: string
     - name: snapshot
       type: string
   tasks:

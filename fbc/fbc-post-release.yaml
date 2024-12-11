@@ -13,16 +13,28 @@ spec:
       params:
         - name: SNAPSHOT
           value: "$(params.snapshot)"
+        - name: IIB_INDEX_IMAGE
+          value: "$(results.iibIndexImage)"
       taskSpec:
         params:
           - name: SNAPSHOT
             type: string
+          - name: IIB_INDEX_IMAGE
+            type: string
         steps:
           - name: get-info
-            image: quay.io/konflux-ci/release-service-utils:e633d51cd41d73e4b3310face21bb980af7a662f
+            image: quay.io/konflux-ci/release-service-utils:cd12f6a509363ae511bf09d50be73d5edb416cdd
             script: |
-              #!/usr/bin/env sh
-              set -eo pipefail
+              #!/usr/bin/env bash
+              set -exo pipefail
 
               echo $(params.SNAPSHOT)
+              echo $(params.IIB_INDEX_IMAGE)
+
+              snapshot=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              snapshot_data=$(kubectl get snapshot $snapshot -oyaml)
+              fbc_fragment=$(echo $snapshot_data | yq '.spec.components[0].containerImage')
+              git_commit=$(echo $snapshot_data | yq '.spec.components[0].source.git.revision')
+              git_repo=$(echo $snapshot_data | yq '.spec.components[0].source.git.url')
+
               get-resource "snapshot" $(params.SNAPSHOT)

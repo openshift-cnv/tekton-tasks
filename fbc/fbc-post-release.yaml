@@ -8,13 +8,15 @@ spec:
   params:
     - name: snapshot
       type: string
+    - name: iibIndexImage
+      type: string
   tasks:
     - name: get-info
       params:
         - name: SNAPSHOT
           value: "$(params.snapshot)"
         - name: IIB_INDEX_IMAGE
-          value: "$(results.iibIndexImage)"
+          value: "$(params.iibIndexImage)"
       taskSpec:
         params:
           - name: SNAPSHOT

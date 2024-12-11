@@ -8,20 +8,26 @@ spec:
   params:
     - name: snapshot
       type: string
-    - name: iibIndexImage
+    - name: cnv_version
+      type: string
+    - name: releaseplan_id
       type: string
   tasks:
     - name: get-info
       params:
         - name: SNAPSHOT
           value: "$(params.snapshot)"
-        - name: IIB_INDEX_IMAGE
-          value: "$(params.iibIndexImage)"
+        - name: CNV_VERSION
+          value: "$(params.cnv_version)"
+        - name: RELEASEPLAN_ID
+          value: "$(params.releaseplan_id)"
       taskSpec:
         params:
           - name: SNAPSHOT
             type: string
-          - name: IIB_INDEX_IMAGE
+          - name: CNV_VERSION
+            type: string
+          - name: RELEASEPLAN_ID
             type: string
         steps:
           - name: get-info
@@ -30,11 +36,20 @@ spec:
               #!/usr/bin/env bash
               set -exo pipefail
 
-              echo $(params.SNAPSHOT)
-              echo $(params.IIB_INDEX_IMAGE)
+              snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              snapshot_data=$(kubectl get snapshot $snapshot_id -oyaml)
 
-              snapshot=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
-              snapshot_data=$(kubectl get snapshot $snapshot -oyaml)
+              release_id=$(kubectl get release -o json | \
+              jq -r --arg snapshot "$snapshot_id" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
+              '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | head -n 1)
+
+              managed_pipelinerun=$(kubectl get release $release_id -oyaml | yq '.status.managedProcessing.pipelineRun')
+              managed_ns=$(echo "$managed_pipelinerun" | awk -F'/' '{print $1}')
+              managed_pipelinerun=$(echo "$managed_pipelinerun" | awk -F'/' '{print $2}')
+
+              index_image=$(kubectl get pipelinerun $managed_pipelinerun -n $managed_ns -oyaml | yq '.status.results[] | select(.name == "iibIndexImage") | .value')
+              from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:$(params.CNV_VERSION)"
+
               fbc_fragment=$(echo $snapshot_data | yq '.spec.components[0].containerImage')
               git_commit=$(echo $snapshot_data | yq '.spec.components[0].source.git.revision')
               git_repo=$(echo $snapshot_data | yq '.spec.components[0].source.git.url')

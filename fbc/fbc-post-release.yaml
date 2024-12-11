@@ -39,9 +39,13 @@ spec:
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
               snapshot_data=$(kubectl get snapshot $snapshot_id -oyaml)
 
-              release_id=$(kubectl get release -o json | \
+              fbc_fragment=$(echo $snapshot_data | yq '.spec.components[0].containerImage')
+              git_commit=$(echo $snapshot_data | yq '.spec.components[0].source.git.revision')
+              git_repo=$(echo $snapshot_data | yq '.spec.components[0].source.git.url')
+
+              release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
               jq -r --arg snapshot "$snapshot_id" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
-              '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | head -n 1)
+              '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
 
               managed_pipelinerun=$(kubectl get release $release_id -oyaml | yq '.status.managedProcessing.pipelineRun')
               managed_ns=$(echo "$managed_pipelinerun" | awk -F'/' '{print $1}')
@@ -49,9 +53,3 @@ spec:
 
               index_image=$(kubectl get pipelinerun $managed_pipelinerun -n $managed_ns -oyaml | yq '.status.results[] | select(.name == "iibIndexImage") | .value')
               from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:$(params.CNV_VERSION)"
-
-              fbc_fragment=$(echo $snapshot_data | yq '.spec.components[0].containerImage')
-              git_commit=$(echo $snapshot_data | yq '.spec.components[0].source.git.revision')
-              git_repo=$(echo $snapshot_data | yq '.spec.components[0].source.git.url')
-
-              get-resource "snapshot" $(params.SNAPSHOT)

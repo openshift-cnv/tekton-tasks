@@ -40,8 +40,6 @@ spec:
               snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
 
               fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
-              git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
-              git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
 
               release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
               jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
@@ -51,5 +49,15 @@ spec:
               managed_ns=$(echo "${managed_pipelinerun}" | awk -F'/' '{print $1}')
               managed_pipelinerun=$(echo "${managed_pipelinerun}" | awk -F'/' '{print $2}')
 
-              index_image=$(kubectl get pipelinerun "${managed_pipelinerun}" -n "${managed_ns}" -oyaml | yq '.status.results[] | select(.name == "iibIndexImage") | .value')
+              # index_image=$(kubectl get pipelinerun "${managed_pipelinerun}" -n "${managed_ns}" -oyaml | yq '.status.results[] | select(.name == "iibIndexImage") | .value')
               from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:$(params.CNV_VERSION)"
+
+              git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
+              git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
+              mkdir cnv-fbc && cd cnv-fbc
+              git init
+              git remote add origin "${git_repo}.git"
+              git fetch origin "${git_commit}" --depth 1
+              git checkout "${git_commit}"
+              image_sha=$(yq '.image' $(params.CNV_VERSION)/updated_image.yaml)
+              channel=$(yq '.channel' $(params.CNV_VERSION)/updated_image.yaml)

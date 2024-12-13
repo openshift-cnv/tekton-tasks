@@ -54,7 +54,7 @@ spec:
 
               git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
               git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
-              mkdir cnv-fbc && cd cnv-fbc
+              gitdir=$(mktemp -d) && cd "${gitdir}"
               git init
               git remote add origin "${git_repo}.git"
               git fetch origin "${git_commit}" --depth 1

@@ -56,9 +56,11 @@ spec:
               git checkout "${git_commit}"
               image_sha=$(yq '.image' $(params.CNV_VERSION)/updated_image.yaml)
               channel=$(yq '.channel' $(params.CNV_VERSION)/updated_image.yaml)
+              hco_bundle_version=$(yq '.hco-bundle-version' $(params.CNV_VERSION)/updated_image.yaml)
 
               echo "index_image: ${index_image}"
               echo "from_index: ${from_index}"
               echo "fbc_fragment: ${fbc_fragment}"
               echo "image_sha to ensure integrity: ${image_sha}"
               echo "channel: ${channel}"
+              echo "hco-bundle-version: ${hco_bundle_version}"

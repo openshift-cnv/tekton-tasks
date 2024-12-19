@@ -68,12 +68,12 @@ spec:
 
               mkdir "$(params.CNV_VERSION)"
               touch "$(params.CNV_VERSION)/payload.yaml"
-              yq e '.index_image = ${index_image}' -i $(params.CNV_VERSION)/payload.yaml
-              yq e '.from_index = ${from_index}' -i $(params.CNV_VERSION)/payload.yaml
-              yq e '.fbc_fragment = ${fbc_fragment}' -i $(params.CNV_VERSION)/payload.yaml
-              yq e '.image_sha = ${image_sha}' -i $(params.CNV_VERSION)/payload.yaml
-              yq e '.channel = ${channel}' -i $(params.CNV_VERSION)/payload.yaml
-              yq e '.hco_bundle_version = ${hco_bundle_version}' -i $(params.CNV_VERSION)/payload.yaml
+              yq e '.index_image = "${index_image}"' -i $(params.CNV_VERSION)/payload.yaml
+              yq e '.from_index = "${from_index}"' -i $(params.CNV_VERSION)/payload.yaml
+              yq e '.fbc_fragment = "${fbc_fragment}"' -i $(params.CNV_VERSION)/payload.yaml
+              yq e '.image_sha = "${image_sha}"' -i $(params.CNV_VERSION)/payload.yaml
+              yq e '.channel = "${channel}"' -i $(params.CNV_VERSION)/payload.yaml
+              yq e '.hco_bundle_version = "${hco_bundle_version}"' -i $(params.CNV_VERSION)/payload.yaml
 
               git add .
               git commit -m "Update payload"

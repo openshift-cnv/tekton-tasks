@@ -32,6 +32,9 @@ spec:
         steps:
           - name: get-info
             image: quay.io/konflux-ci/release-service-utils:cd12f6a509363ae511bf09d50be73d5edb416cdd
+            envFrom:
+              - secretRef:
+                  name: cnv-ci-release-token
             script: |
               #!/usr/bin/env bash
               set -eo pipefail
@@ -49,7 +52,7 @@ spec:
 
               git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
               git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
-              gitdir=$(mktemp -d) && cd "${gitdir}"
+              gitfbcdir=$(mktemp -d) && cd "${gitfbcdir}"
               git init
               git remote add origin "${git_repo}.git"
               git fetch origin "${git_commit}" --depth 1
@@ -58,9 +61,20 @@ spec:
               channel=$(yq '.channel' $(params.CNV_VERSION)/updated_image.yaml)
               hco_bundle_version=$(yq '.hco-bundle-version' $(params.CNV_VERSION)/updated_image.yaml)
 
-              echo "index_image: ${index_image}"
-              echo "from_index: ${from_index}"
-              echo "fbc_fragment: ${fbc_fragment}"
-              echo "image_sha to ensure integrity: ${image_sha}"
-              echo "channel: ${channel}"
-              echo "hco-bundle-version: ${hco_bundle_version}"
+              gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
+              git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads.git && cd cnv-fbc-payloads
+              git config --global user.name "${github_username}"
+              git config --global user.email "no-reply@redhat.com"
+
+              mkdir "$(params.CNV_VERSION)"
+              touch "$(params.CNV_VERSION)/payload.yaml"
+              yq e '.index_image = ${index_image}' -i $(params.CNV_VERSION)/payload.yml
+              yq e '.from_index = ${from_index}' -i $(params.CNV_VERSION)/payload.yml
+              yq e '.fbc_fragment = ${fbc_fragment}' -i $(params.CNV_VERSION)/payload.yml
+              yq e '.image_sha = ${image_sha}' -i $(params.CNV_VERSION)/payload.yml
+              yq e '.channel = ${channel}' -i $(params.CNV_VERSION)/payload.yml
+              yq e '.hco_bundle_version = ${hco_bundle_version}' -i $(params.CNV_VERSION)/payload.yml
+
+              git add .
+              git commit -m "Update payload"
+              git push origin main

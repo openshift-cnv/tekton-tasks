@@ -66,7 +66,7 @@ spec:
               git config --global user.name "${github_username}"
               git config --global user.email "no-reply@redhat.com"
 
-              mkdir "$(params.CNV_VERSION)"
+              mkdir -p "$(params.CNV_VERSION)"
               touch "$(params.CNV_VERSION)/payload.yaml"
               yq e ".index_image = \"${index_image}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".from_index = \"${from_index}\"" -i $(params.CNV_VERSION)/payload.yaml

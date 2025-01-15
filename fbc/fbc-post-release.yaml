@@ -67,13 +67,15 @@ spec:
               git config --global user.email "no-reply@redhat.com"
 
               mkdir -p "$(params.CNV_VERSION)"
-              touch "$(params.CNV_VERSION)/payload.yaml"
+              echo "" > "$(params.CNV_VERSION)/payload.yaml"
               yq e ".index_image = \"${index_image}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".snapshot_id = \"${snapshot_id}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".from_index = \"${from_index}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".fbc_fragment = \"${fbc_fragment}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".image_sha = \"${image_sha}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".channel = \"${channel}\"" -i $(params.CNV_VERSION)/payload.yaml
+              yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i $(params.CNV_VERSION)/payload.yaml
+              image_base=$(echo "${image_sha}" | cut -d'@' -f1)
+              yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i $(params.CNV_VERSION)/payload.yaml
 
               git add .

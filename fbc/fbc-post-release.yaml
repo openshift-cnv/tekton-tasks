@@ -4,7 +4,7 @@ kind: Pipeline
 metadata:
   name: fbc-post-release
 spec:
-  description: WIP
+  description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
   params:
     - name: snapshot
       type: string
@@ -31,7 +31,7 @@ spec:
             type: string
         steps:
           - name: get-info
-            image: quay.io/konflux-ci/release-service-utils:cd12f6a509363ae511bf09d50be73d5edb416cdd
+            image: quay.io/konflux-ci/release-service-utils:0a58b6a6b562879e89395636d97931f2dcbb494c
             envFrom:
               - secretRef:
                   name: cnv-ci-release-token
@@ -40,13 +40,18 @@ spec:
               set -eo pipefail
 
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
-              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
-
-              fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
-
               release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
               jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
               '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
+
+              released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "Released") | .status')
+              if [ "$released_status" != "True" ]; then
+                echo "Release failed. Not continuing with post-release."
+                exit 1
+              fi
+
+              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
+              fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
               index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')
               from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:$(params.CNV_VERSION)"
 

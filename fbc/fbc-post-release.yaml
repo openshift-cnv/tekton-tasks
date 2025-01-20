@@ -44,7 +44,7 @@ spec:
               jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
               '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
 
-              released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "Released") | .status')
+              released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
               if [ "$released_status" != "True" ]; then
                 echo "Release failed. Not continuing with post-release."
                 exit 1

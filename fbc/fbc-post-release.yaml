@@ -79,7 +79,7 @@ spec:
               yq e ".snapshot_id = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
               yq e ".from_index = \"${from_index}\"" -i ${save_folder}/payload.yaml
               yq e ".fbc_fragment = \"${fbc_fragment}\"" -i ${save_folder}/payload.yaml
-              yq e ".channel = \"${channel}\"" -i ${save_folder}/payload.yaml
+              yq e ".channel = \"nightly\"" -i ${save_folder}/payload.yaml
               yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i ${save_folder}/payload.yaml
               image_base=$(echo "${image_sha}" | cut -d'@' -f1)
               yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml

@@ -50,10 +50,11 @@ spec:
                 exit 1
               fi
 
+              cnv_version="$(params.CNV_VERSION)"
               snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
               fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
               index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')
-              from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:$(params.CNV_VERSION)"
+              from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
 
               git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
               git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
@@ -62,28 +63,29 @@ spec:
               git remote add origin "${git_repo}.git"
               git fetch origin "${git_commit}" --depth 1
               git checkout "${git_commit}"
-              image_sha=$(yq '.image' $(params.CNV_VERSION)/updated_image.yaml)
-              channel=$(yq '.channel' $(params.CNV_VERSION)/updated_image.yaml)
-              hco_bundle_version=$(yq '.hco-bundle-version' $(params.CNV_VERSION)/updated_image.yaml)
+              image_sha=$(yq '.image' ${cnv_version}/updated_image.yaml)
+              channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
+              hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
 
               gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
               git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads.git && cd cnv-fbc-payloads
               git config --global user.name "${github_username}"
               git config --global user.email "no-reply@redhat.com"
 
-              mkdir -p "$(params.CNV_VERSION)"
-              echo "" > "$(params.CNV_VERSION)/payload.yaml"
-              yq e ".index_image = \"${index_image}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".snapshot_id = \"${snapshot_id}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".from_index = \"${from_index}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".fbc_fragment = \"${fbc_fragment}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".channel = \"${channel}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i $(params.CNV_VERSION)/payload.yaml
+              save_folder="${cnv_version//./-}/stages/nightly/build"
+              mkdir -p "${save_folder}"
+              echo "" > "${save_folder}/payload.yaml"
+              yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml
+              yq e ".snapshot_id = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
+              yq e ".from_index = \"${from_index}\"" -i ${save_folder}/payload.yaml
+              yq e ".fbc_fragment = \"${fbc_fragment}\"" -i ${save_folder}/payload.yaml
+              yq e ".channel = \"${channel}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i ${save_folder}/payload.yaml
               image_base=$(echo "${image_sha}" | cut -d'@' -f1)
-              yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".version = null" -i $(params.CNV_VERSION)/payload.yaml
-              yq e ".releasePlan = null" -i $(params.CNV_VERSION)/payload.yaml
+              yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".version = null" -i ${save_folder}/payload.yaml
+              yq e ".releasePlan = null" -i ${save_folder}/payload.yaml
 
               git add .
               git commit -m "Update payload"

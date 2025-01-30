@@ -82,6 +82,8 @@ spec:
               image_base=$(echo "${image_sha}" | cut -d'@' -f1)
               yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i $(params.CNV_VERSION)/payload.yaml
               yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i $(params.CNV_VERSION)/payload.yaml
+              yq e ".version = null" -i $(params.CNV_VERSION)/payload.yaml
+              yq e ".releasePlan = null" -i $(params.CNV_VERSION)/payload.yaml
 
               git add .
               git commit -m "Update payload"

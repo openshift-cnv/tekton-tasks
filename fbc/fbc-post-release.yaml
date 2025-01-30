@@ -72,7 +72,7 @@ spec:
               git config --global user.name "${github_username}"
               git config --global user.email "no-reply@redhat.com"
 
-              save_folder="${cnv_version//./-}/stages/nightly/build"
+              save_folder="${cnv_version//./-}/lanes/nightly/build"
               mkdir -p "${save_folder}"
               echo "" > "${save_folder}/payload.yaml"
               yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml

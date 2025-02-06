@@ -1,0 +1,94 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: fbc-post-release
+spec:
+  description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
+  params:
+    - name: snapshot
+      type: string
+    - name: cnv_version
+      type: string
+    - name: releaseplan_id
+      type: string
+  tasks:
+    - name: get-info
+      params:
+        - name: SNAPSHOT
+          value: "$(params.snapshot)"
+        - name: CNV_VERSION
+          value: "$(params.cnv_version)"
+        - name: RELEASEPLAN_ID
+          value: "$(params.releaseplan_id)"
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+          - name: CNV_VERSION
+            type: string
+          - name: RELEASEPLAN_ID
+            type: string
+        steps:
+          - name: get-info
+            image: quay.io/konflux-ci/release-service-utils:0a58b6a6b562879e89395636d97931f2dcbb494c
+            envFrom:
+              - secretRef:
+                  name: cnv-ci-release-token
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
+              jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
+              '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
+
+              released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
+              if [ "$released_status" != "True" ]; then
+                echo "Release failed. Not continuing with post-release."
+                exit 1
+              fi
+
+              cnv_version="$(params.CNV_VERSION)"
+              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
+              fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
+              index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')
+              from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
+
+              git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
+              git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
+              gitfbcdir=$(mktemp -d) && cd "${gitfbcdir}"
+              git init
+              git remote add origin "${git_repo}.git"
+              git fetch origin "${git_commit}" --depth 1
+              git checkout "${git_commit}"
+              image_sha=$(yq '.image' ${cnv_version}/updated_image.yaml)
+              channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
+              hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
+
+              gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
+              git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads.git && cd cnv-fbc-payloads
+              git config --global user.name "${github_username}"
+              git config --global user.email "no-reply@redhat.com"
+
+              save_folder="${cnv_version//./-}/lanes/${channel}/build"
+              mkdir -p "${save_folder}"
+              echo "" > "${save_folder}/payload.yaml"
+              yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml
+              yq e ".snapshot_id = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
+              yq e ".from_index = \"${from_index}\"" -i ${save_folder}/payload.yaml
+              yq e ".fbc_fragment = \"${fbc_fragment}\"" -i ${save_folder}/payload.yaml
+              yq e ".channel = \"${channel}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i ${save_folder}/payload.yaml
+              image_base=$(echo "${image_sha}" | cut -d'@' -f1)
+              yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".version = null" -i ${save_folder}/payload.yaml
+              yq e ".releasePlan = null" -i ${save_folder}/payload.yaml
+              yq e ".freightName = null" -i ${save_folder}/payload.yaml
+              yq e ".freightID = null" -i ${save_folder}/payload.yaml
+
+              git add .
+              git commit -m "Update payload"
+              git push origin main

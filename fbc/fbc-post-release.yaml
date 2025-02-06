@@ -86,6 +86,8 @@ spec:
               yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
               yq e ".version = null" -i ${save_folder}/payload.yaml
               yq e ".releasePlan = null" -i ${save_folder}/payload.yaml
+              yq e ".freightName = null" -i ${save_folder}/payload.yaml
+              yq e ".freightID = null" -i ${save_folder}/payload.yaml
 
               git add .
               git commit -m "Update payload"

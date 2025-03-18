@@ -91,6 +91,14 @@ spec:
               yq e ".freightName = null" -i ${save_folder}/payload.yaml
               yq e ".freightID = null" -i ${save_folder}/payload.yaml
               yq e ".prNumber = null" -i ${save_folder}/payload.yaml
+              # add a firstRelease flag to the payload
+              patch_version=$(echo "$hco_bundle_version" | grep -oP 'v\d+\.\d+\.\K\d+')
+              if [ "$patch_version" -eq 0 ]; then
+                yq -i '.firstRelease = true' ${save_folder}/payload.yaml
+              else
+                yq -i '.firstRelease = false' ${save_folder}/payload.yaml
+              fi
+
 
               git add .
               git commit -m "Update payload"

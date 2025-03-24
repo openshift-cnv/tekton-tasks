@@ -5,6 +5,13 @@ metadata:
   name: fbc-post-release
 spec:
   description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
+  finally:
+    - name: send-notification
+      params:
+      - name: message
+        type: string
+      - name: result
+      
   params:
     - name: snapshot
       type: string

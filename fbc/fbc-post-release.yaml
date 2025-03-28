@@ -67,6 +67,10 @@ spec:
               channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
               hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
 
+              if [[ $hco_bundle_version == v4.99* ]]; then
+                cnv_version="v4.99"
+              fi
+
               gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
               git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads.git && cd cnv-fbc-payloads
               git config --global user.name "${github_username}"

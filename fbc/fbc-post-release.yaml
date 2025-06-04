@@ -90,9 +90,9 @@ spec:
               yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
               # Add the minor version number from the bundle for Kargo
               yq e '.minorVersion = (.hco_bundle_version | split("-") | .[0])' -i ${save_folder}/payload.yaml
-              yq e ".version = null" -i ${save_folder}/payload.yaml
-              yq e ".releasePlan = null" -i ${save_folder}/payload.yaml
-              yq e ".freightName = null" -i ${save_folder}/payload.yaml
+              yq e ".version = \"${cnv_version//./-}\"" -i ${save_folder}/payload.yaml
+              yq e ".releasePlan = \"stage\"" -i ${save_folder}/payload.yaml
+              yq e ".freightName = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
               yq e ".freightID = null" -i ${save_folder}/payload.yaml
               yq e ".prNumber = null" -i ${save_folder}/payload.yaml
               # add a firstRelease flag to the payload

@@ -8,8 +8,6 @@ spec:
   params:
     - name: snapshot
       type: string
-    - name: cnv_version
-      type: string
     - name: releaseplan_id
       type: string
   tasks:
@@ -17,15 +15,11 @@ spec:
       params:
         - name: SNAPSHOT
           value: "$(params.snapshot)"
-        - name: CNV_VERSION
-          value: "$(params.cnv_version)"
         - name: RELEASEPLAN_ID
           value: "$(params.releaseplan_id)"
       taskSpec:
         params:
           - name: SNAPSHOT
-            type: string
-          - name: CNV_VERSION
             type: string
           - name: RELEASEPLAN_ID
             type: string
@@ -50,7 +44,7 @@ spec:
                 exit 1
               fi
 
-              cnv_version="$(params.CNV_VERSION)"
+              cnv_version="$(kubectl get release "${release_id}" -oyaml | yq '.metadata.labels["appstudio.openshift.io/component"]' | sed -E 's/^v([0-9]+)-([0-9]+).*/v\1.\2/')"
               snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
               fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
               index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')

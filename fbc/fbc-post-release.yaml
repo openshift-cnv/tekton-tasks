@@ -12,6 +12,9 @@ spec:
       type: string
     - name: releaseplan_id
       type: string
+  workspaces:
+    - name: test-artifacts
+      description: Workspace to store test artifacts
   tasks:
     - name: get-info
       params:
@@ -108,3 +111,180 @@ spec:
               git add .
               git commit -m "Update payload $hco_bundle_version"
               git push origin main
+    - name: create-ephemeral-cluster
+      runAfter:
+        - get-info
+      params:
+        - name: CNV_VERSION
+          value: "$(params.cnv_version)"
+      workspaces:
+        - name: test-artifacts
+          workspace: test-artifacts
+      taskSpec:
+        params:
+          - name: CNV_VERSION
+            type: string
+        workspaces:
+          - name: test-artifacts
+            description: Workspace to store cluster configuration
+        results:
+          - name: kubeconfig
+            description: Path to the kubeconfig file
+          - name: cluster-name
+            description: Name of the created cluster
+        steps:
+          - name: create-cluster
+            ref:
+              resolver: git
+              params:
+                - name: url
+                  value: https://github.com/konflux-ci/build-definitions.git
+                - name: revision
+                  value: main
+                - name: pathInRepo
+                  value: stepactions/eaas-create-ephemeral-cluster-hypershift-aws/0.1/eaas-create-ephemeral-cluster-hypershift-aws.yaml
+            params:
+              - name: cluster-name
+                value: "cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
+              - name: version
+                value: "$(params.CNV_VERSION)"
+            env:
+              - name: KUBECONFIG
+                value: "/workspace/test-artifacts/kubeconfig"
+              - name: CLUSTER_NAME
+                value: "cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
+          - name: store-kubeconfig
+            image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -ex
+              
+              # Ensure kubeconfig was created
+              if [ ! -f "/workspace/test-artifacts/kubeconfig" ]; then
+                echo "ERROR: Kubeconfig not found!"
+                exit 1
+              fi
+              
+              CLUSTER_NAME="cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
+              echo "Cluster created successfully: ${CLUSTER_NAME}"
+              echo "Kubeconfig stored at: /workspace/test-artifacts/kubeconfig"
+              
+              echo -n "/workspace/test-artifacts/kubeconfig" > $(results.kubeconfig.path)
+              echo -n "${CLUSTER_NAME}" > $(results.cluster-name.path)
+    - name: cnv-tests-smoke
+      runAfter:
+        - get-info
+        - create-ephemeral-cluster
+      params:
+        - name: CNV_VERSION
+          value: "$(params.cnv_version)"
+        - name: KUBECONFIG_PATH
+          value: "$(tasks.create-ephemeral-cluster.results.kubeconfig)"
+      workspaces:
+        - name: test-artifacts
+          workspace: test-artifacts
+      taskSpec:
+        params:
+          - name: CNV_VERSION
+            type: string
+          - name: KUBECONFIG_PATH
+            type: string
+        workspaces:
+          - name: test-artifacts
+            description: Workspace to store test artifacts
+        volumes:
+          - name: tests-cache-volume
+            emptyDir: {}
+        results:
+          - name: artifacts-path
+            description: Path to the test artifacts
+        steps:
+          - name: run-cnv-tests
+            image: quay.io/openshift-cnv/openshift-virtualization-tests:$(params.CNV_VERSION)
+            volumeMounts:
+              - name: tests-cache-volume
+                mountPath: /cache
+            workspaces:
+              - name: test-artifacts
+                mountPath: /workspace/test-artifacts
+            env:
+              - name: KUBECONFIG
+                value: "$(params.KUBECONFIG_PATH)"
+              - name: CNV_TESTS_DIR
+                value: "/openshift-virtualization-tests"
+              - name: STORAGECLASS
+                value: "ocs-storagecluster-ceph-rbd"
+              - name: VOLUME_MODE
+                value: "Block"
+              - name: PYTEST_PARAMS
+                value: ""
+            script: |
+              #!/bin/bash
+              set -ex
+              
+              # Create test results directory with timestamp
+              RESULTS_DIR="/workspace/test-artifacts/cnv-tests-$(params.CNV_VERSION)-$(date +%Y%m%d-%H%M%S)"
+              mkdir -p "${RESULTS_DIR}/tests-collected-info"
+              
+              echo "Running CNV tests for version: $(params.CNV_VERSION)"
+              echo "Results will be stored in: ${RESULTS_DIR}"
+              
+              cd ${CNV_TESTS_DIR}
+              eval uv run --verbose --cache-dir /cache/.cache/uv pytest tests \
+                --junitxml="${RESULTS_DIR}/xunit_results.xml" \
+                --pytest-log-file="${RESULTS_DIR}/pytest-tests.log" \
+                --data-collector \
+                --html="${RESULTS_DIR}/report.html" --self-contained-html \
+                ${PYTEST_PARAMS} \
+                --tc default_storage_class:${STORAGECLASS} \
+                --storage-class-matrix=${STORAGECLASS} \
+                --tc default_volume_mode:${VOLUME_MODE} \
+                --latest-rhel \
+                -o log_cli=true -s -rs \
+                -m smoke \
+                --tb=native
+              
+              # Write the results path to the task result
+              echo -n "${RESULTS_DIR}" > $(results.artifacts-path.path)
+  finally:
+    - name: cleanup-ephemeral-cluster
+      params:
+        - name: CLUSTER_NAME
+          value: "$(tasks.create-ephemeral-cluster.results.cluster-name)"
+        - name: KUBECONFIG_PATH
+          value: "$(tasks.create-ephemeral-cluster.results.kubeconfig)"
+      workspaces:
+        - name: test-artifacts
+          workspace: test-artifacts
+      taskSpec:
+        params:
+          - name: CLUSTER_NAME
+            type: string
+          - name: KUBECONFIG_PATH
+            type: string
+        workspaces:
+          - name: test-artifacts
+            description: Workspace containing cluster configuration
+        steps:
+          - name: destroy-cluster
+            ref:
+              resolver: git
+              params:
+                - name: url
+                  value: https://github.com/konflux-ci/build-definitions.git
+                - name: revision
+                  value: main
+                - name: pathInRepo
+                  value: stepactions/eaas-destroy-ephemeral-cluster-hypershift-aws/0.1/eaas-destroy-ephemeral-cluster-hypershift-aws.yaml
+            params:
+              - name: cluster-name
+                value: "$(params.CLUSTER_NAME)"
+            env:
+              - name: KUBECONFIG
+                value: "$(params.KUBECONFIG_PATH)"
+          - name: cleanup-confirmation
+            image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -ex
+              echo "Ephemeral cluster $(params.CLUSTER_NAME) has been destroyed"

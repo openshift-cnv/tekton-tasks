@@ -10,6 +10,8 @@ spec:
       type: string
     - name: releaseplan_id
       type: string
+    - name: environment
+      type: string
   tasks:
     - name: get-info
       params:
@@ -17,11 +19,15 @@ spec:
           value: "$(params.snapshot)"
         - name: RELEASEPLAN_ID
           value: "$(params.releaseplan_id)"
+        - name: ENVIRONMENT
+          value: "$(params.ENVIRONMENT)"
       taskSpec:
         params:
           - name: SNAPSHOT
             type: string
           - name: RELEASEPLAN_ID
+            type: string
+          - name: ENVIRONMENT
             type: string
         steps:
           - name: get-info
@@ -70,7 +76,20 @@ spec:
               git config --global user.name "${github_username}"
               git config --global user.email "no-reply@redhat.com"
 
-              save_folder="${cnv_version//./-}/lanes/${channel}/stage"
+              case $(params.ENVIRONMENT) in
+              "production")
+                NEXT_STAGE="verify-production-release"
+                ;;
+              "stage")
+                NEXT_STAGE="stage"
+                ;;
+              *)
+                echo "Unknown environment: $(params.ENVIRONMENT)"
+                exit 1
+                ;;
+              esac
+
+              save_folder="${cnv_version//./-}/lanes/${channel}/${NEXT_STAGE}"
               mkdir -p "${save_folder}"
               echo "" > "${save_folder}/payload.yaml"
               yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml
@@ -86,7 +105,7 @@ spec:
               yq e '.minorVersion = (.hco_bundle_version | split("-") | .[0])' -i ${save_folder}/payload.yaml
               yq e '.rhelVersion = (.minorVersion | split(".") | .[3])' -i ${save_folder}/payload.yaml
               yq e ".version = \"${cnv_version//./-}\"" -i ${save_folder}/payload.yaml
-              yq e ".releasePlan = \"stage\"" -i ${save_folder}/payload.yaml
+              yq e ".releasePlan = \"${NEXT_STAGE}\"" -i ${save_folder}/payload.yaml
               yq e ".freightName = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
               yq e ".freightID = null" -i ${save_folder}/payload.yaml
               yq e ".prNumber = null" -i ${save_folder}/payload.yaml

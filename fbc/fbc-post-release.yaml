@@ -24,7 +24,7 @@ spec:
         - name: RELEASEPLAN_ID
           value: "$(params.releaseplan_id)"
         - name: ENVIRONMENT
-          value: "$(params.ENVIRONMENT)"
+          value: "$(params.environment)"
       taskSpec:
         params:
           - name: SNAPSHOT

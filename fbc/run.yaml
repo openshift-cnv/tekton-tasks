@@ -1,0 +1,17 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: fbc-post-release-run-
+spec:
+  pipelineRef:
+    name: fbc-post-release
+  params:
+    - name: snapshot
+      value: "not-used"  # Not used with get-info excluded
+    - name: cnv_version
+      value: "4.19"  # Replace with your CNV version
+    - name: releaseplan_id
+      value: "not-used"  # Not used with get-info excluded
+  workspaces:
+    - name: test-artifacts
+      emptyDir: {}

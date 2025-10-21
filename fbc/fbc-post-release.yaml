@@ -12,117 +12,125 @@ spec:
       type: string
     - name: releaseplan_id
       type: string
+    - name: instance_type
+      type: string
+      default: "c5n.metal"
+      description: AWS EC2 instance type for the ephemeral cluster
   workspaces:
     - name: test-artifacts
       description: Workspace to store test artifacts
   tasks:
-    - name: get-info
-      params:
-        - name: SNAPSHOT
-          value: "$(params.snapshot)"
-        - name: CNV_VERSION
-          value: "$(params.cnv_version)"
-        - name: RELEASEPLAN_ID
-          value: "$(params.releaseplan_id)"
-      taskSpec:
-        params:
-          - name: SNAPSHOT
-            type: string
-          - name: CNV_VERSION
-            type: string
-          - name: RELEASEPLAN_ID
-            type: string
-        steps:
-          - name: get-info
-            image: quay.io/konflux-ci/release-service-utils:0a58b6a6b562879e89395636d97931f2dcbb494c
-            envFrom:
-              - secretRef:
-                  name: cnv-ci-release-token
-            script: |
-              #!/usr/bin/env bash
-              set -eo pipefail
+    # - name: get-info
+    #   params:
+    #     - name: SNAPSHOT
+    #       value: "$(params.snapshot)"
+    #     - name: CNV_VERSION
+    #       value: "$(params.cnv_version)"
+    #     - name: RELEASEPLAN_ID
+    #       value: "$(params.releaseplan_id)"
+    #   taskSpec:
+    #     params:
+    #       - name: SNAPSHOT
+    #         type: string
+    #       - name: CNV_VERSION
+    #         type: string
+    #       - name: RELEASEPLAN_ID
+    #         type: string
+    #     steps:
+    #       - name: get-info
+    #         image: quay.io/konflux-ci/release-service-utils:0a58b6a6b562879e89395636d97931f2dcbb494c
+    #         envFrom:
+    #           - secretRef:
+    #               name: cnv-ci-release-token
+    #         script: |
+    #           #!/usr/bin/env bash
+    #           set -eo pipefail
 
-              snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
-              release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
-              jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
-              '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
+    #           snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+    #           release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
+    #           jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
+    #           '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
 
-              released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
-              if [ "$released_status" != "True" ]; then
-                echo "Release failed. Not continuing with post-release."
-                exit 1
-              fi
+    #           released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
+    #           if [ "$released_status" != "True" ]; then
+    #             echo "Release failed. Not continuing with post-release."
+    #             exit 1
+    #           fi
 
-              cnv_version="$(params.CNV_VERSION)"
-              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
-              fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
-              index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')
-              from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
+    #           cnv_version="$(params.CNV_VERSION)"
+    #           snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
+    #           fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
+    #           index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')
+    #           from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
 
-              git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
-              git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
-              gitfbcdir=$(mktemp -d) && cd "${gitfbcdir}"
-              git init
-              git remote add origin "${git_repo}.git"
-              git fetch origin "${git_commit}" --depth 1
-              git checkout "${git_commit}"
-              image_sha=$(yq '.image' ${cnv_version}/updated_image.yaml)
-              channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
-              hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
+    #           git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
+    #           git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
+    #           gitfbcdir=$(mktemp -d) && cd "${gitfbcdir}"
+    #           git init
+    #           git remote add origin "${git_repo}.git"
+    #           git fetch origin "${git_commit}" --depth 1
+    #           git checkout "${git_commit}"
+    #           image_sha=$(yq '.image' ${cnv_version}/updated_image.yaml)
+    #           channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
+    #           hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
 
-              if [[ $hco_bundle_version == v4.99* ]]; then
-                cnv_version="v4.99"
-              fi
+    #           if [[ $hco_bundle_version == v4.99* ]]; then
+    #             cnv_version="v4.99"
+    #           fi
 
-              gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
-              git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads-new.git && cd cnv-fbc-payloads-new
-              git config --global user.name "${github_username}"
-              git config --global user.email "no-reply@redhat.com"
+    #           gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
+    #           git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads-new.git && cd cnv-fbc-payloads-new
+    #           git config --global user.name "${github_username}"
+    #           git config --global user.email "no-reply@redhat.com"
 
-              save_folder="${cnv_version//./-}/lanes/${channel}/stage"
-              mkdir -p "${save_folder}"
-              echo "" > "${save_folder}/payload.yaml"
-              yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml
-              yq e ".snapshot_id = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
-              yq e ".from_index = \"${from_index}\"" -i ${save_folder}/payload.yaml
-              yq e ".fbc_fragment = \"${fbc_fragment}\"" -i ${save_folder}/payload.yaml
-              yq e ".channel = \"${channel}\"" -i ${save_folder}/payload.yaml
-              yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i ${save_folder}/payload.yaml
-              image_base=$(echo "${image_sha}" | cut -d'@' -f1)
-              yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
-              yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
-              # Add the minor version number from the bundle for Kargo
-              yq e '.minorVersion = (.hco_bundle_version | split("-") | .[0])' -i ${save_folder}/payload.yaml
-              yq e '.rhelVersion = (.minorVersion | split(".") | .[3])' -i ${save_folder}/payload.yaml
-              yq e ".version = \"${cnv_version//./-}\"" -i ${save_folder}/payload.yaml
-              yq e ".releasePlan = \"stage\"" -i ${save_folder}/payload.yaml
-              yq e ".freightName = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
-              yq e ".freightID = null" -i ${save_folder}/payload.yaml
-              yq e ".prNumber = null" -i ${save_folder}/payload.yaml
-              # add a firstRelease flag to the payload
-              patch_version=$(echo "$hco_bundle_version" | grep -oP 'v\d+\.\d+\.\K\d+')
-              if [ "$patch_version" -eq 0 ]; then
-                yq -i '.firstRelease = true' ${save_folder}/payload.yaml
-              else
-                yq -i '.firstRelease = false' ${save_folder}/payload.yaml
-              fi
+    #           save_folder="${cnv_version//./-}/lanes/${channel}/stage"
+    #           mkdir -p "${save_folder}"
+    #           echo "" > "${save_folder}/payload.yaml"
+    #           yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".snapshot_id = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".from_index = \"${from_index}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".fbc_fragment = \"${fbc_fragment}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".channel = \"${channel}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i ${save_folder}/payload.yaml
+    #           image_base=$(echo "${image_sha}" | cut -d'@' -f1)
+    #           yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+    #           # Add the minor version number from the bundle for Kargo
+    #           yq e '.minorVersion = (.hco_bundle_version | split("-") | .[0])' -i ${save_folder}/payload.yaml
+    #           yq e '.rhelVersion = (.minorVersion | split(".") | .[3])' -i ${save_folder}/payload.yaml
+    #           yq e ".version = \"${cnv_version//./-}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".releasePlan = \"stage\"" -i ${save_folder}/payload.yaml
+    #           yq e ".freightName = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
+    #           yq e ".freightID = null" -i ${save_folder}/payload.yaml
+    #           yq e ".prNumber = null" -i ${save_folder}/payload.yaml
+    #           # add a firstRelease flag to the payload
+    #           patch_version=$(echo "$hco_bundle_version" | grep -oP 'v\d+\.\d+\.\K\d+')
+    #           if [ "$patch_version" -eq 0 ]; then
+    #             yq -i '.firstRelease = true' ${save_folder}/payload.yaml
+    #           else
+    #             yq -i '.firstRelease = false' ${save_folder}/payload.yaml
+    #           fi
 
 
-              git add .
-              git commit -m "Update payload $hco_bundle_version"
-              git push origin main
+    #           git add .
+    #           git commit -m "Update payload $hco_bundle_version"
+    #           git push origin main
     - name: create-ephemeral-cluster
-      runAfter:
-        - get-info
+      # runAfter:
+      #   - get-info
       params:
         - name: CNV_VERSION
           value: "$(params.cnv_version)"
+        - name: INSTANCE_TYPE
+          value: "$(params.instance_type)"
       workspaces:
         - name: test-artifacts
           workspace: test-artifacts
       taskSpec:
         params:
           - name: CNV_VERSION
+            type: string
+          - name: INSTANCE_TYPE
             type: string
         workspaces:
           - name: test-artifacts
@@ -133,6 +141,15 @@ spec:
           - name: cluster-name
             description: Name of the created cluster
         steps:
+          - name: prepare-env
+            image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+            script: |
+              #!/bin/bash
+              set -ex
+              
+              # Prepare workspace directory
+              mkdir -p /workspace/test-artifacts
+              echo "Workspace prepared for cluster creation"
           - name: create-cluster
             ref:
               resolver: git
@@ -144,36 +161,47 @@ spec:
                 - name: pathInRepo
                   value: stepactions/eaas-create-ephemeral-cluster-hypershift-aws/0.1/eaas-create-ephemeral-cluster-hypershift-aws.yaml
             params:
-              - name: cluster-name
-                value: "cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
+              - name: eaasSpaceSecretRef
+                value: "eaas-space-credentials"  # You'll need to create this secret
               - name: version
                 value: "$(params.CNV_VERSION)"
-            env:
-              - name: KUBECONFIG
-                value: "/workspace/test-artifacts/kubeconfig"
-              - name: CLUSTER_NAME
-                value: "cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
+              - name: instanceType
+                value: "$(params.INSTANCE_TYPE)"
           - name: store-kubeconfig
             image: registry.access.redhat.com/ubi8/ubi-minimal:latest
+            env:
+              - name: CLUSTER_NAME_FROM_STEP
+                value: "$(steps.create-cluster.results.clusterName)"
             script: |
               #!/bin/bash
               set -ex
               
+              # The StepAction creates a kubeconfig at /workspace/test-artifacts/kubeconfig
+              KUBECONFIG="/workspace/test-artifacts/kubeconfig"
+              
+              # Get the cluster name from env var (populated from step result)
+              CLUSTER_NAME="${CLUSTER_NAME_FROM_STEP}"
+              
+              # If cluster name is empty, construct it ourselves
+              if [ -z "${CLUSTER_NAME}" ]; then
+                CLUSTER_NAME="cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
+              fi
+              
               # Ensure kubeconfig was created
-              if [ ! -f "/workspace/test-artifacts/kubeconfig" ]; then
-                echo "ERROR: Kubeconfig not found!"
+              if [ ! -f "${KUBECONFIG}" ]; then
+                echo "ERROR: Kubeconfig not found at ${KUBECONFIG}!"
+                ls -la /workspace/test-artifacts/
                 exit 1
               fi
               
-              CLUSTER_NAME="cnv-test-$(params.CNV_VERSION)-$(context.taskRun.uid)"
               echo "Cluster created successfully: ${CLUSTER_NAME}"
-              echo "Kubeconfig stored at: /workspace/test-artifacts/kubeconfig"
+              echo "Kubeconfig stored at: ${KUBECONFIG}"
               
-              echo -n "/workspace/test-artifacts/kubeconfig" > $(results.kubeconfig.path)
+              echo -n "${KUBECONFIG}" > $(results.kubeconfig.path)
               echo -n "${CLUSTER_NAME}" > $(results.cluster-name.path)
     - name: cnv-tests-smoke
       runAfter:
-        - get-info
+        # - get-info
         - create-ephemeral-cluster
       params:
         - name: CNV_VERSION
@@ -277,11 +305,10 @@ spec:
                 - name: pathInRepo
                   value: stepactions/eaas-destroy-ephemeral-cluster-hypershift-aws/0.1/eaas-destroy-ephemeral-cluster-hypershift-aws.yaml
             params:
-              - name: cluster-name
+              - name: eaasSpaceSecretRef
+                value: "eaas-space-credentials"  # Same secret as create
+              - name: clusterName
                 value: "$(params.CLUSTER_NAME)"
-            env:
-              - name: KUBECONFIG
-                value: "$(params.KUBECONFIG_PATH)"
           - name: cleanup-confirmation
             image: registry.access.redhat.com/ubi8/ubi-minimal:latest
             script: |

@@ -1,0 +1,29 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: fbc-post-release
+spec:
+  description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
+  params:
+    - name: snapshot
+      type: string
+  tasks:
+    - name: get-info
+      params:
+        - name: SNAPSHOT
+          value: "$(params.snapshot)"
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+        steps:
+          - name: get-info
+            image: quay.io/konflux-ci/release-service-utils:17783bdc643d73daac55017e3da47f99b83bca48
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              echo $snapshot_id
+              kubectl get snapshot $snapshot_id

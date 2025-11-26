@@ -32,11 +32,11 @@ spec:
               NAMESPACE=$(jq -r '.metadata.namespace' <<< "$SNAPSHOT_DATA")
               VERSION=$(echo "$NAMESPACE" | cut -d'-' -f1,2)
               REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
+              REPO_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
 
               git clone $REPO_URL --depth 1
               cd hco-bundle-registry
-              AUTH_REPO_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
-              git remote set-url origin "$AUTH_REPO_URL"
+              git remote set-url origin "$REPO_URL"
               git config user.name "submodule-sync"
               git config user.email "no-reply@redhat.com"
 

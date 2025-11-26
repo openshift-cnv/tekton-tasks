@@ -1,0 +1,59 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: update-bundle
+spec:
+  description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
+  params:
+    - name: snapshot
+      type: string
+  tasks:
+    - name: update-bundle
+      params:
+        - name: SNAPSHOT
+          value: "$(params.snapshot)"
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+        steps:
+          - name: update-bundle
+            image: quay.io/konflux-ci/release-service-utils@sha256:ab9fce5bf41c15f1475d660da302f935e0999143ef4c50606846b189cb742caf
+            envFrom:
+              - secretRef:
+                  name: hco-updater-gitlab-token
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              SNAPSHOT_ID=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              SNAPSHOT_DATA=$(kubectl get snapshot $SNAPSHOT_ID -ojson)
+              NAMESPACE=$(jq -r '.metadata.namespace' <<< "$SNAPSHOT_DATA")
+              VERSION=$(echo "$NAMESPACE" | cut -d'-' -f1,2)
+              REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
+
+              git clone $REPO_URL --depth 1
+              cd hco-bundle-registry
+              AUTH_REPO_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
+              git remote set-url origin "$AUTH_REPO_URL"
+              git config user.name "submodule-sync"
+              git config user.email "no-reply@redhat.com"
+
+              IMAGES=$(jq -r '.spec.components[].containerImage' <<< "$SNAPSHOT_DATA")
+              for img in $IMAGES; do
+                image_name_sha=$(echo "${img##*/}")
+                image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
+                
+                if [[ "$image_name" == *"-operator" ]]; then
+                  json_file="components/hco-bundle-registry/core-params.json"
+                else
+                  json_file="components/hco-bundle-registry/extra-params.json"
+                fi
+                jq ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
+              done
+
+              git add .
+              git commit -m "Update HCO bundle registry with new images"
+              git pull --rebase origin main
+              git push origin main

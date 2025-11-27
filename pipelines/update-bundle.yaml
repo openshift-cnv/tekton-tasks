@@ -41,6 +41,15 @@ spec:
               git config user.email "no-reply@redhat.com"
 
               IMAGES=$(jq -r '.spec.components[].containerImage' <<< "$SNAPSHOT_DATA")
+
+              # Make sure all the commits in every component are the same
+              if jq -e '[.spec.components[].source.git.revision] | unique | length == 1' <<< "$SNAPSHOT_DATA" > /dev/null; then
+                echo "The snapshot has all the components pointing to the same commit, continuing."
+              else
+                echo "Commits are inconsistent!"
+                exit 1
+              fi
+
               for img in $IMAGES; do
                 image_name_sha=$(echo "${img##*/}")
                 image_name=$(echo "$image_name_sha" | cut -d'@' -f1)

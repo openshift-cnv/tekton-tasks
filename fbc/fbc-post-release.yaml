@@ -59,7 +59,7 @@ spec:
               cnv_version="$(params.CNV_VERSION)"
               snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
               fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
-              index_image=$(kubectl get release "${release_id}" -oyaml | yq '.status.artifacts.index_image.index_image')
+              index_image=$(kubectl get release "${release_id}" -oyaml | yq ".status.artifacts.index_image.\"${cnv_version}\".index_image")
               from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
 
               git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')

@@ -54,7 +54,7 @@ spec:
                 image_name_sha=$(echo "${img##*/}")
                 image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
                 
-                if [[ "$image_name" == *"-operator" ]]; then
+                if [[ "$image_name" == *"-operator-"* ]]; then
                   json_file="components/hco-bundle-registry/core-params.json"
                 else
                   json_file="components/hco-bundle-registry/extra-params.json"

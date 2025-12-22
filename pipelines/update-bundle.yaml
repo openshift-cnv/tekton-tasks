@@ -30,6 +30,7 @@ spec:
               SNAPSHOT_ID=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
               SNAPSHOT_DATA=$(kubectl get snapshot $SNAPSHOT_ID -ojson)
               NAMESPACE=$(jq -r '.metadata.namespace' <<< "$SNAPSHOT_DATA")
+              APPLICATION=$(jq -r '.spec.application' <<< "$SNAPSHOT_DATA")
               VERSION=$(echo "$NAMESPACE" | cut -d'-' -f1,2)
               REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
               REPO_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
@@ -61,6 +62,16 @@ spec:
                 fi
                 jq ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
               done
+
+              snapshots_file="components/hco-bundle-registry/snapshots.json"
+              touch ${snapshots_file}
+              jq -n \
+                --slurpfile f "$snapshots_file" \
+                --arg app "$APPLICATION" \
+                --arg snap "$SNAPSHOT_ID" \
+                '$f[0] // {} | .[$app] = $snap' \
+              > "$snapshots_file.tmp" \
+              && mv "$snapshots_file.tmp" "$snapshots_file"
 
               git add .
               git commit -m "Update HCO bundle registry with new images"

@@ -87,9 +87,14 @@ spec:
               update_images_snapshots
 
               git add .
-              git commit -m "Update HCO bundle registry with new images"
-              git pull --rebase origin main
-              git push origin main
+              # Check if there are actually changes before committing
+              if ! git diff-index --quiet HEAD; then
+                git commit -m "Update HCO bundle registry with new images"
+                git pull --rebase origin main
+                git push origin main
+              else
+                echo "No changes detected in the bundle registry. Skipping git push."
+              fi
 
               if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
                 REPO_REVISION=$(jq -r '.spec.components[].source.git.revision' <<< "$SNAPSHOT_DATA")

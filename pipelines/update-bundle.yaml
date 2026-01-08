@@ -143,8 +143,8 @@ spec:
               git clone https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/release-chart.git --depth 1
               cd release-chart/release-orchestrator
               yq -i ".version = \"$BUNDLE_VERSION\"" Chart.yaml
-              yq -i ".global.releasePlan = \"TODO-RELEASEPLAN\""
-              yq -i ".global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\""
+              yq -i ".global.releasePlan = \"TODO-RELEASEPLAN\"" Chart.yaml
+              yq -i ".global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"" Chart.yaml
 
               # Update values.yaml with snapshots from SNAPSHOTS_TO_RELEASE
               echo "$SNAPSHOTS_TO_RELEASE" | jq -r '{snapshots: .}' | yq eval -P '.' > /tmp/snapshots_with_key.yaml

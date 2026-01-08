@@ -44,7 +44,7 @@ spec:
               REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
               REPO_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
 
-              git clone $REPO_URL --depth 1
+              git clone $REPO_URL --depth 50
               cd hco-bundle-registry
               git remote set-url origin "$REPO_URL"
               git config user.name "submodule-sync"

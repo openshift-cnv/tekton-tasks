@@ -124,7 +124,7 @@ spec:
                 readOnly: true
             script: |
               #!/usr/bin/env bash
-              set -exo pipefail
+              set -eo pipefail
 
               # Only continue if its releasing hco-bundle-registry
               if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
@@ -157,4 +157,4 @@ spec:
               PACKAGE_OUTPUT=$(helm package . 2>&1)
               PACKAGE_FILE=$(echo "${PACKAGE_OUTPUT}" | grep -oP 'Successfully packaged chart and saved it to: \K.*')
 
-              helm push $PACKAGE_FILE oci://${QUAY_URL}/release-orchestrator
+              helm push $PACKAGE_FILE oci://${QUAY_URL}

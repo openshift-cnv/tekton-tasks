@@ -17,9 +17,18 @@ spec:
         params:
           - name: SNAPSHOT
             type: string
+        results:
+          - name: snapshots-to-release
+            description: Contents of the snapshots.json file
+          - name: bundle-version
+            description: NVR of the bundle
+        volumes:
+          - name: quay-creds
+            secret:
+              secretName: quay-builds-creds
         steps:
           - name: update-bundle
-            image: quay.io/konflux-ci/release-service-utils@sha256:ab9fce5bf41c15f1475d660da302f935e0999143ef4c50606846b189cb742caf
+            image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
             envFrom:
               - secretRef:
                   name: hco-updater-gitlab-token
@@ -51,29 +60,93 @@ spec:
                 exit 1
               fi
 
-              for img in $IMAGES; do
-                image_name_sha=$(echo "${img##*/}")
-                image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
-                
-                if [[ "$image_name" == *"-operator-rhel"* ]]; then
-                  json_file="components/hco-bundle-registry/core-params.json"
-                else
-                  json_file="components/hco-bundle-registry/extra-params.json"
-                fi
-                jq ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
-              done
+              function update_images_snapshots() {
+                for img in $IMAGES; do
+                  image_name_sha=$(echo "${img##*/}")
+                  image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
 
-              snapshots_file="components/hco-bundle-registry/snapshots.json"
-              touch ${snapshots_file}
-              jq -n \
-                --slurpfile f "$snapshots_file" \
-                --arg app "$APPLICATION" \
-                --arg snap "$SNAPSHOT_ID" \
-                '$f[0] // {} | .[$app] = $snap' \
-              > "$snapshots_file.tmp" \
-              && mv "$snapshots_file.tmp" "$snapshots_file"
+                  if [[ "$image_name" == *"-operator-rhel"* ]]; then
+                    json_file="components/hco-bundle-registry/core-params.json"
+                  else
+                    json_file="components/hco-bundle-registry/extra-params.json"
+                  fi
+                  jq ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
+                done
+
+                snapshots_file="components/hco-bundle-registry/snapshots.json"
+                touch ${snapshots_file}
+                jq -n \
+                  --slurpfile f "$snapshots_file" \
+                  --arg app "$APPLICATION" \
+                  --arg snap "$SNAPSHOT_ID" \
+                  '$f[0] // {} | .[$app] = $snap' \
+                > "$snapshots_file.tmp" \
+                && mv "$snapshots_file.tmp" "$snapshots_file"
+              }
+
+              update_images_snapshots
 
               git add .
               git commit -m "Update HCO bundle registry with new images"
               git pull --rebase origin main
               git push origin main
+
+              if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
+                REPO_REVISION=$(jq -r '.spec.components[].source.git.revision' <<< "$SNAPSHOT_DATA")
+
+                BUNDLE_VERSION=$(cat build-bundle.json | jq -r '.metadata.Version | "\(.XY).\(.Z)-\(.release)" | sub("^v"; "")')
+                echo -n "$BUNDLE_VERSION" > /tekton/results/bundle-version
+
+                # Make sure we are getting the exact snapshots from the bundle
+                git checkout $REPO_REVISION
+
+                # Update the bundle snapshot as its not updated in this commit
+                update_images_snapshots
+
+                SNAPSHOTS_TO_RELEASE=$(cat $snapshots_file)
+                echo -n "$SNAPSHOTS_TO_RELEASE" > /tekton/results/snapshots-to-release
+              fi
+          - name: push-release-chart
+            image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
+            envFrom:
+              - secretRef:
+                  name: hco-updater-gitlab-token
+              - secretRef:
+                  name: quay-builds-creds
+            volumeMounts:
+              - name: quay-creds
+                mountPath: /tekton/secrets/quay-builds-creds
+                readOnly: true
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              # Only continue if its releasing hco-bundle-registry
+              if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
+                echo "Skipping push-release-chart: snapshot parameter does not contain 'hco-bundle-registry'"
+                exit 0
+              fi
+
+              # Read results from previous step
+              SNAPSHOTS_TO_RELEASE=$(cat /tekton/results/snapshots-to-release)
+              BUNDLE_VERSION=$(cat /tekton/results/bundle-version)
+
+              git clone https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/release-chart.git --depth 1
+              cd release-chart/release-orchestrator
+              yq -i ".version = \"$BUNDLE_VERSION-skeleton\"" Chart.yaml
+
+              # Update values.yaml with snapshots from SNAPSHOTS_TO_RELEASE
+              echo "$SNAPSHOTS_TO_RELEASE" | jq -r '{snapshots: .}' | yq eval -P '.' > /tmp/snapshots_with_key.yaml
+              yq eval-all '. as $item ireduce ({}; . * $item)' values.yaml /tmp/snapshots_with_key.yaml -i
+
+              DOCKER_CONFIG=$(cat /tekton/secrets/quay-builds-creds/.dockerconfigjson)
+              QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | select(.key | contains("quay.io")) | .value.username')
+              QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | select(.key | contains("quay.io")) | .value.password')
+              QUAY_URL=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | .key')
+
+              echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin
+
+              PACKAGE_OUTPUT=$(helm package . 2>&1)
+              PACKAGE_FILE=$(echo "${PACKAGE_OUTPUT}" | grep -oP 'Successfully packaged chart and saved it to: \K.*')
+
+              helm push $PACKAGE_FILE oci://${QUAY_URL}/release-orchestrator

@@ -138,6 +138,7 @@ spec:
 
               TMPDIR=$(mktemp -d)
               cd "$TMPDIR"
+              export HOME=/tmp
               git clone https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/release-chart.git --depth 1
               cd release-chart/release-orchestrator
               yq -i ".version = \"$BUNDLE_VERSION-skeleton\"" Chart.yaml

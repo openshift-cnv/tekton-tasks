@@ -115,7 +115,7 @@ spec:
                   name: quay-builds-creds
             volumeMounts:
               - name: quay-creds
-                mountPath: /tekton/secrets/quay-builds-creds
+                mountPath: /tmp/quay-builds-creds
                 readOnly: true
             script: |
               #!/usr/bin/env bash
@@ -139,7 +139,7 @@ spec:
               echo "$SNAPSHOTS_TO_RELEASE" | jq -r '{snapshots: .}' | yq eval -P '.' > /tmp/snapshots_with_key.yaml
               yq eval-all '. as $item ireduce ({}; . * $item)' values.yaml /tmp/snapshots_with_key.yaml -i
 
-              DOCKER_CONFIG=$(cat /tekton/secrets/quay-builds-creds/.dockerconfigjson)
+              DOCKER_CONFIG=$(cat /tmp/quay-builds-creds/.dockerconfigjson)
               QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | select(.key | contains("quay.io")) | .value.username')
               QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | select(.key | contains("quay.io")) | .value.password')
               QUAY_URL=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | .key')

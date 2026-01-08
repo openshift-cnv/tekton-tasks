@@ -124,7 +124,7 @@ spec:
                 readOnly: true
             script: |
               #!/usr/bin/env bash
-              set -eo pipefail
+              set -exo pipefail
 
               # Only continue if its releasing hco-bundle-registry
               if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
@@ -136,6 +136,8 @@ spec:
               SNAPSHOTS_TO_RELEASE=$(cat /tekton/results/snapshots-to-release)
               BUNDLE_VERSION=$(cat /tekton/results/bundle-version)
 
+              TMPDIR=$(mktemp -d)
+              cd "$TMPDIR"
               git clone https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/release-chart.git --depth 1
               cd release-chart/release-orchestrator
               yq -i ".version = \"$BUNDLE_VERSION-skeleton\"" Chart.yaml

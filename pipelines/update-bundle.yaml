@@ -107,7 +107,7 @@ spec:
                 echo -n "$SNAPSHOTS_TO_RELEASE" > /tekton/results/snapshots-to-release
               fi
           - name: push-release-chart
-            image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
+            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:18f9f819e9393891ce7ae19414a5672786e3efb120bdeaa2c254d8ba5d8e2493
             envFrom:
               - secretRef:
                   name: hco-updater-gitlab-token

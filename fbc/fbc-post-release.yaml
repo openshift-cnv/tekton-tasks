@@ -72,6 +72,7 @@ spec:
               image_sha=$(yq '.image' ${cnv_version}/updated_image.yaml)
               channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
               hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
+              hco_bundle_url=$(yq '.hco-bundle-url' ${cnv_version}/updated_image.yaml)
 
               if [[ $hco_bundle_version == v4.99* ]]; then
                 cnv_version="v4.99"
@@ -106,6 +107,7 @@ spec:
               image_base=$(echo "${image_sha}" | cut -d'@' -f1)
               yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
               yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_url = \"${hco_bundle_url}\"" -i ${save_folder}/payload.yaml
               # Add the minor version number from the bundle for Kargo
               yq e '.minorVersion = (.hco_bundle_version | split("-") | .[0])' -i ${save_folder}/payload.yaml
               yq e '.rhelVersion = (.minorVersion | split(".") | .[3])' -i ${save_folder}/payload.yaml

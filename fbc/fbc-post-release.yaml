@@ -79,6 +79,7 @@ spec:
               fi
 
               gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
+              # github_token and github_username are injected from cnv-ci-release-token secret
               git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads-new.git && cd cnv-fbc-payloads-new
               git config --global user.name "${github_username}"
               git config --global user.email "no-reply@redhat.com"

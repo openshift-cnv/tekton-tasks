@@ -8,14 +8,21 @@ spec:
   params:
     - name: snapshot
       type: string
+    - name: skeleton-chart-version
+      type: string
+      default: "0.0.0-skeleton"
   tasks:
     - name: update-bundle
       params:
         - name: SNAPSHOT
           value: "$(params.snapshot)"
+        - name: SKELETON_CHART_VERSION
+          value: "$(params.skeleton-chart-version)"
       taskSpec:
         params:
           - name: SNAPSHOT
+            type: string
+          - name: SKELETON_CHART_VERSION
             type: string
         results:
           - name: snapshots-to-release
@@ -97,9 +104,10 @@ spec:
               fi
 
               if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
-                REPO_REVISION=$(jq -r '.spec.components[].source.git.revision' <<< "$SNAPSHOT_DATA")
+                # Use [0] to get single value (all components have same revision, validated above)
+                REPO_REVISION=$(jq -r '.spec.components[0].source.git.revision' <<< "$SNAPSHOT_DATA")
 
-                BUNDLE_VERSION=$(cat build-bundle.json | jq -r '.metadata.Version | "\(.XY).\(.Z)-\(.release)" | sub("^v"; "")')
+                BUNDLE_VERSION=$(cat build-bundle.json | jq -r '.metadata.Version | "\(.XY).\(.Z)-\(.os).\(.release)" | sub("^v"; "")')
                 echo -n "$BUNDLE_VERSION" > /tekton/results/bundle-version
 
                 # Make sure we are getting the exact snapshots from the bundle
@@ -132,6 +140,10 @@ spec:
                 exit 0
               fi
 
+              # Configuration
+              OCI_REGISTRY="quay.io/openshift-virtualization/release-chart"
+              SKELETON_VERSION="$(params.SKELETON_CHART_VERSION)"
+
               # Read results from previous step
               SNAPSHOTS_TO_RELEASE=$(cat /tekton/results/snapshots-to-release)
               BUNDLE_VERSION=$(cat /tekton/results/bundle-version)
@@ -140,24 +152,55 @@ spec:
               TMPDIR=$(mktemp -d)
               cd "$TMPDIR"
               export HOME=/tmp
-              git clone https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/release-chart.git --depth 1
-              cd release-chart/release-orchestrator
-              yq -i ".version = \"$BUNDLE_VERSION\"" Chart.yaml
-              yq -i ".global.releasePlan = \"TODO-RELEASEPLAN\"" values.yaml
+
+              # Registry login - extract first matching quay.io credentials
+              DOCKER_CONFIG=$(cat /tmp/quay-builds-creds/.dockerconfigjson)
+              QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.username')
+              QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.password')
+
+              if [[ -z "${QUAY_USERNAME}" || "${QUAY_USERNAME}" == "null" ]]; then
+                echo "ERROR: Could not extract quay.io credentials from secret"
+                exit 1
+              fi
+
+              echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin
+
+              # Pull skeleton chart from OCI registry
+              echo "Pulling skeleton chart: oci://${OCI_REGISTRY}/release-orchestrator --version ${SKELETON_VERSION}"
+              helm pull "oci://${OCI_REGISTRY}/release-orchestrator" --version "${SKELETON_VERSION}" --untar
+
+              cd release-orchestrator
+
+              # Hydrate Chart.yaml
+              yq -i ".version = \"${BUNDLE_VERSION}\"" Chart.yaml
+              yq -i ".appVersion = \"${BUNDLE_VERSION}\"" Chart.yaml
+
+              # Hydrate values.yaml
               yq -i ".global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"" values.yaml
+              yq -i ".global.releasePlan = \"v${XY}-component-releaseplan\"" values.yaml
+              yq -i ".global.bundleReleasePlan = \"v${XY}-bundle-releaseplan\"" values.yaml
 
               # Update values.yaml with snapshots from SNAPSHOTS_TO_RELEASE
               echo "$SNAPSHOTS_TO_RELEASE" | jq -r '{snapshots: .}' | yq eval -P '.' > /tmp/snapshots_with_key.yaml
               yq eval-all '. as $item ireduce ({}; . * $item)' values.yaml /tmp/snapshots_with_key.yaml -i
 
-              DOCKER_CONFIG=$(cat /tmp/quay-builds-creds/.dockerconfigjson)
-              QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | select(.key | contains("quay.io")) | .value.username')
-              QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | select(.key | contains("quay.io")) | .value.password')
-              QUAY_URL=$(echo "${DOCKER_CONFIG}" | jq -r '.auths | to_entries[] | .key')
+              # Validate chart before pushing
+              echo "Validating chart with helm lint..."
+              if ! helm lint .; then
+                echo "ERROR: Chart validation failed"
+                exit 1
+              fi
 
-              echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin
+              # Package and push
+              helm package .
+              PACKAGE_FILE=$(ls release-orchestrator-*.tgz 2>/dev/null | head -1)
 
-              PACKAGE_OUTPUT=$(helm package . 2>&1)
-              PACKAGE_FILE=$(echo "${PACKAGE_OUTPUT}" | grep -oP 'Successfully packaged chart and saved it to: \K.*')
+              if [[ -z "${PACKAGE_FILE}" || ! -f "${PACKAGE_FILE}" ]]; then
+                echo "ERROR: Failed to find packaged chart file"
+                exit 1
+              fi
 
-              helm push $PACKAGE_FILE oci://${QUAY_URL}
+              echo "Pushing chart to oci://${OCI_REGISTRY}"
+              helm push "${PACKAGE_FILE}" "oci://${OCI_REGISTRY}"
+
+              echo "Published release-orchestrator:${BUNDLE_VERSION} to oci://${OCI_REGISTRY}"

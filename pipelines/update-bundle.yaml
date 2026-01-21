@@ -41,7 +41,7 @@ spec:
                   name: hco-updater-gitlab-token
             script: |
               #!/usr/bin/env bash
-              set -eox pipefail
+              set -eo pipefail
 
               echo "=== PHASE 1: Fetching snapshot data ==="
               SNAPSHOT_ID=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
@@ -149,7 +149,7 @@ spec:
                 readOnly: true
             script: |
               #!/usr/bin/env bash
-              set -eox pipefail
+              set -eo pipefail
 
               echo "=== PHASE 1: Checking if hco-bundle-registry release ==="
               if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
@@ -158,18 +158,22 @@ spec:
               fi
               echo "OK: This is an hco-bundle-registry release"
 
-              echo "=== PHASE 2: Loading configuration ==="
-              OCI_REGISTRY="quay.io/openshift-virtualization/release-chart"
-              SKELETON_VERSION="$(params.SKELETON_CHART_VERSION)"
-              echo "OCI Registry: $OCI_REGISTRY"
-              echo "Skeleton Version: $SKELETON_VERSION"
-
-              echo "=== PHASE 3: Reading results from previous step ==="
+              echo "=== PHASE 2: Reading results from previous step ==="
               SNAPSHOTS_TO_RELEASE=$(cat /tekton/results/snapshots-to-release)
               BUNDLE_VERSION=$(cat /tekton/results/bundle-version)
               XY=$(echo "$BUNDLE_VERSION" | cut -d'.' -f1,2 | tr '.' '-')
               echo "Bundle Version: $BUNDLE_VERSION"
               echo "XY Version: $XY"
+
+              echo "=== PHASE 3: Loading configuration ==="
+              CHART_NAME="hco-bundle-registry-rhel9"
+              SKELETON_REGISTRY="quay.io/openshift-virtualization/release-chart"
+              TARGET_REGISTRY="quay.io/openshift-virtualization/konflux-builds/v${XY}"
+              SKELETON_VERSION="$(params.SKELETON_CHART_VERSION)"
+              echo "Chart Name: $CHART_NAME"
+              echo "Skeleton Registry: $SKELETON_REGISTRY"
+              echo "Target Registry: $TARGET_REGISTRY"
+              echo "Skeleton Version: $SKELETON_VERSION"
 
               TMPDIR=$(mktemp -d)
               cd "$TMPDIR"
@@ -189,15 +193,19 @@ spec:
               echo "OK: Logged in to quay.io"
 
               echo "=== PHASE 5: Pulling skeleton chart ==="
-              echo "Pulling: oci://${OCI_REGISTRY}/release-orchestrator --version ${SKELETON_VERSION}"
-              helm pull "oci://${OCI_REGISTRY}/release-orchestrator" --version "${SKELETON_VERSION}" --untar
-              cd release-orchestrator
+              echo "Pulling: oci://${SKELETON_REGISTRY}/${CHART_NAME} --version ${SKELETON_VERSION}"
+              helm pull "oci://${SKELETON_REGISTRY}/${CHART_NAME}" --version "${SKELETON_VERSION}" --untar
+              cd "${CHART_NAME}"
               echo "OK: Skeleton chart extracted"
 
               echo "=== PHASE 6: Hydrating Chart.yaml ==="
-              yq -i ".version = \"${BUNDLE_VERSION}\"" Chart.yaml
-              yq -i ".appVersion = \"${BUNDLE_VERSION}\"" Chart.yaml
-              echo "OK: Chart.yaml updated with version $BUNDLE_VERSION"
+              CHART_VERSION="releases-${BUNDLE_VERSION}"
+              APP_VERSION="v${BUNDLE_VERSION}"
+              yq -i ".version = \"${CHART_VERSION}\"" Chart.yaml
+              yq -i ".appVersion = \"${APP_VERSION}\"" Chart.yaml
+              echo "OK: Chart.yaml updated"
+              echo "  version (OCI tag): $CHART_VERSION"
+              echo "  appVersion: $APP_VERSION"
 
               echo "=== PHASE 7: Hydrating values.yaml ==="
               yq -i ".global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"" values.yaml
@@ -219,7 +227,7 @@ spec:
 
               echo "=== PHASE 10: Packaging chart ==="
               helm package .
-              PACKAGE_FILE=$(ls release-orchestrator-*.tgz 2>/dev/null | head -1)
+              PACKAGE_FILE=$(ls ${CHART_NAME}-*.tgz 2>/dev/null | head -1)
 
               if [[ -z "${PACKAGE_FILE}" || ! -f "${PACKAGE_FILE}" ]]; then
                 echo "ERROR: Failed to find packaged chart file"
@@ -228,7 +236,7 @@ spec:
               echo "OK: Packaged as $PACKAGE_FILE"
 
               echo "=== PHASE 11: Pushing to OCI registry ==="
-              helm push "${PACKAGE_FILE}" "oci://${OCI_REGISTRY}"
+              helm push "${PACKAGE_FILE}" "oci://${TARGET_REGISTRY}"
 
               echo "=== push-release-chart step completed ==="
-              echo "Published release-orchestrator:${BUNDLE_VERSION} to oci://${OCI_REGISTRY}"
+              echo "Published ${CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY}"

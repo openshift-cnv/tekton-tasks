@@ -199,7 +199,10 @@ spec:
               echo "OK: Skeleton chart extracted"
 
               echo "=== PHASE 6: Hydrating Chart.yaml ==="
-              CHART_VERSION="releases-${BUNDLE_VERSION}"
+              # Transform 4.99.0-rhel9.2559 to 4.99.0-releases.2559 for clearer chart versioning
+              SEMVER=$(echo "$BUNDLE_VERSION" | cut -d'-' -f1)
+              RELEASE_NUM=$(echo "$BUNDLE_VERSION" | grep -oE '[0-9]+$')
+              CHART_VERSION="${SEMVER}-releases.${RELEASE_NUM}"
               APP_VERSION="v${BUNDLE_VERSION}"
               yq -i ".version = \"${CHART_VERSION}\"" Chart.yaml
               yq -i ".appVersion = \"${APP_VERSION}\"" Chart.yaml

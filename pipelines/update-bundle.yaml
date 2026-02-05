@@ -226,6 +226,9 @@ spec:
               fi
               echo "│ OK: All components point to the same commit"
 
+              # Define snapshots_file outside function so it's available in main script
+              snapshots_file="components/hco-bundle-registry/snapshots.json"
+
               function update_images_snapshots() {
                 for img in $IMAGES; do
                   image_name_sha=$(echo "${img##*/}")
@@ -239,7 +242,6 @@ spec:
                   jq ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
                 done
 
-                snapshots_file="components/hco-bundle-registry/snapshots.json"
                 touch ${snapshots_file}
                 jq -n \
                   --slurpfile f "$snapshots_file" \
@@ -251,7 +253,9 @@ spec:
               }
 
               echo "=== PHASE 4: Updating image references ==="
+              # Export function AND variables needed by function when run in subshell via exec_action
               export -f update_images_snapshots
+              export IMAGES APPLICATION SNAPSHOT_ID snapshots_file
               if ! exec_action "Update image references" 60 "update_images_snapshots"; then
                 echo "ERROR: Failed to update image references"
                 FINAL_EXIT_CODE=1

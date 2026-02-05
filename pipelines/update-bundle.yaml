@@ -251,6 +251,7 @@ spec:
               }
 
               echo "=== PHASE 4: Updating image references ==="
+              export -f update_images_snapshots
               if ! exec_action "Update image references" 60 "update_images_snapshots"; then
                 echo "ERROR: Failed to update image references"
                 FINAL_EXIT_CODE=1

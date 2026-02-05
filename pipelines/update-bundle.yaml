@@ -125,9 +125,9 @@ spec:
                   local details=$(echo "$entry" | cut -d'|' -f3-)
                   
                   case "$status" in
-                    OK) ((ok_count++)); echo "║ ✓ $action ($details)" ;;
-                    FAILED) ((fail_count++)); echo "║ ✗ $action ($details)" ;;
-                    TIMEOUT) ((timeout_count++)); echo "║ ⏱ $action ($details)" ;;
+                    OK) ok_count=$((ok_count + 1)); echo "║ ✓ $action ($details)" ;;
+                    FAILED) fail_count=$((fail_count + 1)); echo "║ ✗ $action ($details)" ;;
+                    TIMEOUT) timeout_count=$((timeout_count + 1)); echo "║ ⏱ $action ($details)" ;;
                   esac
                 done
                 
@@ -423,9 +423,9 @@ spec:
                   local details=$(echo "$entry" | cut -d'|' -f3-)
                   
                   case "$status" in
-                    OK) ((ok_count++)); echo "║ ✓ $action ($details)" ;;
-                    FAILED) ((fail_count++)); echo "║ ✗ $action ($details)" ;;
-                    TIMEOUT) ((timeout_count++)); echo "║ ⏱ $action ($details)" ;;
+                    OK) ok_count=$((ok_count + 1)); echo "║ ✓ $action ($details)" ;;
+                    FAILED) fail_count=$((fail_count + 1)); echo "║ ✗ $action ($details)" ;;
+                    TIMEOUT) timeout_count=$((timeout_count + 1)); echo "║ ⏱ $action ($details)" ;;
                   esac
                 done
                 

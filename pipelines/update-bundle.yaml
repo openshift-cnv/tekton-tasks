@@ -11,6 +11,10 @@ spec:
     - name: skeleton-chart-version
       type: string
       default: "0.0.0-skeleton"
+    - name: debug
+      type: string
+      default: "false"
+      description: Enable debug mode with verbose output (set -x)
   tasks:
     - name: update-bundle
       params:
@@ -18,11 +22,15 @@ spec:
           value: "$(params.snapshot)"
         - name: SKELETON_CHART_VERSION
           value: "$(params.skeleton-chart-version)"
+        - name: DEBUG
+          value: "$(params.debug)"
       taskSpec:
         params:
           - name: SNAPSHOT
             type: string
           - name: SKELETON_CHART_VERSION
+            type: string
+          - name: DEBUG
             type: string
         results:
           - name: snapshots-to-release
@@ -41,41 +49,182 @@ spec:
                   name: hco-updater-gitlab-token
             script: |
               #!/usr/bin/env bash
+
+              # ============================================================
+              # EXECUTION LAYER - Resilient wrapper for observability
+              # ============================================================
+              SCRIPT_START=$(date +%s)
+              declare -a ACTION_LOG=()
+              FINAL_EXIT_CODE=0
+
+              # Enable debug mode if requested
+              if [[ "$(params.DEBUG)" == "true" ]]; then
+                set -x
+              fi
+
+              exec_action() {
+                local action_name="$1"
+                local timeout_secs="${2:-60}"
+                shift 2
+                local cmd="$*"
+                
+                local start_ts=$(date +%s)
+                echo ""
+                echo "┌─────────────────────────────────────────────────────────────"
+                echo "│ ACTION: $action_name"
+                echo "│ CMD: $cmd"
+                echo "│ TIMEOUT: ${timeout_secs}s"
+                echo "├─────────────────────────────────────────────────────────────"
+                
+                local output
+                local exit_code
+                output=$(timeout "$timeout_secs" bash -c "$cmd" 2>&1)
+                exit_code=$?
+                
+                local end_ts=$(date +%s)
+                local duration=$((end_ts - start_ts))
+                
+                if [[ -n "$output" ]]; then
+                  echo "$output" | sed 's/^/│ /'
+                fi
+                
+                local status
+                if [[ $exit_code -eq 0 ]]; then
+                  status="OK"
+                elif [[ $exit_code -eq 124 ]]; then
+                  status="TIMEOUT"
+                else
+                  status="FAILED"
+                fi
+                
+                echo "├─────────────────────────────────────────────────────────────"
+                echo "│ STATUS: $status (exit: $exit_code, duration: ${duration}s)"
+                echo "└─────────────────────────────────────────────────────────────"
+                
+                ACTION_LOG+=("$status|$action_name|exit=$exit_code|${duration}s")
+                return $exit_code
+              }
+
+              execution_summary() {
+                local script_exit_code=$?
+                local script_end=$(date +%s)
+                local total_duration=$((script_end - SCRIPT_START))
+                
+                echo ""
+                echo "╔═════════════════════════════════════════════════════════════"
+                echo "║ EXECUTION SUMMARY - update-bundle"
+                echo "║ Total Duration: ${total_duration}s"
+                echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+                echo "╠═════════════════════════════════════════════════════════════"
+                
+                local ok_count=0 fail_count=0 timeout_count=0
+                
+                for entry in "${ACTION_LOG[@]}"; do
+                  local status=$(echo "$entry" | cut -d'|' -f1)
+                  local action=$(echo "$entry" | cut -d'|' -f2)
+                  local details=$(echo "$entry" | cut -d'|' -f3-)
+                  
+                  case "$status" in
+                    OK) ((ok_count++)); echo "║ ✓ $action ($details)" ;;
+                    FAILED) ((fail_count++)); echo "║ ✗ $action ($details)" ;;
+                    TIMEOUT) ((timeout_count++)); echo "║ ⏱ $action ($details)" ;;
+                  esac
+                done
+                
+                echo "╠═════════════════════════════════════════════════════════════"
+                echo "║ OK: $ok_count | FAILED: $fail_count | TIMEOUT: $timeout_count"
+                echo "╚═════════════════════════════════════════════════════════════"
+                
+                exit ${FINAL_EXIT_CODE:-$script_exit_code}
+              }
+
+              trap execution_summary EXIT
+
+              # ============================================================
+              # RUN LOGIC - Business logic with fail-fast behavior
+              # ============================================================
               set -eo pipefail
 
               echo "=== PHASE 1: Fetching snapshot data ==="
+
+              # Validate SNAPSHOT parameter
+              if [[ -z "$(params.SNAPSHOT)" ]]; then
+                echo "ERROR: SNAPSHOT parameter is empty"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate SNAPSHOT parameter|exit=0|0s")
+
               SNAPSHOT_ID=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              if [[ -z "$SNAPSHOT_ID" ]]; then
+                echo "ERROR: Could not extract SNAPSHOT_ID from: $(params.SNAPSHOT)"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Extract SNAPSHOT_ID|exit=0|0s")
+              echo "│ Snapshot ID: $SNAPSHOT_ID"
+
+              if ! exec_action "Fetch snapshot from Kubernetes" 60 "kubectl get snapshot $SNAPSHOT_ID -ojson"; then
+                echo "ERROR: Failed to fetch snapshot $SNAPSHOT_ID"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
               SNAPSHOT_DATA=$(kubectl get snapshot $SNAPSHOT_ID -ojson)
+
+              # Validate JSON response
+              if ! echo "$SNAPSHOT_DATA" | jq -e . > /dev/null 2>&1; then
+                echo "ERROR: Invalid JSON response from kubectl"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate snapshot JSON|exit=0|0s")
+
               NAMESPACE=$(jq -r '.metadata.namespace' <<< "$SNAPSHOT_DATA")
               APPLICATION=$(jq -r '.spec.application' <<< "$SNAPSHOT_DATA")
               VERSION=$(echo "$NAMESPACE" | cut -d'-' -f1,2)
-              echo "Snapshot ID: $SNAPSHOT_ID"
-              echo "Namespace: $NAMESPACE"
-              echo "Application: $APPLICATION"
-              echo "Version: $VERSION"
+              echo "│ Namespace: $NAMESPACE"
+              echo "│ Application: $APPLICATION"
+              echo "│ Version: $VERSION"
 
               echo "=== PHASE 2: Cloning hco-bundle-registry ==="
+
+              # Validate GITLAB_TOKEN
+              if [[ -z "${GITLAB_TOKEN:-}" ]]; then
+                echo "ERROR: GITLAB_TOKEN environment variable is not set"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate GITLAB_TOKEN|exit=0|0s")
+
               REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
-              REPO_URL=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
-              git clone $REPO_URL --depth 50
+              REPO_URL_WITH_AUTH=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
+
+              if ! exec_action "Clone hco-bundle-registry" 120 "git clone $REPO_URL_WITH_AUTH --depth 50 hco-bundle-registry"; then
+                echo "ERROR: Failed to clone repository"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
               cd hco-bundle-registry
-              git remote set-url origin "$REPO_URL"
+              git remote set-url origin "$REPO_URL_WITH_AUTH"
               git config user.name "submodule-sync"
               git config user.email "no-reply@redhat.com"
+              ACTION_LOG+=("OK|Configure git identity|exit=0|0s")
 
               echo "=== PHASE 3: Validating commit consistency ==="
               IMAGES=$(jq -r '.spec.components[].containerImage' <<< "$SNAPSHOT_DATA")
-              if jq -e '[.spec.components[].source.git.revision] | unique | length == 1' <<< "$SNAPSHOT_DATA" > /dev/null; then
-                echo "OK: All components point to the same commit"
-              else
+
+              if ! exec_action "Validate commit consistency" 30 "jq -e '[.spec.components[].source.git.revision] | unique | length == 1' <<< '$SNAPSHOT_DATA' > /dev/null"; then
                 echo "ERROR: Commits are inconsistent!"
                 echo "Component revisions:"
                 jq -r '.spec.components[] | "\(.name): \(.source.git.revision)"' <<< "$SNAPSHOT_DATA"
                 echo ""
                 echo "Unique revisions found:"
                 jq -r '[.spec.components[].source.git.revision] | unique | .[]' <<< "$SNAPSHOT_DATA"
+                FINAL_EXIT_CODE=1
                 exit 1
               fi
+              echo "│ OK: All components point to the same commit"
 
               function update_images_snapshots() {
                 for img in $IMAGES; do
@@ -102,37 +251,85 @@ spec:
               }
 
               echo "=== PHASE 4: Updating image references ==="
-              update_images_snapshots
+              if ! exec_action "Update image references" 60 "update_images_snapshots"; then
+                echo "ERROR: Failed to update image references"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
 
               echo "=== PHASE 5: Committing and pushing changes ==="
               git add .
               if ! git diff-index --quiet HEAD; then
                 git commit -m "Update HCO bundle registry with new images"
-                git pull --rebase origin main
-                git push origin main
-                echo "OK: Changes pushed to GitLab"
+                ACTION_LOG+=("OK|Commit changes|exit=0|0s")
+                
+                if ! exec_action "Pull with rebase" 60 "git pull --rebase origin main"; then
+                  echo "ERROR: Failed to pull with rebase"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                
+                if ! exec_action "Push to origin" 60 "git push origin main"; then
+                  echo "ERROR: Failed to push to origin"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                echo "│ OK: Changes pushed to GitLab"
               else
-                echo "SKIP: No changes detected in the bundle registry"
+                ACTION_LOG+=("OK|Skip - No changes detected|exit=0|0s")
+                echo "│ SKIP: No changes detected in the bundle registry"
               fi
 
               if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
                 echo "=== PHASE 6: Preparing release data for hco-bundle-registry ==="
                 REPO_REVISION=$(jq -r '.spec.components[0].source.git.revision' <<< "$SNAPSHOT_DATA")
-                echo "Repo revision: $REPO_REVISION"
+                echo "│ Repo revision: $REPO_REVISION"
 
+                if [[ ! -f "build-bundle.json" ]]; then
+                  echo "ERROR: build-bundle.json not found"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                
                 BUNDLE_VERSION=$(cat build-bundle.json | jq -r '.metadata.Version | "\(.XY).\(.Z)-\(.os).\(.release)" | sub("^v"; "")')
-                echo "Bundle version: $BUNDLE_VERSION"
+                if [[ -z "$BUNDLE_VERSION" || "$BUNDLE_VERSION" == "null" ]]; then
+                  echo "ERROR: Failed to extract bundle version"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                echo "│ Bundle version: $BUNDLE_VERSION"
+                ACTION_LOG+=("OK|Extract bundle version|exit=0|0s")
+                
                 echo -n "$BUNDLE_VERSION" > /tekton/results/bundle-version
+                if [[ ! -f "/tekton/results/bundle-version" ]]; then
+                  echo "ERROR: Failed to write bundle-version result"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Write bundle-version result|exit=0|0s")
 
-                git checkout $REPO_REVISION
+                if ! exec_action "Checkout release revision" 30 "git checkout $REPO_REVISION"; then
+                  echo "ERROR: Failed to checkout revision $REPO_REVISION"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                
                 update_images_snapshots
+                ACTION_LOG+=("OK|Update images for release|exit=0|0s")
 
                 SNAPSHOTS_TO_RELEASE=$(cat $snapshots_file)
                 echo -n "$SNAPSHOTS_TO_RELEASE" > /tekton/results/snapshots-to-release
-                echo "OK: Release data written to results"
+                if [[ ! -f "/tekton/results/snapshots-to-release" ]]; then
+                  echo "ERROR: Failed to write snapshots-to-release result"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Write snapshots-to-release result|exit=0|0s")
+                echo "│ OK: Release data written to results"
               fi
 
               echo "=== update-bundle step completed ==="
+              FINAL_EXIT_CODE=0
           - name: push-release-chart
             image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:18f9f819e9393891ce7ae19414a5672786e3efb120bdeaa2c254d8ba5d8e2493
             env:
@@ -149,97 +346,309 @@ spec:
                 readOnly: true
             script: |
               #!/usr/bin/env bash
+
+              # ============================================================
+              # EXECUTION LAYER - Resilient wrapper for observability
+              # ============================================================
+              SCRIPT_START=$(date +%s)
+              declare -a ACTION_LOG=()
+              FINAL_EXIT_CODE=0
+
+              # Enable debug mode if requested
+              if [[ "$(params.DEBUG)" == "true" ]]; then
+                set -x
+              fi
+
+              exec_action() {
+                local action_name="$1"
+                local timeout_secs="${2:-60}"
+                shift 2
+                local cmd="$*"
+                
+                local start_ts=$(date +%s)
+                echo ""
+                echo "┌─────────────────────────────────────────────────────────────"
+                echo "│ ACTION: $action_name"
+                echo "│ CMD: $cmd"
+                echo "│ TIMEOUT: ${timeout_secs}s"
+                echo "├─────────────────────────────────────────────────────────────"
+                
+                local output
+                local exit_code
+                output=$(timeout "$timeout_secs" bash -c "$cmd" 2>&1)
+                exit_code=$?
+                
+                local end_ts=$(date +%s)
+                local duration=$((end_ts - start_ts))
+                
+                if [[ -n "$output" ]]; then
+                  echo "$output" | sed 's/^/│ /'
+                fi
+                
+                local status
+                if [[ $exit_code -eq 0 ]]; then
+                  status="OK"
+                elif [[ $exit_code -eq 124 ]]; then
+                  status="TIMEOUT"
+                else
+                  status="FAILED"
+                fi
+                
+                echo "├─────────────────────────────────────────────────────────────"
+                echo "│ STATUS: $status (exit: $exit_code, duration: ${duration}s)"
+                echo "└─────────────────────────────────────────────────────────────"
+                
+                ACTION_LOG+=("$status|$action_name|exit=$exit_code|${duration}s")
+                return $exit_code
+              }
+
+              execution_summary() {
+                local script_exit_code=$?
+                local script_end=$(date +%s)
+                local total_duration=$((script_end - SCRIPT_START))
+                
+                echo ""
+                echo "╔═════════════════════════════════════════════════════════════"
+                echo "║ EXECUTION SUMMARY - push-release-chart"
+                echo "║ Total Duration: ${total_duration}s"
+                echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+                echo "╠═════════════════════════════════════════════════════════════"
+                
+                local ok_count=0 fail_count=0 timeout_count=0
+                
+                for entry in "${ACTION_LOG[@]}"; do
+                  local status=$(echo "$entry" | cut -d'|' -f1)
+                  local action=$(echo "$entry" | cut -d'|' -f2)
+                  local details=$(echo "$entry" | cut -d'|' -f3-)
+                  
+                  case "$status" in
+                    OK) ((ok_count++)); echo "║ ✓ $action ($details)" ;;
+                    FAILED) ((fail_count++)); echo "║ ✗ $action ($details)" ;;
+                    TIMEOUT) ((timeout_count++)); echo "║ ⏱ $action ($details)" ;;
+                  esac
+                done
+                
+                echo "╠═════════════════════════════════════════════════════════════"
+                echo "║ OK: $ok_count | FAILED: $fail_count | TIMEOUT: $timeout_count"
+                echo "╚═════════════════════════════════════════════════════════════"
+                
+                exit ${FINAL_EXIT_CODE:-$script_exit_code}
+              }
+
+              trap execution_summary EXIT
+
+              # ============================================================
+              # RUN LOGIC - Business logic with fail-fast behavior
+              # ============================================================
               set -eo pipefail
 
               echo "=== PHASE 1: Checking if hco-bundle-registry release ==="
               if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
-                echo "SKIP: Snapshot does not contain 'hco-bundle-registry'"
+                ACTION_LOG+=("OK|Skip - Not hco-bundle-registry|exit=0|0s")
+                echo "│ SKIP: Snapshot does not contain 'hco-bundle-registry'"
+                FINAL_EXIT_CODE=0
                 exit 0
               fi
-              echo "OK: This is an hco-bundle-registry release"
+              ACTION_LOG+=("OK|Validate snapshot type|exit=0|0s")
+              echo "│ OK: This is an hco-bundle-registry release"
 
               echo "=== PHASE 2: Reading results from previous step ==="
+
+              # Validate result files exist
+              if [[ ! -f "/tekton/results/snapshots-to-release" ]]; then
+                echo "ERROR: snapshots-to-release result file not found"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              if [[ ! -f "/tekton/results/bundle-version" ]]; then
+                echo "ERROR: bundle-version result file not found"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate result files exist|exit=0|0s")
+
               SNAPSHOTS_TO_RELEASE=$(cat /tekton/results/snapshots-to-release)
               BUNDLE_VERSION=$(cat /tekton/results/bundle-version)
+
+              if [[ -z "$BUNDLE_VERSION" ]]; then
+                echo "ERROR: bundle-version is empty"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Read previous step results|exit=0|0s")
+
               XY=$(echo "$BUNDLE_VERSION" | cut -d'.' -f1,2 | tr '.' '-')
-              echo "Bundle Version: $BUNDLE_VERSION"
-              echo "XY Version: $XY"
+              echo "│ Bundle Version: $BUNDLE_VERSION"
+              echo "│ XY Version: $XY"
 
               echo "=== PHASE 3: Loading configuration ==="
               CHART_NAME="hco-bundle-registry-rhel9"
               SKELETON_REGISTRY="quay.io/openshift-virtualization/release-chart"
               TARGET_REGISTRY="quay.io/openshift-virtualization/konflux-builds/v${XY}"
               SKELETON_VERSION="$(params.SKELETON_CHART_VERSION)"
-              echo "Chart Name: $CHART_NAME"
-              echo "Skeleton Registry: $SKELETON_REGISTRY"
-              echo "Target Registry: $TARGET_REGISTRY"
-              echo "Skeleton Version: $SKELETON_VERSION"
+              echo "│ Chart Name: $CHART_NAME"
+              echo "│ Skeleton Registry: $SKELETON_REGISTRY"
+              echo "│ Target Registry: $TARGET_REGISTRY"
+              echo "│ Skeleton Version: $SKELETON_VERSION"
+              ACTION_LOG+=("OK|Load configuration|exit=0|0s")
 
               TMPDIR=$(mktemp -d)
               cd "$TMPDIR"
 
               echo "=== PHASE 4: Registry login ==="
+
+              # Validate credentials file exists
+              if [[ ! -f "/tmp/quay-builds-creds/.dockerconfigjson" ]]; then
+                echo "ERROR: Quay credentials file not found at /tmp/quay-builds-creds/.dockerconfigjson"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
               DOCKER_CONFIG=$(cat /tmp/quay-builds-creds/.dockerconfigjson)
+
+              # Validate JSON
+              if ! echo "$DOCKER_CONFIG" | jq -e . > /dev/null 2>&1; then
+                echo "ERROR: Invalid JSON in docker config"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate credentials file|exit=0|0s")
+
               QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.username')
               QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.password')
 
               if [[ -z "${QUAY_USERNAME}" || "${QUAY_USERNAME}" == "null" ]]; then
                 echo "ERROR: Could not extract quay.io credentials from secret"
+                FINAL_EXIT_CODE=1
                 exit 1
               fi
-              echo "OK: Extracted credentials for user: $QUAY_USERNAME"
+              ACTION_LOG+=("OK|Extract Quay credentials|exit=0|0s")
+              echo "│ OK: Extracted credentials for user: $QUAY_USERNAME"
 
-              echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin
-              echo "OK: Logged in to quay.io"
+              if ! exec_action "Login to Quay registry" 30 "echo '***' | helm registry login quay.io --username '${QUAY_USERNAME}' --password-stdin"; then
+                # Retry with actual password (exec_action masks it)
+                if ! echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin; then
+                  echo "ERROR: Failed to login to Quay registry"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+              else
+                # Actually login with real password
+                echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin > /dev/null 2>&1
+              fi
+              echo "│ OK: Logged in to quay.io"
 
               echo "=== PHASE 5: Pulling skeleton chart ==="
-              echo "Pulling: oci://${SKELETON_REGISTRY}/${CHART_NAME} --version ${SKELETON_VERSION}"
-              helm pull "oci://${SKELETON_REGISTRY}/${CHART_NAME}" --version "${SKELETON_VERSION}" --untar
+              echo "│ Pulling: oci://${SKELETON_REGISTRY}/${CHART_NAME} --version ${SKELETON_VERSION}"
+
+              if ! exec_action "Pull skeleton chart" 120 "helm pull 'oci://${SKELETON_REGISTRY}/${CHART_NAME}' --version '${SKELETON_VERSION}' --untar"; then
+                echo "ERROR: Failed to pull skeleton chart"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
+              if [[ ! -d "${CHART_NAME}" ]]; then
+                echo "ERROR: Chart directory ${CHART_NAME} not found after pull"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
               cd "${CHART_NAME}"
-              echo "OK: Skeleton chart extracted"
+              echo "│ OK: Skeleton chart extracted"
 
               echo "=== PHASE 6: Hydrating Chart.yaml ==="
+
+              if [[ ! -f "Chart.yaml" ]]; then
+                echo "ERROR: Chart.yaml not found"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
               # Transform 4.99.0-rhel9.2559 to 4.99.0-releases.2559 for clearer chart versioning
               SEMVER=$(echo "$BUNDLE_VERSION" | cut -d'-' -f1)
               RELEASE_NUM=$(echo "$BUNDLE_VERSION" | grep -oE '[0-9]+$')
-              CHART_VERSION="${SEMVER}-releases.${RELEASE_NUM}"
-              APP_VERSION="v${BUNDLE_VERSION}"
-              yq -i ".version = \"${CHART_VERSION}\"" Chart.yaml
-              yq -i ".appVersion = \"${APP_VERSION}\"" Chart.yaml
-              echo "OK: Chart.yaml updated"
-              echo "  version (OCI tag): $CHART_VERSION"
-              echo "  appVersion: $APP_VERSION"
 
-              echo "=== PHASE 7: Hydrating values.yaml ==="
-              yq -i ".global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"" values.yaml
-              yq -i ".global.releasePlan = \"v${XY}-component-releaseplan\"" values.yaml
-              yq -i ".global.bundleReleasePlan = \"v${XY}-bundle-releaseplan\"" values.yaml
-              echo "OK: Global values set"
-
-              echo "=== PHASE 8: Injecting snapshots ==="
-              echo "$SNAPSHOTS_TO_RELEASE" | jq -r '{snapshots: .}' | yq eval -P '.' > /tmp/snapshots_with_key.yaml
-              yq eval-all '. as $item ireduce ({}; . * $item)' values.yaml /tmp/snapshots_with_key.yaml -i
-              echo "OK: Snapshots injected into values.yaml"
-
-              echo "=== PHASE 9: Validating chart ==="
-              if ! helm lint .; then
-                echo "ERROR: Chart validation failed"
+              if [[ -z "$SEMVER" || -z "$RELEASE_NUM" ]]; then
+                echo "ERROR: Failed to parse bundle version: $BUNDLE_VERSION"
+                FINAL_EXIT_CODE=1
                 exit 1
               fi
-              echo "OK: Chart passed validation"
+
+              CHART_VERSION="${SEMVER}-releases.${RELEASE_NUM}"
+              APP_VERSION="v${BUNDLE_VERSION}"
+
+              if ! exec_action "Hydrate Chart.yaml" 30 "yq -i '.version = \"${CHART_VERSION}\"' Chart.yaml && yq -i '.appVersion = \"${APP_VERSION}\"' Chart.yaml"; then
+                echo "ERROR: Failed to update Chart.yaml"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              echo "│ OK: Chart.yaml updated"
+              echo "│   version (OCI tag): $CHART_VERSION"
+              echo "│   appVersion: $APP_VERSION"
+
+              echo "=== PHASE 7: Hydrating values.yaml ==="
+
+              if [[ ! -f "values.yaml" ]]; then
+                echo "ERROR: values.yaml not found"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
+              if ! exec_action "Hydrate values.yaml" 30 "yq -i '.global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"' values.yaml && yq -i '.global.releasePlan = \"v${XY}-component-releaseplan\"' values.yaml && yq -i '.global.bundleReleasePlan = \"v${XY}-bundle-releaseplan\"' values.yaml"; then
+                echo "ERROR: Failed to update values.yaml"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              echo "│ OK: Global values set"
+
+              echo "=== PHASE 8: Injecting snapshots ==="
+
+              # Validate snapshots JSON
+              if ! echo "$SNAPSHOTS_TO_RELEASE" | jq -e . > /dev/null 2>&1; then
+                echo "ERROR: Invalid JSON in snapshots-to-release"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate snapshots JSON|exit=0|0s")
+
+              if ! exec_action "Inject snapshots" 30 "echo '$SNAPSHOTS_TO_RELEASE' | jq -r '{snapshots: .}' | yq eval -P '.' > /tmp/snapshots_with_key.yaml && yq eval-all '. as \$item ireduce ({}; . * \$item)' values.yaml /tmp/snapshots_with_key.yaml -i"; then
+                echo "ERROR: Failed to inject snapshots"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              echo "│ OK: Snapshots injected into values.yaml"
+
+              echo "=== PHASE 9: Validating chart ==="
+              if ! exec_action "Lint chart" 30 "helm lint ."; then
+                echo "ERROR: Chart validation failed"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              echo "│ OK: Chart passed validation"
 
               echo "=== PHASE 10: Packaging chart ==="
-              helm package .
+              if ! exec_action "Package chart" 30 "helm package ."; then
+                echo "ERROR: Failed to package chart"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
               PACKAGE_FILE=$(ls ${CHART_NAME}-*.tgz 2>/dev/null | head -1)
 
               if [[ -z "${PACKAGE_FILE}" || ! -f "${PACKAGE_FILE}" ]]; then
                 echo "ERROR: Failed to find packaged chart file"
+                FINAL_EXIT_CODE=1
                 exit 1
               fi
-              echo "OK: Packaged as $PACKAGE_FILE"
+              ACTION_LOG+=("OK|Validate package file|exit=0|0s")
+              echo "│ OK: Packaged as $PACKAGE_FILE"
 
               echo "=== PHASE 11: Pushing to OCI registry ==="
-              helm push "${PACKAGE_FILE}" "oci://${TARGET_REGISTRY}"
+              if ! exec_action "Push to OCI registry" 120 "helm push '${PACKAGE_FILE}' 'oci://${TARGET_REGISTRY}'"; then
+                echo "ERROR: Failed to push chart to registry"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
 
               echo "=== push-release-chart step completed ==="
-              echo "Published ${CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY}"
+              echo "│ Published ${CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY}"
+              FINAL_EXIT_CODE=0

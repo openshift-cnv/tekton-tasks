@@ -1,0 +1,104 @@
+---
+description: Guidelines for Tekton pipeline development with resilient execution patterns
+alwaysApply: true
+---
+
+# Tekton Tasks Repository Guidelines
+
+## Repository Overview
+
+This repository contains Tekton pipelines and tasks for OpenShift Virtualization CI/CD workflows. All pipelines follow the **Resilient Execution Layer** pattern for observability and debugging.
+
+## Key Patterns
+
+### Resilient Execution Layer
+
+Every pipeline step MUST include:
+
+1. **Execution Layer Header** - Initialize tracking at script start:
+```bash
+SCRIPT_START=$(date +%s)
+declare -a ACTION_LOG=()
+FINAL_EXIT_CODE=0
+```
+
+2. **exec_action() wrapper** - Wrap external commands with timeouts and structured logging:
+```bash
+exec_action "Action name" <timeout_secs> "<command>"
+```
+
+3. **execution_summary() trap** - Guarantee summary output on ANY exit:
+```bash
+trap execution_summary EXIT
+```
+
+4. **Fail-fast run logic** - Keep `set -eo pipefail` for business logic after the execution layer.
+
+### Timeout Guidelines
+
+| Command Type | Recommended Timeout |
+|-------------|---------------------|
+| kubectl/oc API calls | 60s |
+| git clone | 120s |
+| git pull/push | 60s |
+| helm pull | 120s |
+| helm push | 120s |
+| helm lint/package | 30s |
+| Registry login | 30s |
+| Validation checks | 30s |
+
+### Validation Requirements
+
+Before executing any command, validate:
+- Required parameters are not empty
+- Environment variables (tokens, credentials) exist
+- Files exist before reading them
+- JSON/YAML is valid before parsing
+
+### Output Formatting
+
+Use box-drawing characters for structured output:
+- `┌─────` Action start
+- `│` Output prefix  
+- `├─────` Status separator
+- `└─────` Action end
+- `╔═════` Summary header
+- `║` Summary lines
+- `╚═════` Summary footer
+
+## File Structure
+
+```
+tekton-tasks/
+├── pipelines/          # Full pipeline definitions
+│   └── *.yaml
+├── fbc/                # FBC-specific tasks
+│   └── *.yaml
+└── README.md
+```
+
+## Pipeline Parameters
+
+Always include a `debug` parameter for verbose output:
+```yaml
+- name: debug
+  type: string
+  default: "false"
+  description: Enable debug mode with verbose output (set -x)
+```
+
+## Testing Changes
+
+Before committing:
+1. Validate YAML syntax: `python3 -c "import yaml; yaml.safe_load(open('file.yaml'))"`
+2. Validate bash syntax: Extract script and run `bash -n script.sh`
+3. Test in a non-production namespace first
+
+## Commit Messages
+
+Format: `<type>(<scope>): <description>`
+
+Examples:
+- `feat(pipeline): add new release automation step`
+- `fix(update-bundle): handle empty snapshot gracefully`
+- `refactor(pipeline): improve error handling and observability`

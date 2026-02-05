@@ -259,8 +259,8 @@ spec:
               fi
 
               echo "=== PHASE 5: Committing and pushing changes ==="
-              git add .
-              if ! git diff-index --quiet HEAD; then
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git add .
                 git commit -m "Update HCO bundle registry with new images"
                 ACTION_LOG+=("OK|Commit changes|exit=0|0s")
                 

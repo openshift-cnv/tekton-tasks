@@ -530,16 +530,30 @@ spec:
               ACTION_LOG+=("OK|Extract Quay credentials|exit=0|0s")
               echo "│ OK: Extracted credentials for user: $QUAY_USERNAME"
 
-              if ! exec_action "Login to Quay registry" 30 "echo '***' | helm registry login quay.io --username '${QUAY_USERNAME}' --password-stdin"; then
-                # Retry with actual password (exec_action masks it)
-                if ! echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin; then
-                  echo "ERROR: Failed to login to Quay registry"
-                  FINAL_EXIT_CODE=1
-                  exit 1
-                fi
+              # Login directly -- password can't be piped through exec_action safely
+              echo ""
+              echo "┌─────────────────────────────────────────────────────────────"
+              echo "│ ACTION: Login to Quay registry"
+              echo "│ CMD: echo '***' | helm registry login quay.io --username '${QUAY_USERNAME}' --password-stdin"
+              echo "│ TIMEOUT: 30s"
+              echo "├─────────────────────────────────────────────────────────────"
+              login_output=$(echo "${QUAY_PASSWORD}" | timeout 30 helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin 2>&1)
+              login_exit=$?
+              if [[ -n "$login_output" ]]; then
+                echo "$login_output" | sed 's/^/│ /'
+              fi
+              echo "├─────────────────────────────────────────────────────────────"
+              if [[ $login_exit -eq 0 ]]; then
+                echo "│ STATUS: OK (exit: 0, duration: 0s)"
+                echo "└─────────────────────────────────────────────────────────────"
+                ACTION_LOG+=("OK|Login to Quay registry|exit=0|0s")
               else
-                # Actually login with real password
-                echo "${QUAY_PASSWORD}" | helm registry login quay.io --username "${QUAY_USERNAME}" --password-stdin > /dev/null 2>&1
+                echo "│ STATUS: FAILED (exit: $login_exit, duration: 0s)"
+                echo "└─────────────────────────────────────────────────────────────"
+                ACTION_LOG+=("FAILED|Login to Quay registry|exit=$login_exit|0s")
+                echo "ERROR: Failed to login to Quay registry"
+                FINAL_EXIT_CODE=1
+                exit 1
               fi
               echo "│ OK: Logged in to quay.io"
 

@@ -612,6 +612,9 @@ spec:
                 exit 1
               fi
               cd "${CHART_NAME}"
+              # Defense-in-depth: remove stale .tgz left by helm pull --untar
+              rm -f "../${CHART_NAME}"-*.tgz "${CHART_NAME}"-*.tgz 2>/dev/null || true
+              ACTION_LOG+=("OK|Cleanup stale tgz archives|exit=0|0s")
               echo "│ OK: Skeleton chart extracted"
 
               echo "=== PHASE 6: Hydrating Chart.yaml ==="
@@ -643,6 +646,15 @@ spec:
               echo "│ OK: Chart.yaml updated"
               echo "│   version (OCI tag): $CHART_VERSION"
               echo "│   appVersion: $APP_VERSION"
+
+              # Feedback loop: verify Chart.yaml was actually hydrated
+              ACTUAL_VERSION=$(yq '.version' Chart.yaml | tr -d '"')
+              if [[ "$ACTUAL_VERSION" != "$CHART_VERSION" ]]; then
+                echo "ERROR: Chart.yaml hydration verification failed. Expected: $CHART_VERSION, Got: $ACTUAL_VERSION"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Verify Chart.yaml hydration|exit=0|0s")
 
               echo "=== PHASE 7: Hydrating values.yaml ==="
 
@@ -691,7 +703,7 @@ spec:
                 exit 1
               fi
 
-              PACKAGE_FILE=$(ls ${CHART_NAME}-*.tgz 2>/dev/null | head -1)
+              PACKAGE_FILE="${CHART_NAME}-${CHART_VERSION}.tgz"
 
               if [[ -z "${PACKAGE_FILE}" || ! -f "${PACKAGE_FILE}" ]]; then
                 echo "ERROR: Failed to find packaged chart file"
@@ -709,5 +721,5 @@ spec:
               fi
 
               echo "=== push-release-chart step completed ==="
-              echo "│ Published ${CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY}"
+              echo "│ Published ${CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
               FINAL_EXIT_CODE=0

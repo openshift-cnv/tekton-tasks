@@ -283,13 +283,17 @@ spec:
                 done
 
                 touch ${snapshots_file}
-                jq -n \
-                  --slurpfile f "$snapshots_file" \
-                  --arg app "$APPLICATION" \
-                  --arg snap "$SNAPSHOT_ID" \
-                  '$f[0] // {} | .[$app] = $snap' \
-                > "$snapshots_file.tmp" \
-                && mv "$snapshots_file.tmp" "$snapshots_file"
+                if [[ ! "$APPLICATION" == *"-test-"* ]]; then
+                  jq -n \
+                    --slurpfile f "$snapshots_file" \
+                    --arg app "$APPLICATION" \
+                    --arg snap "$SNAPSHOT_ID" \
+                    '$f[0] // {} | .[$app] = $snap' \
+                  > "$snapshots_file.tmp" \
+                  && mv "$snapshots_file.tmp" "$snapshots_file"
+                else
+                  echo "Test application, skipping snapshot being added to the bundle, as it won't be released"
+                fi
               }
 
               echo "=== PHASE 4: Updating image references ==="

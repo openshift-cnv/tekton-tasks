@@ -253,15 +253,17 @@ spec:
                 echo "└─────────────────────────────────────────────────────────────"
                 ACTION_LOG+=("OK|Validate commit consistency|exit=0|0s")
               else
-                echo "│ INFO: $UNIQUE_COUNT unique revisions across $COMPONENT_COUNT components (expected for multi-component apps)"
+                echo "│ WARN: $UNIQUE_COUNT unique revisions across $COMPONENT_COUNT components"
                 echo "│ Component revisions:"
                 jq -r '.spec.components[] | "│   \(.name): \(.source.git.revision)"' /tmp/snapshot.json
                 echo "│ Unique revisions:"
                 jq -r '[.spec.components[].source.git.revision] | unique | .[] | "│   \(.)"' /tmp/snapshot.json
                 echo "├─────────────────────────────────────────────────────────────"
-                echo "│ STATUS: OK (exit: 0, duration: 0s)"
+                echo "│ STATUS: FAILED (exit: 1, duration: 0s)"
                 echo "└─────────────────────────────────────────────────────────────"
-                ACTION_LOG+=("OK|Validate commit consistency|exit=0|0s")
+                ACTION_LOG+=("FAILED|Validate commit consistency|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
               fi
 
               rm -f /tmp/snapshot.json

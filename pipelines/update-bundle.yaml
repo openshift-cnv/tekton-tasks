@@ -533,7 +533,7 @@ spec:
               echo "│ XY Version: $XY"
 
               echo "=== PHASE 3: Loading configuration ==="
-              CHART_NAME="hco-bundle-registry-rhel9"
+              CHART_NAME="hco-bundle-registry"
               SKELETON_REGISTRY="quay.io/openshift-virtualization/release-chart"
               TARGET_REGISTRY="quay.io/openshift-virtualization/konflux-builds/v${XY}"
               SKELETON_VERSION="$(params.SKELETON_CHART_VERSION)"
@@ -670,7 +670,7 @@ spec:
                 exit 1
               fi
 
-              if ! exec_action "Hydrate values.yaml" 30 "yq -i '.global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"' values.yaml && yq -i '.global.releasePlan = \"v${XY}-component-releaseplan\"' values.yaml && yq -i '.global.bundleReleasePlan = \"v${XY}-bundle-releaseplan\"' values.yaml"; then
+              if ! exec_action "Hydrate values.yaml" 30 "yq -i '.global.targetNamespace = \"v${XY}-openshift-virtualization-tenant\"' values.yaml && yq -i '.global.releasePlanSuffix = \"-releaseplan-prod\"' values.yaml"; then
                 echo "ERROR: Failed to update values.yaml"
                 FINAL_EXIT_CODE=1
                 exit 1

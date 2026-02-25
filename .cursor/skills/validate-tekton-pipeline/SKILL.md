@@ -71,10 +71,53 @@ For steps using the Resilient Execution Layer, verify:
 4. `trap execution_summary EXIT` set before business logic
 5. `set -eo pipefail` set after execution layer, before business logic
 
+## Helm OCI Chart Lifecycle Checks
+
+For steps that hydrate and push Helm charts (e.g., `push-release-chart`):
+
+### Variable Derivation Chain
+
+Verify the derivation from `BUNDLE_VERSION` is consistent:
+
+```
+BUNDLE_VERSION  →  SEMVER (cut -d'-' -f1)
+                →  RELEASE_NUM (grep -oE '[0-9]+$')
+                →  OS_SUFFIX (cut -d'-' -f2 | cut -d'.' -f1)
+                →  XY (cut -d'.' -f1,2 | tr '.' '-')
+```
+
+### Chart Name Hydration Contract
+
+1. `HYDRATED_CHART_NAME` must match what `yq` writes to `.name` in Chart.yaml
+2. `CHART_VERSION` must match what `yq` writes to `.version` in Chart.yaml
+3. `PACKAGE_FILE` must equal `{HYDRATED_CHART_NAME}-{CHART_VERSION}.tgz`
+4. `helm package .` produces the .tgz using `.name` and `.version` from Chart.yaml
+5. `helm push` reads the chart name from inside the .tgz for the OCI repo path
+
+If any of these are misaligned, the package file check (`! -f "${PACKAGE_FILE}"`) will fail, or the push will target the wrong OCI repo.
+
+### Verification Checklist
+
+- [ ] Chart.yaml `.name` is hydrated (not left as skeleton default)
+- [ ] Chart.yaml `.version` is hydrated (not `0.0.0-skeleton`)
+- [ ] Chart.yaml `.appVersion` is hydrated
+- [ ] Verification reads back `.name` and `.version` and compares
+- [ ] `PACKAGE_FILE` uses `HYDRATED_CHART_NAME`, not `CHART_NAME`
+- [ ] Published message uses `HYDRATED_CHART_NAME`
+- [ ] OS suffix guard handles: normal (`rhel9`), future (`rhel10`), null, empty, legacy (no dash)
+
+### Cross-Step Result Checks
+
+- [ ] Step 1 writes `bundle-version` and `snapshots-to-release` to `/tekton/results/`
+- [ ] Step 2 validates both files exist before reading
+- [ ] Step 2 validates `bundle-version` is non-empty
+- [ ] `snapshots-to-release` JSON is validated with `jq -e .` before injection
+
 ## Pre-Commit Workflow
 
 1. Edit the pipeline/task YAML
 2. Run YAML syntax check
 3. Run bash syntax check on modified scripts
 4. Run `kubectl apply --dry-run=client`
-5. Commit with format: `<type>(<scope>): <description>`
+5. Verify chart hydration contract (if modifying push-release-chart step)
+6. Commit with format: `<type>(<scope>): <description>`

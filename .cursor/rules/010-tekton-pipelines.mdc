@@ -66,6 +66,42 @@ Use box-drawing characters for structured output:
 - `║` Summary lines
 - `╚═════` Summary footer
 
+### Credential Patterns
+
+#### Registry Auth (Quay OCI)
+
+For steps that pull/push OCI artifacts (Helm charts, images):
+1. Mount the docker config secret as a **volume** (provides `.dockerconfigjson` file)
+2. Extract username/password via `jq` from the mounted file
+3. Run `helm registry login <host>` **inline** (not through `exec_action`) -- passwords cannot be safely piped through `bash -c`
+4. A single `helm registry login quay.io` covers ALL quay.io repos the robot has access to
+
+#### Secret Injection
+
+- Use `envFrom` for tokens needed as env vars (e.g., `GITLAB_TOKEN`)
+- Use `volumeMounts` for structured credentials (e.g., `.dockerconfigjson`)
+- Never hardcode credentials in pipeline YAML
+
+### Helm OCI Chart Lifecycle
+
+When pipelines produce Helm charts via OCI:
+
+1. **Pull** a skeleton (template) chart from OCI registry
+2. **Hydrate** Chart.yaml fields (name, version, appVersion) from build metadata
+3. **Hydrate** values.yaml with runtime configuration
+4. **Lint** the hydrated chart (`helm lint .`)
+5. **Package** (`helm package .`) -- filename is `{Chart.yaml name}-{Chart.yaml version}.tgz`
+6. **Push** to target OCI registry (`helm push <file> oci://<registry>`)
+
+`helm package` derives the .tgz filename from `Chart.yaml`, not from shell variables. Always verify `PACKAGE_FILE` matches what `helm package` actually produces.
+
+### Cross-Step Data Sharing
+
+Steps within the same Tekton task share `/tekton/results/`:
+- Step N writes: `echo -n "$VALUE" > /tekton/results/<name>`
+- Step N+1 reads: `cat /tekton/results/<name>`
+- Size limit: ~4KB per result, ~12KB total. Monitor for large JSON payloads.
+
 ## File Structure
 
 ```

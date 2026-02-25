@@ -642,21 +642,43 @@ spec:
               fi
 
               CHART_VERSION="${SEMVER}-releases.${RELEASE_NUM}"
+
+              # Derive OS suffix from bundle version for chart name hydration
+              # Current builds: 4.20.8-rhel9.47 → rhel9; future: rhel10
+              # Defensive: legacy/null OS falls back to base CHART_NAME
+              if [[ "$BUNDLE_VERSION" == *"-"* ]]; then
+                OS_SUFFIX=$(echo "$BUNDLE_VERSION" | cut -d'-' -f2 | cut -d'.' -f1)
+                if [[ -n "$OS_SUFFIX" && "$OS_SUFFIX" != "null" ]]; then
+                  HYDRATED_CHART_NAME="${CHART_NAME}-${OS_SUFFIX}"
+                else
+                  HYDRATED_CHART_NAME="${CHART_NAME}"
+                fi
+              else
+                HYDRATED_CHART_NAME="${CHART_NAME}"
+              fi
+
               APP_VERSION="v${BUNDLE_VERSION}"
 
-              if ! exec_action "Hydrate Chart.yaml" 30 "yq -i '.version = \"${CHART_VERSION}\"' Chart.yaml && yq -i '.appVersion = \"${APP_VERSION}\"' Chart.yaml"; then
+              if ! exec_action "Hydrate Chart.yaml" 30 "yq -i '.name = \"${HYDRATED_CHART_NAME}\"' Chart.yaml && yq -i '.version = \"${CHART_VERSION}\"' Chart.yaml && yq -i '.appVersion = \"${APP_VERSION}\"' Chart.yaml"; then
                 echo "ERROR: Failed to update Chart.yaml"
                 FINAL_EXIT_CODE=1
                 exit 1
               fi
               echo "│ OK: Chart.yaml updated"
+              echo "│   name: $HYDRATED_CHART_NAME"
               echo "│   version (OCI tag): $CHART_VERSION"
               echo "│   appVersion: $APP_VERSION"
 
               # Feedback loop: verify Chart.yaml was actually hydrated
+              ACTUAL_NAME=$(yq '.name' Chart.yaml | tr -d '"')
               ACTUAL_VERSION=$(yq '.version' Chart.yaml | tr -d '"')
+              if [[ "$ACTUAL_NAME" != "$HYDRATED_CHART_NAME" ]]; then
+                echo "ERROR: Chart.yaml name hydration failed. Expected: $HYDRATED_CHART_NAME, Got: $ACTUAL_NAME"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
               if [[ "$ACTUAL_VERSION" != "$CHART_VERSION" ]]; then
-                echo "ERROR: Chart.yaml hydration verification failed. Expected: $CHART_VERSION, Got: $ACTUAL_VERSION"
+                echo "ERROR: Chart.yaml version hydration failed. Expected: $CHART_VERSION, Got: $ACTUAL_VERSION"
                 FINAL_EXIT_CODE=1
                 exit 1
               fi
@@ -709,7 +731,7 @@ spec:
                 exit 1
               fi
 
-              PACKAGE_FILE="${CHART_NAME}-${CHART_VERSION}.tgz"
+              PACKAGE_FILE="${HYDRATED_CHART_NAME}-${CHART_VERSION}.tgz"
 
               if [[ -z "${PACKAGE_FILE}" || ! -f "${PACKAGE_FILE}" ]]; then
                 echo "ERROR: Failed to find packaged chart file"
@@ -727,5 +749,5 @@ spec:
               fi
 
               echo "=== push-release-chart step completed ==="
-              echo "│ Published ${CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
+              echo "│ Published ${HYDRATED_CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
               FINAL_EXIT_CODE=0

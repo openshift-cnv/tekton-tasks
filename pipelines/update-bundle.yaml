@@ -41,12 +41,17 @@ spec:
           - name: quay-creds
             secret:
               secretName: quay-builds-creds
+          - name: shared-data
+            emptyDir: {}
         steps:
           - name: update-bundle
             image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
             envFrom:
               - secretRef:
                   name: hco-updater-gitlab-token
+            volumeMounts:
+              - name: shared-data
+                mountPath: /var/shared
             script: |
               #!/usr/bin/env bash
 
@@ -268,6 +273,15 @@ spec:
 
               rm -f /tmp/snapshot.json
 
+              # Save Snapshot object for GC resilience (stripped, with velero label)
+              if [[ "$APPLICATION" != *"-test-"* ]]; then
+                snapshot_objects_dir="components/hco-bundle-registry/snapshot-objects"
+                mkdir -p "$snapshot_objects_dir"
+                if ! exec_action "Save Snapshot object for ${APPLICATION}" 30 "set -o pipefail; kubectl get snapshot '$SNAPSHOT_ID' -oyaml | yq 'del(.metadata.ownerReferences) | .metadata.labels[\"velero.io/restore-name\"] = \"snapshot-persistence\"' > '${snapshot_objects_dir}/${APPLICATION}.yaml'"; then
+                  echo "WARN: Failed to save Snapshot object for ${APPLICATION} (non-fatal)"
+                fi
+              fi
+
               # Define snapshots_file outside function so it's available in main script
               snapshots_file="components/hco-bundle-registry/snapshots.json"
 
@@ -330,6 +344,10 @@ spec:
                 ACTION_LOG+=("OK|Skip - No changes detected|exit=0|0s")
                 echo "│ SKIP: No changes detected in the bundle registry"
               fi
+
+              # Copy Snapshot objects to shared volume for push-release-chart step
+              mkdir -p /var/shared/snapshot-objects
+              cp components/hco-bundle-registry/snapshot-objects/*.yaml /var/shared/snapshot-objects/ 2>/dev/null || true
 
               if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
                 echo "=== PHASE 6: Preparing release data for hco-bundle-registry ==="
@@ -395,6 +413,8 @@ spec:
               - name: quay-creds
                 mountPath: /tmp/quay-builds-creds
                 readOnly: true
+              - name: shared-data
+                mountPath: /var/shared
             script: |
               #!/usr/bin/env bash
 
@@ -715,6 +735,18 @@ spec:
                 exit 1
               fi
               echo "│ OK: Snapshots injected into values.yaml"
+
+              echo "=== PHASE 8b: Injecting Snapshot objects into chart ==="
+              SNAPSHOT_OBJECTS_SRC="/var/shared/snapshot-objects"
+              if ls "${SNAPSHOT_OBJECTS_SRC}"/*.yaml 1>/dev/null 2>&1; then
+                cp "${SNAPSHOT_OBJECTS_SRC}"/*.yaml templates/
+                SNAP_COUNT=$(ls "${SNAPSHOT_OBJECTS_SRC}"/*.yaml 2>/dev/null | wc -l)
+                echo "│ Copied $SNAP_COUNT Snapshot files into chart templates/"
+                ACTION_LOG+=("OK|Inject Snapshot objects ($SNAP_COUNT files)|exit=0|0s")
+              else
+                echo "│ WARN: No Snapshot object files found"
+                ACTION_LOG+=("OK|Skip Snapshot objects (none found)|exit=0|0s")
+              fi
 
               echo "=== PHASE 9: Validating chart ==="
               if ! exec_action "Lint chart" 30 "helm lint ."; then

@@ -290,7 +290,8 @@ spec:
                   image_name_sha=$(echo "${img##*/}")
                   image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
 
-                  if [[ "$image_name" == *"-operator-rhel"* ]]; then
+                  # Virt-platform-autopilot should also be in the core-params
+                  if [[ "$image_name" == *"-operator-rhel"* || "$image_name" == *"virt-platform-autopilot"* ]]; then
                     json_file="components/hco-bundle-registry/core-params.json"
                   else
                     json_file="components/hco-bundle-registry/extra-params.json"

@@ -296,7 +296,7 @@ spec:
                   else
                     json_file="components/hco-bundle-registry/extra-params.json"
                   fi
-                  jq ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
+                  jq -S ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
                 done
 
                 touch ${snapshots_file}

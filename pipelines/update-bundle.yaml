@@ -291,7 +291,7 @@ spec:
                   image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
 
                   # Virt-platform-autopilot should also be in the core-params
-                  if [[ "$image_name" == *"-operator"* || "$image_name" == *"virt-platform-autopilot"* ]]; then
+                  if [[ "$image_name" == *"-operator"* || "$image_name" == *"virt-platform-autopilot"* || "$image_name" != *"-test-"* ]]; then
                     json_file="components/hco-bundle-registry/core-params.json"
                   else
                     json_file="components/hco-bundle-registry/extra-params.json"

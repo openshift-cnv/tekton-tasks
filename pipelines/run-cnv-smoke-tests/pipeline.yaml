@@ -115,6 +115,9 @@ spec:
 
               git clone "${GIT_REPOSITORY}" repo && pushd "repo/${PATH_CONTEXT}" && git checkout "${GIT_REVISION}"
 
+              SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
+              echo "Source branch resolved: ${SOURCE_BRANCH}"
+
               export JOB_INFO_FILE="/tmp/prow.yaml"
               export CNV_OPERATOR_CHANNEL=$(yq '.channel' payload.yaml)
               export FREIGHT_NAME=$(yq '.freightName' payload.yaml)
@@ -125,7 +128,7 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              if [[ "${GIT_REVISION}" == dev/* ]]; then
+              if [[ "${SOURCE_BRANCH}" == dev/* ]]; then
                 echo "Dev branch detected — skipping gangway, using dummy values"
                 export PROW_JOB_STATE="success"
                 export PROW_JOB_URL="https://prow.ci.openshift.org/view/dummy-dev-job"

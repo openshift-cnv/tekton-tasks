@@ -21,6 +21,10 @@ spec:
       type: string
     - name: prow-job
       type: string
+    - name: pull-request-number
+      type: string
+      default: ""
+      description: PR number for closing on failure
   tasks:
     - name: run-smoke-tests
       timeout: 4h0m0s
@@ -140,8 +144,6 @@ spec:
 
               pushd "repo/${PATH_CONTEXT}"
 
-              git fetch && git checkout main && git pull --ff
-
 
               yq --null-input \
                 '
@@ -164,8 +166,51 @@ spec:
               curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
                 | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
 
+              exit ${exit_code:-0}
+
   workspaces:
     - name: git-auth
       optional: true
     - name: netrc
       optional: true
+  finally:
+    - name: close-pr-on-failure
+      when:
+        - input: $(tasks.run-smoke-tests.status)
+          operator: notin
+          values: ["Succeeded"]
+        - input: $(params.pull-request-number)
+          operator: notin
+          values: [""]
+      params:
+        - name: pull-request-number
+          value: $(params.pull-request-number)
+        - name: git-url
+          value: $(params.git-url)
+      taskSpec:
+        params:
+          - name: pull-request-number
+          - name: git-url
+        steps:
+          - name: close-pr
+            image: quay.io/openshift-cnv/ci-tools:latest
+            env:
+              - name: PR_NUMBER
+                value: $(params.pull-request-number)
+              - name: GIT_REPOSITORY
+                value: $(params.git-url)
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_TOKEN
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              REPO_SLUG=$(echo "$GIT_REPOSITORY" | sed 's|https://github.com/||' | sed 's|\.git$||')
+
+              echo "Closing PR #${PR_NUMBER} on ${REPO_SLUG} due to smoke test failure"
+              gh pr close "${PR_NUMBER}" \
+                --repo "${REPO_SLUG}" \
+                --comment "Smoke tests failed — closing PR automatically."

@@ -37,6 +37,8 @@ spec:
           value: $(params.path-context)
         - name: prow-job
           value: $(params.prow-job)
+        - name: pull-request-number
+          value: $(params.pull-request-number)
       taskSpec:
         params:
           - name: git-url
@@ -118,6 +120,7 @@ spec:
               SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
               echo "Source branch resolved: ${SOURCE_BRANCH}"
 
+
               export JOB_INFO_FILE="/tmp/prow.yaml"
               export CNV_OPERATOR_CHANNEL=$(yq '.channel' payload.yaml)
               export FREIGHT_NAME=$(yq '.freightName' payload.yaml)
@@ -185,44 +188,3 @@ spec:
       optional: true
     - name: netrc
       optional: true
-  finally:
-    - name: close-pr-on-failure
-      when:
-        - input: $(tasks.run-smoke-tests.status)
-          operator: notin
-          values: ["Succeeded"]
-        - input: $(params.pull-request-number)
-          operator: notin
-          values: [""]
-      params:
-        - name: pull-request-number
-          value: $(params.pull-request-number)
-        - name: git-url
-          value: $(params.git-url)
-      taskSpec:
-        params:
-          - name: pull-request-number
-          - name: git-url
-        steps:
-          - name: close-pr
-            image: quay.io/openshift-cnv/ci-tools:latest
-            env:
-              - name: PR_NUMBER
-                value: $(params.pull-request-number)
-              - name: GIT_REPOSITORY
-                value: $(params.git-url)
-              - name: GITHUB_TOKEN
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GITHUB_TOKEN
-            script: |
-              #!/usr/bin/env bash
-              set -eo pipefail
-
-              REPO_SLUG=$(echo "$GIT_REPOSITORY" | sed 's|https://github.com/||' | sed 's|\.git$||')
-
-              echo "Closing PR #${PR_NUMBER} on ${REPO_SLUG} due to smoke test failure"
-              gh pr close "${PR_NUMBER}" \
-                --repo "${REPO_SLUG}" \
-                --comment "Smoke tests failed — closing PR automatically."

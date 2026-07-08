@@ -131,7 +131,7 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              if [[ "${SOURCE_BRANCH}" == dev/* ]]; then
+              if [[ "${SOURCE_BRANCH}" == *dev* ]]; then
                 echo "Dev branch detected — skipping gangway, using dummy values"
                 export PROW_JOB_STATE="success"
                 export PROW_JOB_URL="https://prow.ci.openshift.org/view/dummy-dev-job"

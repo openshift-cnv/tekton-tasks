@@ -125,16 +125,23 @@ spec:
               AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 
               # Find open PR by commit SHA — works for both same-repo and cross-repo/fork PRs
-              PR_NUMBER=$(curl -s -H "${AUTH_HEADER}" \
+              COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
                 -H "Accept: application/vnd.github+json" \
-                "${GH_API}/commits/${GIT_REVISION}/pulls" \
-                | jq -r '[.[] | select(.state == "open")][0].number // empty')
+                "${GH_API}/commits/${GIT_REVISION}/pulls")
+              PR_NUMBER=""
+              if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
+              fi
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                # Fallback: search by branch name
-                PR_NUMBER=$(curl -s -H "${AUTH_HEADER}" \
+                # Fallback: search by branch name (owner:branch format for cross-repo PRs)
+                REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
+                BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
                   -H "Accept: application/vnd.github+json" \
-                  "${GH_API}/pulls?state=open&head=${SOURCE_BRANCH}" \
-                  | jq -r '.[0].number // empty')
+                  "${GH_API}/pulls?state=open&head=${REPO_OWNER}:${SOURCE_BRANCH}")
+                PR_NUMBER=""
+                if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                  PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
+                fi
               fi
               if [[ -n "${PR_NUMBER}" ]]; then
                 echo "Open PR found: #${PR_NUMBER}"

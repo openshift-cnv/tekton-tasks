@@ -384,9 +384,20 @@ spec:
               ACTION_LOG+=("OK|Validate revision|exit=0|0s")
 
               # --- Generate GitHub App installation token ---
+              # The GitHub App is installed on the upstream repo, not forks.
+              # git-url may point to a fork, so we resolve the upstream via the API.
               REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-              GH_API="https://api.github.com/repos/${REPO_SLUG}"
               APP_PEM="/credentials/github-app/github_app_private_key.pem"
+
+              # Check if git-url is a fork — if so, use the parent (upstream) repo
+              REPO_INFO=$(curl -s "https://api.github.com/repos/${REPO_SLUG}")
+              IS_FORK=$(echo "${REPO_INFO}" | jq -r '.fork // false')
+              if [[ "${IS_FORK}" == "true" ]]; then
+                UPSTREAM_SLUG=$(echo "${REPO_INFO}" | jq -r '.parent.full_name')
+                echo "Fork detected: ${REPO_SLUG} -> upstream: ${UPSTREAM_SLUG}"
+                REPO_SLUG="${UPSTREAM_SLUG}"
+              fi
+              GH_API="https://api.github.com/repos/${REPO_SLUG}"
 
               NOW=$(date +%s)
               IAT=$((NOW - 60))

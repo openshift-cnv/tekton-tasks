@@ -438,39 +438,55 @@ spec:
               echo "Pipeline Status: ${PIPELINE_STATUS}"
 
               # --- Discover PR number from revision ---
+              # The revision param is the original PR head SHA at pipeline start.
+              # By the time the finally task runs, the main task may have pushed
+              # a new commit, changing the PR's head SHA. So we try multiple methods.
+              ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
               echo "Looking up open PR for revision ${GIT_REVISION}..."
+              echo "  git-url repo: ${ORIG_REPO_SLUG}"
+              echo "  upstream repo: ${REPO_SLUG}"
               PR_NUMBER=""
 
-              # Method 1: List all open PRs and find one whose head SHA matches
-              PAGE=1
-              while [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; do
-                PR_LIST=$(curl -s -H "${AUTH_HEADER}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${GH_API}/pulls?state=open&per_page=100&page=${PAGE}")
-                if ! echo "${PR_LIST}" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
-                  break
+              # Method 1: commits API — finds PRs containing this commit
+              COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                -H "Accept: application/vnd.github+json" \
+                "${GH_API}/commits/${GIT_REVISION}/pulls" 2>/dev/null || true)
+              if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
+                if [[ -n "${PR_NUMBER}" && "${PR_NUMBER}" != "null" ]]; then
+                  echo "Found PR via commits API: #${PR_NUMBER}"
                 fi
-                PR_NUMBER=$(echo "${PR_LIST}" | jq -r \
-                  --arg sha "${GIT_REVISION}" \
-                  '[.[] | select(.head.sha == $sha)][0].number // empty')
-                PAGE=$((PAGE + 1))
-                if [[ ${PAGE} -gt 10 ]]; then
-                  echo "WARN: Searched 1000 open PRs without match, stopping"
-                  break
-                fi
-              done
+              fi
 
+              # Method 2: List open PRs and match — first by head SHA, then by
+              # head repo+ref (branch name survives new pushes to the branch)
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                # Method 2: Commit SHA lookup (works for same-repo PRs)
-                echo "Head SHA match did not find PR, trying commits API..."
-                COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${GH_API}/commits/${GIT_REVISION}/pulls")
-                if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                  PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
-                else
-                  echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
-                fi
+                echo "Commits API did not find PR, scanning open PRs..."
+                PAGE=1
+                while [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; do
+                  PR_LIST=$(curl -s -H "${AUTH_HEADER}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${GH_API}/pulls?state=open&per_page=100&page=${PAGE}")
+                  if ! echo "${PR_LIST}" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+                    break
+                  fi
+                  # Try exact head SHA match first
+                  PR_NUMBER=$(echo "${PR_LIST}" | jq -r \
+                    --arg sha "${GIT_REVISION}" \
+                    '[.[] | select(.head.sha == $sha)][0].number // empty')
+                  # If SHA didn't match (commit was pushed after pipeline started),
+                  # match by head repo — the PR from this repo/fork
+                  if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
+                    PR_NUMBER=$(echo "${PR_LIST}" | jq -r \
+                      --arg repo "${ORIG_REPO_SLUG}" \
+                      '[.[] | select(.head.repo.full_name == $repo)][0].number // empty')
+                  fi
+                  PAGE=$((PAGE + 1))
+                  if [[ ${PAGE} -gt 10 ]]; then
+                    echo "WARN: Searched 1000 open PRs without match, stopping"
+                    break
+                  fi
+                done
               fi
 
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then

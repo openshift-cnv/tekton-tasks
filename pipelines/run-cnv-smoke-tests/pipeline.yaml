@@ -44,8 +44,12 @@ spec:
           - name: path-context
           - name: prow-job
         results:
-          - name: PR_NUMBER
-            description: Pull request number associated with the source branch
+          - name: SMOKE_RESULTS_YAML
+            description: Generated smokeResults.yaml content for the finally task to push
+          - name: SOURCE_BRANCH
+            description: Resolved branch name from the commit
+          - name: HCO_BUNDLE_VERSION
+            description: HCO bundle version for the commit message
           - name: IMAGE_DIGEST
             description: Digest of the image just built
           - name: IMAGE_URL
@@ -120,48 +124,6 @@ spec:
               SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
               echo "Source branch resolved: ${SOURCE_BRANCH}"
 
-              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-              GH_API="https://api.github.com/repos/${REPO_SLUG}"
-              AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
-
-              # Find open PR — try branch name first (most reliable), then commit SHA
-              REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
-              ENCODED_BRANCH=$(printf '%s' "${SOURCE_BRANCH}" | jq -sRr @uri)
-              ENCODED_HEAD=$(printf '%s' "${REPO_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
-
-              echo "Looking up PR: repo=${REPO_SLUG} branch=${SOURCE_BRANCH} sha=${GIT_REVISION}"
-
-              # Primary: search by branch name (owner:branch format)
-              BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
-                -H "Accept: application/vnd.github+json" \
-                "${GH_API}/pulls?state=open&head=${ENCODED_HEAD}")
-              PR_NUMBER=""
-              if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
-              else
-                echo "Branch lookup response: $(echo "${BRANCH_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
-              fi
-
-              if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                # Fallback: search by commit SHA
-                COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${GH_API}/commits/${GIT_REVISION}/pulls")
-                PR_NUMBER=""
-                if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                  PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
-                else
-                  echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
-                fi
-              fi
-              if [[ -n "${PR_NUMBER}" ]]; then
-                echo "Open PR found: #${PR_NUMBER}"
-              else
-                echo "WARN: No open PR found for revision ${GIT_REVISION} or branch ${SOURCE_BRANCH}"
-                PR_NUMBER=""
-              fi
-              echo -n "${PR_NUMBER}" > $(results.PR_NUMBER.path)
-
               export JOB_INFO_FILE="/tmp/prow.yaml"
               export CNV_OPERATOR_CHANNEL=$(yq '.channel' payload.yaml)
               export FREIGHT_NAME=$(yq '.freightName' payload.yaml)
@@ -211,16 +173,9 @@ spec:
                 .snapshotID    = env(SNAPSHOT_ID)
                 ' | yq 'sort_keys(..)' | tee smokeResults.yaml
 
-              git config user.name "${GIT_USER_NAME}"
-              git config user.email "${GIT_USER_EMAIL}"
-
-              git add smokeResults.yaml
-              git commit -m "🧪 Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
-
-              git checkout -B "${SOURCE_BRANCH}"
-
-              curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
-                | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
+              echo -n "$(cat smokeResults.yaml)" > $(results.SMOKE_RESULTS_YAML.path)
+              echo -n "${SOURCE_BRANCH}" > $(results.SOURCE_BRANCH.path)
+              echo -n "${HCO_BUNDLE_VERSION}" > $(results.HCO_BUNDLE_VERSION.path)
 
               exit ${exit_code:-0}
 
@@ -233,6 +188,14 @@ spec:
           value: $(params.git-url)
         - name: revision
           value: $(params.revision)
+        - name: path-context
+          value: $(params.path-context)
+        - name: smoke-results-yaml
+          value: $(tasks.run-smoke-tests.results.SMOKE_RESULTS_YAML)
+        - name: source-branch
+          value: $(tasks.run-smoke-tests.results.SOURCE_BRANCH)
+        - name: hco-bundle-version
+          value: $(tasks.run-smoke-tests.results.HCO_BUNDLE_VERSION)
         - name: debug
           value: $(params.debug)
       taskSpec:
@@ -240,6 +203,10 @@ spec:
           - name: pipeline-status
           - name: git-url
           - name: revision
+          - name: path-context
+          - name: smoke-results-yaml
+          - name: source-branch
+          - name: hco-bundle-version
           - name: debug
         volumes:
           - name: github-app-private-key
@@ -258,6 +225,24 @@ spec:
                 value: $(params.git-url)
               - name: GIT_REVISION
                 value: $(params.revision)
+              - name: PATH_CONTEXT
+                value: $(params.path-context)
+              - name: SMOKE_RESULTS_YAML
+                value: $(params.smoke-results-yaml)
+              - name: SOURCE_BRANCH
+                value: $(params.source-branch)
+              - name: HCO_BUNDLE_VERSION
+                value: $(params.hco-bundle-version)
+              - name: GIT_USER_NAME
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GIT_USER_NAME
+              - name: GIT_USER_EMAIL
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GIT_USER_EMAIL
               - name: GITHUB_APP_ID
                 valueFrom:
                   secretKeyRef:
@@ -436,6 +421,29 @@ spec:
               echo "Repository: ${REPO_SLUG}"
               echo "Revision:   ${GIT_REVISION}"
               echo "Pipeline Status: ${PIPELINE_STATUS}"
+
+              # --- Push smokeResults.yaml to PR branch ---
+              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
+                echo ""
+                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
+                PUSH_DIR=$(mktemp -d)
+                git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" "${PUSH_DIR}"
+                pushd "${PUSH_DIR}/${PATH_CONTEXT}"
+                git checkout "${GIT_REVISION}"
+                echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
+                git config user.name "${GIT_USER_NAME}"
+                git config user.email "${GIT_USER_EMAIL}"
+                git add smokeResults.yaml
+                git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
+                git checkout -B "${SOURCE_BRANCH}"
+                git push origin "${SOURCE_BRANCH}"
+                popd
+                rm -rf "${PUSH_DIR}"
+                ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
+              else
+                echo "INFO: No smoke results to push (main task may have failed before generating results)"
+                ACTION_LOG+=("OK|Skip push - no results|exit=0|0s")
+              fi
 
               # --- Discover PR number from revision ---
               # The revision param is the original PR head SHA at pipeline start.

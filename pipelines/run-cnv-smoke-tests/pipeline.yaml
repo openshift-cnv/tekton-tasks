@@ -229,17 +229,17 @@ spec:
       params:
         - name: pipeline-status
           value: $(tasks.status)
-        - name: pull-request-number
-          value: $(tasks.run-smoke-tests.results.PR_NUMBER)
         - name: git-url
           value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
         - name: debug
           value: $(params.debug)
       taskSpec:
         params:
           - name: pipeline-status
-          - name: pull-request-number
           - name: git-url
+          - name: revision
           - name: debug
         volumes:
           - name: github-app-private-key
@@ -254,10 +254,10 @@ spec:
             env:
               - name: PIPELINE_STATUS
                 value: $(params.pipeline-status)
-              - name: PR_NUMBER
-                value: $(params.pull-request-number)
               - name: GIT_REPOSITORY
                 value: $(params.git-url)
+              - name: GIT_REVISION
+                value: $(params.revision)
               - name: GITHUB_APP_ID
                 valueFrom:
                   secretKeyRef:
@@ -369,14 +369,6 @@ spec:
               set -eo pipefail
 
               # --- Validate inputs ---
-              if [[ -z "${PR_NUMBER}" ]]; then
-                echo "INFO: No PR number discovered — skipping PR management"
-                ACTION_LOG+=("OK|Skip - no PR number|exit=0|0s")
-                FINAL_EXIT_CODE=0
-                exit 0
-              fi
-              ACTION_LOG+=("OK|Validate PR number|exit=0|0s")
-
               if [[ -z "${GIT_REPOSITORY}" ]]; then
                 echo "ERROR: git-url is empty"
                 FINAL_EXIT_CODE=1
@@ -384,13 +376,68 @@ spec:
               fi
               ACTION_LOG+=("OK|Validate git-url|exit=0|0s")
 
+              if [[ -z "${GIT_REVISION}" ]]; then
+                echo "ERROR: revision is empty"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|Validate revision|exit=0|0s")
+
               # --- Setup GitHub API ---
               REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
               GH_API="https://api.github.com/repos/${REPO_SLUG}"
+              AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 
               echo "Repository: ${REPO_SLUG}"
-              echo "PR Number:  ${PR_NUMBER}"
+              echo "Revision:   ${GIT_REVISION}"
               echo "Pipeline Status: ${PIPELINE_STATUS}"
+
+              # --- Discover PR number from revision ---
+              echo "Looking up open PR for revision ${GIT_REVISION}..."
+
+              # Try commit SHA lookup
+              COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                -H "Accept: application/vnd.github+json" \
+                "${GH_API}/commits/${GIT_REVISION}/pulls")
+              PR_NUMBER=""
+              if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
+              else
+                echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
+              fi
+
+              if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
+                # Fallback: clone and resolve branch, then search by branch name
+                echo "Commit lookup did not find PR, trying branch lookup..."
+                SOURCE_BRANCH=$(git ls-remote --heads "${GIT_REPOSITORY}" \
+                  | awk '{print $1, $2}' \
+                  | grep "^${GIT_REVISION}" \
+                  | head -1 \
+                  | sed 's|.*refs/heads/||')
+                if [[ -n "${SOURCE_BRANCH}" ]]; then
+                  REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
+                  ENCODED_HEAD=$(printf '%s' "${REPO_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
+                  BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${GH_API}/pulls?state=open&head=${ENCODED_HEAD}")
+                  if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                    PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
+                  else
+                    echo "Branch lookup response: $(echo "${BRANCH_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
+                  fi
+                else
+                  echo "Could not resolve branch name from revision ${GIT_REVISION}"
+                fi
+              fi
+
+              if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
+                echo "INFO: No open PR found — skipping PR management"
+                ACTION_LOG+=("OK|Skip - no PR found|exit=0|0s")
+                FINAL_EXIT_CODE=0
+                exit 0
+              fi
+              echo "Open PR found: #${PR_NUMBER}"
+              ACTION_LOG+=("OK|Discover PR #${PR_NUMBER}|exit=0|0s")
 
               gh_api_call() {
                 local method="$1" endpoint="$2" data="${3:-}"

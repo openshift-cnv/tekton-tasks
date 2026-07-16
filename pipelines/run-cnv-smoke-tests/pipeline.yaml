@@ -452,7 +452,6 @@ spec:
               fi
 
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                # Fallback: clone and resolve branch, then search by branch name
                 echo "Commit lookup did not find PR, trying branch lookup..."
                 SOURCE_BRANCH=$(git ls-remote --heads "${GIT_REPOSITORY}" \
                   | awk '{print $1, $2}' \
@@ -460,8 +459,10 @@ spec:
                   | head -1 \
                   | sed 's|.*refs/heads/||')
                 if [[ -n "${SOURCE_BRANCH}" ]]; then
-                  REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
-                  ENCODED_HEAD=$(printf '%s' "${REPO_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
+                  # For fork PRs, head filter must use fork owner, not upstream owner
+                  FORK_OWNER=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|/.*||')
+                  ENCODED_HEAD=$(printf '%s' "${FORK_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
+                  echo "Searching PRs with head=${FORK_OWNER}:${SOURCE_BRANCH}"
                   BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
                     -H "Accept: application/vnd.github+json" \
                     "${GH_API}/pulls?state=open&head=${ENCODED_HEAD}")

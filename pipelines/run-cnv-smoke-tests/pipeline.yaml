@@ -383,9 +383,43 @@ spec:
               fi
               ACTION_LOG+=("OK|Validate revision|exit=0|0s")
 
-              # --- Setup GitHub API ---
+              # --- Generate GitHub App installation token ---
               REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
               GH_API="https://api.github.com/repos/${REPO_SLUG}"
+              APP_PEM="/credentials/github-app/github_app_private_key.pem"
+
+              NOW=$(date +%s)
+              IAT=$((NOW - 60))
+              EXP=$((NOW + 600))
+              HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              SIGNATURE=$(printf '%s.%s' "${HEADER}" "${PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
+
+              INSTALLATION_ID=$(curl -s -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "${GH_API}/installation" | jq -r '.id')
+
+              if [[ -z "${INSTALLATION_ID}" || "${INSTALLATION_ID}" == "null" ]]; then
+                echo "ERROR: Could not find GitHub App installation for ${REPO_SLUG}"
+                ACTION_LOG+=("FAILED|GitHub App auth|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
+              GITHUB_TOKEN=$(curl -s -X POST \
+                -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
+                | jq -r '.token')
+
+              if [[ -z "${GITHUB_TOKEN}" || "${GITHUB_TOKEN}" == "null" ]]; then
+                echo "ERROR: Could not generate installation token"
+                ACTION_LOG+=("FAILED|GitHub App token|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|GitHub App auth|exit=0|0s")
               AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 
               echo "Repository: ${REPO_SLUG}"

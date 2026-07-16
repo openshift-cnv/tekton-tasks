@@ -124,23 +124,34 @@ spec:
               GH_API="https://api.github.com/repos/${REPO_SLUG}"
               AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
 
-              # Find open PR by commit SHA — works for both same-repo and cross-repo/fork PRs
-              COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+              # Find open PR — try branch name first (most reliable), then commit SHA
+              REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
+              ENCODED_BRANCH=$(printf '%s' "${SOURCE_BRANCH}" | jq -sRr @uri)
+              ENCODED_HEAD=$(printf '%s' "${REPO_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
+
+              echo "Looking up PR: repo=${REPO_SLUG} branch=${SOURCE_BRANCH} sha=${GIT_REVISION}"
+
+              # Primary: search by branch name (owner:branch format)
+              BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
                 -H "Accept: application/vnd.github+json" \
-                "${GH_API}/commits/${GIT_REVISION}/pulls")
+                "${GH_API}/pulls?state=open&head=${ENCODED_HEAD}")
               PR_NUMBER=""
-              if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
+              if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
+              else
+                echo "Branch lookup response: $(echo "${BRANCH_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
               fi
+
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                # Fallback: search by branch name (owner:branch format for cross-repo PRs)
-                REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
-                BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                # Fallback: search by commit SHA
+                COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
                   -H "Accept: application/vnd.github+json" \
-                  "${GH_API}/pulls?state=open&head=${REPO_OWNER}:${SOURCE_BRANCH}")
+                  "${GH_API}/commits/${GIT_REVISION}/pulls")
                 PR_NUMBER=""
-                if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                  PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
+                if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                  PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
+                else
+                  echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
                 fi
               fi
               if [[ -n "${PR_NUMBER}" ]]; then

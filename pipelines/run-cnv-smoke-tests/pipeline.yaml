@@ -439,40 +439,37 @@ spec:
 
               # --- Discover PR number from revision ---
               echo "Looking up open PR for revision ${GIT_REVISION}..."
-
-              # Try commit SHA lookup
-              COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
-                -H "Accept: application/vnd.github+json" \
-                "${GH_API}/commits/${GIT_REVISION}/pulls")
               PR_NUMBER=""
-              if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
-              else
-                echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
-              fi
+
+              # Method 1: List all open PRs and find one whose head SHA matches
+              PAGE=1
+              while [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; do
+                PR_LIST=$(curl -s -H "${AUTH_HEADER}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${GH_API}/pulls?state=open&per_page=100&page=${PAGE}")
+                if ! echo "${PR_LIST}" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
+                  break
+                fi
+                PR_NUMBER=$(echo "${PR_LIST}" | jq -r \
+                  --arg sha "${GIT_REVISION}" \
+                  '[.[] | select(.head.sha == $sha)][0].number // empty')
+                PAGE=$((PAGE + 1))
+                if [[ ${PAGE} -gt 10 ]]; then
+                  echo "WARN: Searched 1000 open PRs without match, stopping"
+                  break
+                fi
+              done
 
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                echo "Commit lookup did not find PR, trying branch lookup..."
-                SOURCE_BRANCH=$(git ls-remote --heads "${GIT_REPOSITORY}" \
-                  | awk '{print $1, $2}' \
-                  | grep "^${GIT_REVISION}" \
-                  | head -1 \
-                  | sed 's|.*refs/heads/||')
-                if [[ -n "${SOURCE_BRANCH}" ]]; then
-                  # For fork PRs, head filter must use fork owner, not upstream owner
-                  FORK_OWNER=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|/.*||')
-                  ENCODED_HEAD=$(printf '%s' "${FORK_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
-                  echo "Searching PRs with head=${FORK_OWNER}:${SOURCE_BRANCH}"
-                  BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
-                    -H "Accept: application/vnd.github+json" \
-                    "${GH_API}/pulls?state=open&head=${ENCODED_HEAD}")
-                  if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
-                    PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
-                  else
-                    echo "Branch lookup response: $(echo "${BRANCH_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
-                  fi
+                # Method 2: Commit SHA lookup (works for same-repo PRs)
+                echo "Head SHA match did not find PR, trying commits API..."
+                COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${GH_API}/commits/${GIT_REVISION}/pulls")
+                if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                  PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
                 else
-                  echo "Could not resolve branch name from revision ${GIT_REVISION}"
+                  echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
                 fi
               fi
 

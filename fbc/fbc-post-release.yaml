@@ -44,7 +44,7 @@ spec:
             description: Full bundle version from updated_image.yaml
         steps:
           - name: get-info
-            image: quay.io/konflux-ci/release-service-utils:0a58b6a6b562879e89395636d97931f2dcbb494c
+            image: quay.io/konflux-ci/release-service-utils:105474114b10c0bd52eda96bc67490447131b784
             envFrom:
               - secretRef:
                   name: cnv-ci-release-token

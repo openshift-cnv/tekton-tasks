@@ -215,7 +215,7 @@ spec:
               git config user.email "${GIT_USER_EMAIL}"
 
               git add smokeResults.yaml
-              git commit -m "🧪 Update Smoke Results For ${HCO_BUNDLE_VERSION}"
+              git commit -m "🧪 Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
 
               git checkout -B "${SOURCE_BRANCH}"
 

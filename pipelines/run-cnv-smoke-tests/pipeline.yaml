@@ -423,33 +423,39 @@ spec:
               echo "Pipeline Status: ${PIPELINE_STATUS}"
 
               # --- Push smokeResults.yaml to PR branch ---
+              # Clone from git-url (fork or upstream — wherever the commit lives),
+              # then push to the upstream repo where the PR target is.
+              ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
               if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
                 echo ""
                 echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
+                echo "  Clone source: ${ORIG_REPO_SLUG} (where commit lives)"
+                echo "  Push target:  ${REPO_SLUG} (upstream)"
                 PUSH_DIR=$(mktemp -d)
-                git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" "${PUSH_DIR}"
-                pushd "${PUSH_DIR}/${PATH_CONTEXT}"
-                git checkout "${GIT_REVISION}"
-                echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
-                git config user.name "${GIT_USER_NAME}"
-                git config user.email "${GIT_USER_EMAIL}"
-                git add smokeResults.yaml
-                git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
-                git checkout -B "${SOURCE_BRANCH}"
-                git push origin "${SOURCE_BRANCH}"
-                popd
+                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
+                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
+                   git checkout "${GIT_REVISION}"; then
+                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
+                  git config user.name "${GIT_USER_NAME}"
+                  git config user.email "${GIT_USER_EMAIL}"
+                  git add smokeResults.yaml
+                  git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
+                  git checkout -B "${SOURCE_BRANCH}"
+                  git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
+                  git push origin "${SOURCE_BRANCH}"
+                  popd
+                  ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
+                else
+                  echo "WARN: Failed to clone/checkout for push (continuing to PR management)"
+                  ACTION_LOG+=("FAILED|Push smokeResults.yaml|exit=1|0s")
+                fi
                 rm -rf "${PUSH_DIR}"
-                ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
               else
                 echo "INFO: No smoke results to push (main task may have failed before generating results)"
                 ACTION_LOG+=("OK|Skip push - no results|exit=0|0s")
               fi
 
               # --- Discover PR number from revision ---
-              # The revision param is the original PR head SHA at pipeline start.
-              # By the time the finally task runs, the main task may have pushed
-              # a new commit, changing the PR's head SHA. So we try multiple methods.
-              ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
               echo "Looking up open PR for revision ${GIT_REVISION}..."
               echo "  git-url repo: ${ORIG_REPO_SLUG}"
               echo "  upstream repo: ${REPO_SLUG}"

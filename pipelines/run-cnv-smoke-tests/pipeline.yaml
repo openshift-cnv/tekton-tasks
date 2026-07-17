@@ -548,14 +548,24 @@ spec:
                 Succeeded|Completed)
                   echo ""
                   echo "Pipeline SUCCEEDED — merging PR #${PR_NUMBER}"
-                  if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
-                    "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (status: ${PIPELINE_STATUS})\"}"; then
-                    echo "ERROR: Failed to merge PR"
+                  MERGE_OK=false
+                  for attempt in 1 2 3 4 5; do
+                    if gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
+                      "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (status: ${PIPELINE_STATUS})\"}"; then
+                      MERGE_OK=true
+                      break
+                    fi
+                    echo "Merge attempt ${attempt}/5 failed, waiting 10s for mergeability..."
+                    sleep 10
+                  done
+                  if [[ "${MERGE_OK}" == "true" ]]; then
+                    ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
+                  else
+                    echo "ERROR: Failed to merge PR after 5 attempts"
                     ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
                     FINAL_EXIT_CODE=1
                     exit 1
                   fi
-                  ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
                   ;;
 
                 Failed)

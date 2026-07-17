@@ -44,14 +44,8 @@ spec:
           - name: path-context
           - name: prow-job
         results:
-          - name: SMOKE_RESULTS_YAML
-            description: Generated smokeResults.yaml content for the finally task to push
-          - name: SOURCE_BRANCH
-            description: Resolved branch name from the commit
-          - name: HCO_BUNDLE_VERSION
-            description: HCO bundle version for the commit message
-          - name: PROW_EXIT_CODE
-            description: Exit code from the Prow job (0=success, non-zero=failure)
+          - name: PR_NUMBER
+            description: Pull request number associated with the source branch
           - name: IMAGE_DIGEST
             description: Digest of the image just built
           - name: IMAGE_URL
@@ -126,6 +120,48 @@ spec:
               SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
               echo "Source branch resolved: ${SOURCE_BRANCH}"
 
+              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+              GH_API="https://api.github.com/repos/${REPO_SLUG}"
+              AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
+
+              # Find open PR — try branch name first (most reliable), then commit SHA
+              REPO_OWNER=$(echo "${REPO_SLUG}" | cut -d'/' -f1)
+              ENCODED_BRANCH=$(printf '%s' "${SOURCE_BRANCH}" | jq -sRr @uri)
+              ENCODED_HEAD=$(printf '%s' "${REPO_OWNER}:${SOURCE_BRANCH}" | jq -sRr @uri)
+
+              echo "Looking up PR: repo=${REPO_SLUG} branch=${SOURCE_BRANCH} sha=${GIT_REVISION}"
+
+              # Primary: search by branch name (owner:branch format)
+              BRANCH_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                -H "Accept: application/vnd.github+json" \
+                "${GH_API}/pulls?state=open&head=${ENCODED_HEAD}")
+              PR_NUMBER=""
+              if echo "${BRANCH_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                PR_NUMBER=$(echo "${BRANCH_PR_RESPONSE}" | jq -r '.[0].number // empty')
+              else
+                echo "Branch lookup response: $(echo "${BRANCH_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
+              fi
+
+              if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
+                # Fallback: search by commit SHA
+                COMMIT_PR_RESPONSE=$(curl -s -H "${AUTH_HEADER}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${GH_API}/commits/${GIT_REVISION}/pulls")
+                PR_NUMBER=""
+                if echo "${COMMIT_PR_RESPONSE}" | jq -e 'type == "array"' > /dev/null 2>&1; then
+                  PR_NUMBER=$(echo "${COMMIT_PR_RESPONSE}" | jq -r '[.[] | select(.state == "open")][0].number // empty')
+                else
+                  echo "Commit lookup response: $(echo "${COMMIT_PR_RESPONSE}" | jq -r '.message // "unexpected format"')"
+                fi
+              fi
+              if [[ -n "${PR_NUMBER}" ]]; then
+                echo "Open PR found: #${PR_NUMBER}"
+              else
+                echo "WARN: No open PR found for revision ${GIT_REVISION} or branch ${SOURCE_BRANCH}"
+                PR_NUMBER=""
+              fi
+              echo -n "${PR_NUMBER}" > $(results.PR_NUMBER.path)
+
               export JOB_INFO_FILE="/tmp/prow.yaml"
               export CNV_OPERATOR_CHANNEL=$(yq '.channel' payload.yaml)
               export FREIGHT_NAME=$(yq '.freightName' payload.yaml)
@@ -175,14 +211,18 @@ spec:
                 .snapshotID    = env(SNAPSHOT_ID)
                 ' | yq 'sort_keys(..)' | tee smokeResults.yaml
 
-              echo -n "$(cat smokeResults.yaml)" > $(results.SMOKE_RESULTS_YAML.path)
-              echo -n "${SOURCE_BRANCH}" > $(results.SOURCE_BRANCH.path)
-              echo -n "${HCO_BUNDLE_VERSION}" > $(results.HCO_BUNDLE_VERSION.path)
-              echo -n "${exit_code:-0}" > $(results.PROW_EXIT_CODE.path)
+              git config user.name "${GIT_USER_NAME}"
+              git config user.email "${GIT_USER_EMAIL}"
 
-              # Always exit 0 so Tekton propagates results to the finally task.
-              # The actual pass/fail is communicated via PROW_EXIT_CODE result.
-              exit 0
+              git add smokeResults.yaml
+              git commit -m "🧪 Update Smoke Results For ${HCO_BUNDLE_VERSION}"
+
+              git checkout -B "${SOURCE_BRANCH}"
+
+              curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
+                | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
+
+              exit ${exit_code:-0}
 
   finally:
     - name: manage-pull-request
@@ -193,16 +233,6 @@ spec:
           value: $(params.git-url)
         - name: revision
           value: $(params.revision)
-        - name: path-context
-          value: $(params.path-context)
-        - name: smoke-results-yaml
-          value: $(tasks.run-smoke-tests.results.SMOKE_RESULTS_YAML)
-        - name: source-branch
-          value: $(tasks.run-smoke-tests.results.SOURCE_BRANCH)
-        - name: hco-bundle-version
-          value: $(tasks.run-smoke-tests.results.HCO_BUNDLE_VERSION)
-        - name: prow-exit-code
-          value: $(tasks.run-smoke-tests.results.PROW_EXIT_CODE)
         - name: debug
           value: $(params.debug)
       taskSpec:
@@ -210,11 +240,6 @@ spec:
           - name: pipeline-status
           - name: git-url
           - name: revision
-          - name: path-context
-          - name: smoke-results-yaml
-          - name: source-branch
-          - name: hco-bundle-version
-          - name: prow-exit-code
           - name: debug
         volumes:
           - name: github-app-private-key
@@ -233,26 +258,6 @@ spec:
                 value: $(params.git-url)
               - name: GIT_REVISION
                 value: $(params.revision)
-              - name: PATH_CONTEXT
-                value: $(params.path-context)
-              - name: SMOKE_RESULTS_YAML
-                value: $(params.smoke-results-yaml)
-              - name: SOURCE_BRANCH
-                value: $(params.source-branch)
-              - name: HCO_BUNDLE_VERSION
-                value: $(params.hco-bundle-version)
-              - name: PROW_EXIT_CODE
-                value: $(params.prow-exit-code)
-              - name: GIT_USER_NAME
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GIT_USER_NAME
-              - name: GIT_USER_EMAIL
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GIT_USER_EMAIL
               - name: GITHUB_APP_ID
                 valueFrom:
                   secretKeyRef:
@@ -432,9 +437,11 @@ spec:
               echo "Revision:   ${GIT_REVISION}"
               echo "Pipeline Status: ${PIPELINE_STATUS}"
 
-              ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-
               # --- Discover PR number from revision ---
+              # The revision param is the original PR head SHA at pipeline start.
+              # By the time the finally task runs, the main task may have pushed
+              # a new commit, changing the PR's head SHA. So we try multiple methods.
+              ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
               echo "Looking up open PR for revision ${GIT_REVISION}..."
               echo "  git-url repo: ${ORIG_REPO_SLUG}"
               echo "  upstream repo: ${REPO_SLUG}"
@@ -522,64 +529,53 @@ spec:
                 fi
               }
 
-              # --- Decide action based on Prow exit code ---
-              # The main task always exits 0 (so results propagate). The actual
-              # pass/fail is determined by PROW_EXIT_CODE.
-              echo "Prow exit code: ${PROW_EXIT_CODE}"
+              # --- Decide action based on pipeline status ---
+              case "${PIPELINE_STATUS}" in
+                Succeeded|Completed)
+                  echo ""
+                  echo "Pipeline SUCCEEDED — merging PR #${PR_NUMBER}"
+                  if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
+                    "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (status: ${PIPELINE_STATUS})\"}"; then
+                    echo "ERROR: Failed to merge PR"
+                    ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
+                    FINAL_EXIT_CODE=1
+                    exit 1
+                  fi
+                  ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
+                  ;;
 
-              if [[ "${PROW_EXIT_CODE}" == "0" ]]; then
-                echo ""
-                echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
-                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
-                  "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (prow exit: ${PROW_EXIT_CODE})\"}"; then
-                  echo "ERROR: Failed to merge PR"
-                  ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
-                  FINAL_EXIT_CODE=1
-                  exit 1
-                fi
-                ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
-              else
-                echo ""
-                echo "Smoke tests FAILED (prow exit: ${PROW_EXIT_CODE}) — closing PR #${PR_NUMBER}"
-                gh_api_call POST "/issues/${PR_NUMBER}/comments" \
-                  "{\"body\":\"Smoke tests failed (prow exit code: ${PROW_EXIT_CODE}). Closing PR without merge.\"}" \
-                  && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
-                  || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
-                if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
-                  echo "ERROR: Failed to close PR"
-                  ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
-                  FINAL_EXIT_CODE=1
-                  exit 1
-                fi
-                ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
-              fi
+                Failed)
+                  echo ""
+                  echo "Pipeline FAILED — closing PR #${PR_NUMBER}"
+                  gh_api_call POST "/issues/${PR_NUMBER}/comments" \
+                    '{"body":"Smoke tests failed. Closing PR without merge."}' \
+                    && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
+                    || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
+                  if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
+                    echo "ERROR: Failed to close PR"
+                    ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
+                    FINAL_EXIT_CODE=1
+                    exit 1
+                  fi
+                  ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
+                  ;;
 
-              # --- Push smokeResults.yaml AFTER merge/close ---
-              # Push to the source branch so results are recorded. Uses [skip ci]
-              # to prevent PaC from triggering a new pipeline on this push.
-              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
-                echo ""
-                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
-                PUSH_DIR=$(mktemp -d)
-                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
-                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
-                   git checkout "${GIT_REVISION}"; then
-                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
-                  git config user.name "${GIT_USER_NAME}"
-                  git config user.email "${GIT_USER_EMAIL}"
-                  git add smokeResults.yaml
-                  git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
-                  git checkout -B "${SOURCE_BRANCH}"
-                  git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
-                  git push origin "${SOURCE_BRANCH}" || echo "WARN: Push failed (branch may have been deleted after merge)"
-                  popd
-                  ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
-                else
-                  echo "WARN: Failed to clone/checkout for push"
-                  ACTION_LOG+=("FAILED|Push smokeResults.yaml|exit=1|0s")
-                fi
-                rm -rf "${PUSH_DIR}"
-              fi
+                None|*)
+                  echo ""
+                  echo "Pipeline CANCELLED/TIMEOUT (status: ${PIPELINE_STATUS}) — closing PR #${PR_NUMBER}"
+                  gh_api_call POST "/issues/${PR_NUMBER}/comments" \
+                    "{\"body\":\"Pipeline was cancelled or timed out (status: ${PIPELINE_STATUS}). Closing PR without merge.\"}" \
+                    && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
+                    || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
+                  if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
+                    echo "ERROR: Failed to close PR"
+                    ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
+                    FINAL_EXIT_CODE=1
+                    exit 1
+                  fi
+                  ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
+                  ;;
+              esac
 
               FINAL_EXIT_CODE=0
 

@@ -458,10 +458,9 @@ spec:
                 fi
               fi
 
-              # Method 2: List open PRs and match — first by head SHA, then by
-              # head repo+ref (branch name survives new pushes to the branch)
+              # Method 2: List open PRs and match by exact head SHA only
               if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                echo "Commits API did not find PR, scanning open PRs..."
+                echo "Commits API did not find PR, scanning open PRs by head SHA..."
                 PAGE=1
                 while [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; do
                   PR_LIST=$(curl -s -H "${AUTH_HEADER}" \
@@ -470,17 +469,9 @@ spec:
                   if ! echo "${PR_LIST}" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1; then
                     break
                   fi
-                  # Try exact head SHA match first
                   PR_NUMBER=$(echo "${PR_LIST}" | jq -r \
                     --arg sha "${GIT_REVISION}" \
                     '[.[] | select(.head.sha == $sha)][0].number // empty')
-                  # If SHA didn't match (commit was pushed after pipeline started),
-                  # match by head repo — the PR from this repo/fork
-                  if [[ -z "${PR_NUMBER}" || "${PR_NUMBER}" == "null" ]]; then
-                    PR_NUMBER=$(echo "${PR_LIST}" | jq -r \
-                      --arg repo "${ORIG_REPO_SLUG}" \
-                      '[.[] | select(.head.repo.full_name == $repo)][0].number // empty')
-                  fi
                   PAGE=$((PAGE + 1))
                   if [[ ${PAGE} -gt 10 ]]; then
                     echo "WARN: Searched 1000 open PRs without match, stopping"

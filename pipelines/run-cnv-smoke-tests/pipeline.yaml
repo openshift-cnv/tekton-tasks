@@ -50,6 +50,8 @@ spec:
             description: Resolved branch name from the commit
           - name: HCO_BUNDLE_VERSION
             description: HCO bundle version for the commit message
+          - name: PROW_EXIT_CODE
+            description: Exit code from the Prow job (0=success, non-zero=failure)
           - name: IMAGE_DIGEST
             description: Digest of the image just built
           - name: IMAGE_URL
@@ -176,8 +178,11 @@ spec:
               echo -n "$(cat smokeResults.yaml)" > $(results.SMOKE_RESULTS_YAML.path)
               echo -n "${SOURCE_BRANCH}" > $(results.SOURCE_BRANCH.path)
               echo -n "${HCO_BUNDLE_VERSION}" > $(results.HCO_BUNDLE_VERSION.path)
+              echo -n "${exit_code:-0}" > $(results.PROW_EXIT_CODE.path)
 
-              exit ${exit_code:-0}
+              # Always exit 0 so Tekton propagates results to the finally task.
+              # The actual pass/fail is communicated via PROW_EXIT_CODE result.
+              exit 0
 
   finally:
     - name: manage-pull-request
@@ -196,6 +201,8 @@ spec:
           value: $(tasks.run-smoke-tests.results.SOURCE_BRANCH)
         - name: hco-bundle-version
           value: $(tasks.run-smoke-tests.results.HCO_BUNDLE_VERSION)
+        - name: prow-exit-code
+          value: $(tasks.run-smoke-tests.results.PROW_EXIT_CODE)
         - name: debug
           value: $(params.debug)
       taskSpec:
@@ -207,6 +214,7 @@ spec:
           - name: smoke-results-yaml
           - name: source-branch
           - name: hco-bundle-version
+          - name: prow-exit-code
           - name: debug
         volumes:
           - name: github-app-private-key
@@ -233,6 +241,8 @@ spec:
                 value: $(params.source-branch)
               - name: HCO_BUNDLE_VERSION
                 value: $(params.hco-bundle-version)
+              - name: PROW_EXIT_CODE
+                value: $(params.prow-exit-code)
               - name: GIT_USER_NAME
                 valueFrom:
                   secretKeyRef:
@@ -512,53 +522,37 @@ spec:
                 fi
               }
 
-              # --- Decide action based on pipeline status ---
-              case "${PIPELINE_STATUS}" in
-                Succeeded|Completed)
-                  echo ""
-                  echo "Pipeline SUCCEEDED — merging PR #${PR_NUMBER}"
-                  if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
-                    "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (status: ${PIPELINE_STATUS})\"}"; then
-                    echo "ERROR: Failed to merge PR"
-                    ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
-                    FINAL_EXIT_CODE=1
-                    exit 1
-                  fi
-                  ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
-                  ;;
+              # --- Decide action based on Prow exit code ---
+              # The main task always exits 0 (so results propagate). The actual
+              # pass/fail is determined by PROW_EXIT_CODE.
+              echo "Prow exit code: ${PROW_EXIT_CODE}"
 
-                Failed)
-                  echo ""
-                  echo "Pipeline FAILED — closing PR #${PR_NUMBER}"
-                  gh_api_call POST "/issues/${PR_NUMBER}/comments" \
-                    '{"body":"Smoke tests failed. Closing PR without merge."}' \
-                    && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
-                    || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
-                  if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
-                    echo "ERROR: Failed to close PR"
-                    ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
-                    FINAL_EXIT_CODE=1
-                    exit 1
-                  fi
-                  ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
-                  ;;
-
-                None|*)
-                  echo ""
-                  echo "Pipeline CANCELLED/TIMEOUT (status: ${PIPELINE_STATUS}) — closing PR #${PR_NUMBER}"
-                  gh_api_call POST "/issues/${PR_NUMBER}/comments" \
-                    "{\"body\":\"Pipeline was cancelled or timed out (status: ${PIPELINE_STATUS}). Closing PR without merge.\"}" \
-                    && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
-                    || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
-                  if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
-                    echo "ERROR: Failed to close PR"
-                    ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
-                    FINAL_EXIT_CODE=1
-                    exit 1
-                  fi
-                  ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
-                  ;;
-              esac
+              if [[ "${PROW_EXIT_CODE}" == "0" ]]; then
+                echo ""
+                echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
+                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
+                  "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (prow exit: ${PROW_EXIT_CODE})\"}"; then
+                  echo "ERROR: Failed to merge PR"
+                  ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
+              else
+                echo ""
+                echo "Smoke tests FAILED (prow exit: ${PROW_EXIT_CODE}) — closing PR #${PR_NUMBER}"
+                gh_api_call POST "/issues/${PR_NUMBER}/comments" \
+                  "{\"body\":\"Smoke tests failed (prow exit code: ${PROW_EXIT_CODE}). Closing PR without merge.\"}" \
+                  && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
+                  || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
+                if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
+                  echo "ERROR: Failed to close PR"
+                  ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
+              fi
 
               # --- Push smokeResults.yaml AFTER merge/close ---
               # Push happens after PR action so the [skip ci] commit doesn't

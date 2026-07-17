@@ -522,41 +522,11 @@ spec:
                 fi
               }
 
-              # --- Step 1: Push smokeResults.yaml to source branch ---
-              # Push BEFORE merge/close so the file is part of the PR content.
-              # The CEL expression in .tekton/ filters out synchronize events from
-              # bot senders, so this push will not re-trigger the pipeline.
+              # --- Decide action based on Prow exit code ---
+              # The main task always exits 0 (so results propagate). The actual
+              # pass/fail is determined by PROW_EXIT_CODE.
               echo "Prow exit code: ${PROW_EXIT_CODE}"
 
-              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
-                echo ""
-                echo "Pushing smokeResults.yaml to source branch ${SOURCE_BRANCH}..."
-                PUSH_DIR=$(mktemp -d)
-                if git clone --branch "${SOURCE_BRANCH}" --single-branch \
-                     "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" "${PUSH_DIR}" && \
-                   pushd "${PUSH_DIR}/${PATH_CONTEXT}"; then
-                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
-                  git config user.name "${GIT_USER_NAME}"
-                  git config user.email "${GIT_USER_EMAIL}"
-                  git add smokeResults.yaml
-                  if git diff --cached --quiet; then
-                    echo "INFO: smokeResults.yaml already up to date"
-                    ACTION_LOG+=("OK|Push smokeResults.yaml (no-op)|exit=0|0s")
-                  else
-                    git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
-                    git push origin "${SOURCE_BRANCH}"
-                    echo "Pushed smokeResults.yaml to ${SOURCE_BRANCH}"
-                    ACTION_LOG+=("OK|Push smokeResults.yaml to ${SOURCE_BRANCH}|exit=0|0s")
-                  fi
-                  popd
-                else
-                  echo "WARN: Failed to clone/checkout for push"
-                  ACTION_LOG+=("FAILED|Push smokeResults.yaml|exit=1|0s")
-                fi
-                rm -rf "${PUSH_DIR}"
-              fi
-
-              # --- Step 2: Merge or close PR based on Prow exit code ---
               if [[ "${PROW_EXIT_CODE}" == "0" ]]; then
                 echo ""
                 echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
@@ -582,6 +552,33 @@ spec:
                   exit 1
                 fi
                 ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
+              fi
+
+              # --- Push smokeResults.yaml AFTER merge/close ---
+              # Push happens after PR action so the [skip ci] commit doesn't
+              # block mergeability (branch protection requires CI-passing HEAD).
+              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
+                echo ""
+                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
+                PUSH_DIR=$(mktemp -d)
+                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
+                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
+                   git checkout "${GIT_REVISION}"; then
+                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
+                  git config user.name "${GIT_USER_NAME}"
+                  git config user.email "${GIT_USER_EMAIL}"
+                  git add smokeResults.yaml
+                  git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
+                  git checkout -B "${SOURCE_BRANCH}"
+                  git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
+                  git push origin "${SOURCE_BRANCH}" || echo "WARN: Push failed (branch may have been deleted after merge)"
+                  popd
+                  ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
+                else
+                  echo "WARN: Failed to clone/checkout for push"
+                  ACTION_LOG+=("FAILED|Push smokeResults.yaml|exit=1|0s")
+                fi
+                rm -rf "${PUSH_DIR}"
               fi
 
               FINAL_EXIT_CODE=0

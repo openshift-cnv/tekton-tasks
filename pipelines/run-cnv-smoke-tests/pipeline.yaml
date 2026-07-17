@@ -136,7 +136,7 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              if [[ "${SOURCE_BRANCH}" == *dev* ]]; then
+              if [[ "${SOURCE_BRANCH}" == dev/* ]]; then
                 echo "Dev branch detected — skipping gangway, using dummy values"
                 export PROW_JOB_STATE="success"
                 export PROW_JOB_URL="https://prow.ci.openshift.org/view/dummy-dev-job"
@@ -555,8 +555,8 @@ spec:
               fi
 
               # --- Push smokeResults.yaml AFTER merge/close ---
-              # Push happens after PR action so the [skip ci] commit doesn't
-              # block mergeability (branch protection requires CI-passing HEAD).
+              # Push to the source branch so results are recorded. Uses [skip ci]
+              # to prevent PaC from triggering a new pipeline on this push.
               if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
                 echo ""
                 echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."

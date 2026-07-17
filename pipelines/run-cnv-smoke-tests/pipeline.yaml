@@ -422,38 +422,7 @@ spec:
               echo "Revision:   ${GIT_REVISION}"
               echo "Pipeline Status: ${PIPELINE_STATUS}"
 
-              # --- Push smokeResults.yaml to PR branch ---
-              # Clone from git-url (fork or upstream — wherever the commit lives),
-              # then push to the upstream repo where the PR target is.
               ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
-                echo ""
-                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
-                echo "  Clone source: ${ORIG_REPO_SLUG} (where commit lives)"
-                echo "  Push target:  ${REPO_SLUG} (upstream)"
-                PUSH_DIR=$(mktemp -d)
-                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
-                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
-                   git checkout "${GIT_REVISION}"; then
-                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
-                  git config user.name "${GIT_USER_NAME}"
-                  git config user.email "${GIT_USER_EMAIL}"
-                  git add smokeResults.yaml
-                  git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
-                  git checkout -B "${SOURCE_BRANCH}"
-                  git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
-                  git push origin "${SOURCE_BRANCH}"
-                  popd
-                  ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
-                else
-                  echo "WARN: Failed to clone/checkout for push (continuing to PR management)"
-                  ACTION_LOG+=("FAILED|Push smokeResults.yaml|exit=1|0s")
-                fi
-                rm -rf "${PUSH_DIR}"
-              else
-                echo "INFO: No smoke results to push (main task may have failed before generating results)"
-                ACTION_LOG+=("OK|Skip push - no results|exit=0|0s")
-              fi
 
               # --- Discover PR number from revision ---
               echo "Looking up open PR for revision ${GIT_REVISION}..."
@@ -548,24 +517,14 @@ spec:
                 Succeeded|Completed)
                   echo ""
                   echo "Pipeline SUCCEEDED — merging PR #${PR_NUMBER}"
-                  MERGE_OK=false
-                  for attempt in 1 2 3 4 5; do
-                    if gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
-                      "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (status: ${PIPELINE_STATUS})\"}"; then
-                      MERGE_OK=true
-                      break
-                    fi
-                    echo "Merge attempt ${attempt}/5 failed, waiting 10s for mergeability..."
-                    sleep 10
-                  done
-                  if [[ "${MERGE_OK}" == "true" ]]; then
-                    ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
-                  else
-                    echo "ERROR: Failed to merge PR after 5 attempts"
+                  if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
+                    "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline (status: ${PIPELINE_STATUS})\"}"; then
+                    echo "ERROR: Failed to merge PR"
                     ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
                     FINAL_EXIT_CODE=1
                     exit 1
                   fi
+                  ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
                   ;;
 
                 Failed)
@@ -600,6 +559,33 @@ spec:
                   ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
                   ;;
               esac
+
+              # --- Push smokeResults.yaml AFTER merge/close ---
+              # Push happens after PR action so the [skip ci] commit doesn't
+              # block mergeability (branch protection requires CI-passing HEAD).
+              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
+                echo ""
+                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
+                PUSH_DIR=$(mktemp -d)
+                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
+                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
+                   git checkout "${GIT_REVISION}"; then
+                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
+                  git config user.name "${GIT_USER_NAME}"
+                  git config user.email "${GIT_USER_EMAIL}"
+                  git add smokeResults.yaml
+                  git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION} [skip ci]"
+                  git checkout -B "${SOURCE_BRANCH}"
+                  git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
+                  git push origin "${SOURCE_BRANCH}" || echo "WARN: Push failed (branch may have been deleted after merge)"
+                  popd
+                  ACTION_LOG+=("OK|Push smokeResults.yaml|exit=0|0s")
+                else
+                  echo "WARN: Failed to clone/checkout for push"
+                  ACTION_LOG+=("FAILED|Push smokeResults.yaml|exit=1|0s")
+                fi
+                rm -rf "${PUSH_DIR}"
+              fi
 
               FINAL_EXIT_CODE=0
 

@@ -146,7 +146,8 @@ spec:
 
               if [[ "${SOURCE_BRANCH}" == *dev* ]]; then
                 echo "Dev branch detected — skipping gangway, using dummy values"
-                export PROW_JOB_STATE="success"
+                exit_code=1
+                export PROW_JOB_STATE="failure"
                 export PROW_JOB_URL="https://prow.ci.openshift.org/view/dummy-dev-job"
                 export PROW_JOB_YAML="https://prow.ci.openshift.org/prowjob/dummy-dev-job.yaml"
               else

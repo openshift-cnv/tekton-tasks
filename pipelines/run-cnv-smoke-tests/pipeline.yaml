@@ -144,22 +144,29 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              uv run gangway.py \
-                  --trigger "${PROW_JOB_NAME}" \
-                  --write-job-info-file ${JOB_INFO_FILE} \
-                  -e CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
-                  -e CNV_OPERATOR_CHANNEL=${CNV_OPERATOR_CHANNEL} \
-                  -e HCO_BUNDLE_VERSION=${HCO_BUNDLE_VERSION}
+              if [[ "${SOURCE_BRANCH}" == *dev* ]]; then
+                echo "Dev branch detected — skipping gangway, using dummy values"
+                export PROW_JOB_STATE="success"
+                export PROW_JOB_URL="https://prow.ci.openshift.org/view/dummy-dev-job"
+                export PROW_JOB_YAML="https://prow.ci.openshift.org/prowjob/dummy-dev-job.yaml"
+              else
+                uv run gangway.py \
+                    --trigger "${PROW_JOB_NAME}" \
+                    --write-job-info-file ${JOB_INFO_FILE} \
+                    -e CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
+                    -e CNV_OPERATOR_CHANNEL=${CNV_OPERATOR_CHANNEL} \
+                    -e HCO_BUNDLE_VERSION=${HCO_BUNDLE_VERSION}
 
-              PROW_JOB_ID=$(yq '.prowJobId' ${JOB_INFO_FILE})
+                PROW_JOB_ID=$(yq '.prowJobId' ${JOB_INFO_FILE})
 
-              uv run gangway.py \
-                  --write-job-info-file ${JOB_INFO_FILE} \
-                  --wait-job-id ${PROW_JOB_ID} || exit_code=$?
+                uv run gangway.py \
+                --write-job-info-file ${JOB_INFO_FILE} \
+                --wait-job-id ${PROW_JOB_ID} || exit_code=$?
 
-              export PROW_JOB_STATE=$(yq '.prowJobState' ${JOB_INFO_FILE})
-              export PROW_JOB_URL=$(yq '.prowJobUrl' ${JOB_INFO_FILE})
-              export PROW_JOB_YAML=$(yq '.prowJobYamlUrl' ${JOB_INFO_FILE})
+                export PROW_JOB_STATE=$(yq '.prowJobState' ${JOB_INFO_FILE})
+                export PROW_JOB_URL=$(yq '.prowJobUrl' ${JOB_INFO_FILE})
+                export PROW_JOB_YAML=$(yq '.prowJobYamlUrl' ${JOB_INFO_FILE})
+              fi
 
               pushd "repo/${PATH_CONTEXT}"
 

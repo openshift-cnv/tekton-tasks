@@ -451,6 +451,16 @@ spec:
               if [[ "${PROW_EXIT_CODE}" == "0" && "${PUSH_OK}" == "true" ]]; then
                 echo ""
                 echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
+
+                # Update PR branch if behind base (required by branch protection)
+                PR_HEAD=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${GH_API}/pulls/${PR_NUMBER}" | jq -r '.head.ref')
+                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/update-branch" '{}' 2>/dev/null; then
+                  echo "INFO: Branch already up to date or update not needed"
+                fi
+                sleep 3
+
                 if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
                   "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline\"}"; then
                   echo "ERROR: Failed to merge PR #${PR_NUMBER}"

@@ -24,7 +24,11 @@ spec:
     - name: pull-request-number
       type: string
       default: ""
-      description: PR number for closing on failure
+      description: PR number provided by PaC via {{pull_request_number}}
+    - name: debug
+      type: string
+      default: "false"
+      description: Enable debug mode with verbose output (set -x)
   tasks:
     - name: run-smoke-tests
       timeout: 4h0m0s
@@ -47,6 +51,14 @@ spec:
           - name: prow-job
           - name: pull-request-number
         results:
+          - name: SMOKE_RESULTS_YAML
+            description: Generated smokeResults.yaml content for the finally task to push
+          - name: SOURCE_BRANCH
+            description: Resolved branch name from the commit
+          - name: HCO_BUNDLE_VERSION
+            description: HCO bundle version for the commit message
+          - name: PROW_EXIT_CODE
+            description: Exit code from the Prow job (0=success, non-zero=failure)
           - name: IMAGE_DIGEST
             description: Digest of the image just built
           - name: IMAGE_URL
@@ -116,10 +128,6 @@ spec:
 
               set -xeuo pipefail
 
-              echo "========================================="
-              echo "Pull Request Number: $(params.pull-request-number)"
-              echo "========================================="
-
               git clone "${GIT_REPOSITORY}" repo && pushd "repo/${PATH_CONTEXT}" && git checkout "${GIT_REVISION}"
 
               SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
@@ -175,18 +183,286 @@ spec:
                 .snapshotID    = env(SNAPSHOT_ID)
                 ' | yq 'sort_keys(..)' | tee smokeResults.yaml
 
-              git config user.name "${GIT_USER_NAME}"
-              git config user.email "${GIT_USER_EMAIL}"
+              echo -n "$(cat smokeResults.yaml)" > $(results.SMOKE_RESULTS_YAML.path)
+              echo -n "${SOURCE_BRANCH}" > $(results.SOURCE_BRANCH.path)
+              echo -n "${HCO_BUNDLE_VERSION}" > $(results.HCO_BUNDLE_VERSION.path)
+              echo -n "${exit_code:-0}" > $(results.PROW_EXIT_CODE.path)
 
-              git add smokeResults.yaml
-              git commit -m "🧪 Update Smoke Results For ${HCO_BUNDLE_VERSION}"
+              # Always exit 0 so Tekton propagates results to the finally task.
+              # The actual pass/fail is communicated via PROW_EXIT_CODE result.
+              exit 0
 
-              git checkout -B "${SOURCE_BRANCH}"
+  finally:
+    - name: manage-pull-request
+      params:
+        - name: pull-request-number
+          value: $(params.pull-request-number)
+        - name: git-url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+        - name: path-context
+          value: $(params.path-context)
+        - name: smoke-results-yaml
+          value: $(tasks.run-smoke-tests.results.SMOKE_RESULTS_YAML)
+        - name: source-branch
+          value: $(tasks.run-smoke-tests.results.SOURCE_BRANCH)
+        - name: hco-bundle-version
+          value: $(tasks.run-smoke-tests.results.HCO_BUNDLE_VERSION)
+        - name: prow-exit-code
+          value: $(tasks.run-smoke-tests.results.PROW_EXIT_CODE)
+        - name: debug
+          value: $(params.debug)
+      taskSpec:
+        params:
+          - name: pull-request-number
+          - name: git-url
+          - name: revision
+          - name: path-context
+          - name: smoke-results-yaml
+          - name: source-branch
+          - name: hco-bundle-version
+          - name: prow-exit-code
+          - name: debug
+        volumes:
+          - name: github-app-private-key
+            secret:
+              secretName: github-secrets
+              items:
+                - key: GITHUB_APP_PRIVATE_KEY
+                  path: github_app_private_key.pem
+        steps:
+          - name: merge-or-close-pr
+            image: quay.io/cnv-qe-devops/gangway:latest
+            env:
+              - name: PR_NUMBER
+                value: $(params.pull-request-number)
+              - name: GIT_REPOSITORY
+                value: $(params.git-url)
+              - name: GIT_REVISION
+                value: $(params.revision)
+              - name: PATH_CONTEXT
+                value: $(params.path-context)
+              - name: SMOKE_RESULTS_YAML
+                value: $(params.smoke-results-yaml)
+              - name: SOURCE_BRANCH
+                value: $(params.source-branch)
+              - name: HCO_BUNDLE_VERSION
+                value: $(params.hco-bundle-version)
+              - name: PROW_EXIT_CODE
+                value: $(params.prow-exit-code)
+              - name: GIT_USER_NAME
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GIT_USER_NAME
+              - name: GIT_USER_EMAIL
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GIT_USER_EMAIL
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_APP_ID
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_TOKEN
+            volumeMounts:
+              - name: github-app-private-key
+                mountPath: /credentials/github-app
+                readOnly: true
+            script: |
+              #!/usr/bin/env bash
 
-              curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
-                | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
+              # ============================================================
+              # EXECUTION LAYER
+              # ============================================================
+              SCRIPT_START=$(date +%s)
+              declare -a ACTION_LOG=()
+              FINAL_EXIT_CODE=0
 
-              exit ${exit_code:-0}
+              if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+              execution_summary() {
+                local script_exit_code=$?
+                local script_end=$(date +%s)
+                local total_duration=$((script_end - SCRIPT_START))
+                echo ""
+                echo "╔═════════════════════════════════════════════════════════════"
+                echo "║ EXECUTION SUMMARY - manage-pull-request"
+                echo "║ Total Duration: ${total_duration}s"
+                echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+                echo "╠═════════════════════════════════════════════════════════════"
+                for entry in "${ACTION_LOG[@]}"; do
+                  local status=$(echo "$entry" | cut -d'|' -f1)
+                  local action=$(echo "$entry" | cut -d'|' -f2)
+                  local details=$(echo "$entry" | cut -d'|' -f3-)
+                  case "$status" in
+                    OK) echo "║ ✓ $action ($details)" ;;
+                    FAILED) echo "║ ✗ $action ($details)" ;;
+                  esac
+                done
+                echo "╚═════════════════════════════════════════════════════════════"
+                exit ${FINAL_EXIT_CODE:-$script_exit_code}
+              }
+              trap execution_summary EXIT
+
+              # ============================================================
+              # RUN LOGIC
+              # ============================================================
+              set -eo pipefail
+
+              # --- Validate PR number ---
+              if [[ -z "${PR_NUMBER}" ]]; then
+                echo "INFO: No pull-request-number provided — skipping PR management"
+                ACTION_LOG+=("OK|Skip - no PR number|exit=0|0s")
+                FINAL_EXIT_CODE=0
+                exit 0
+              fi
+
+              echo "PR Number:     ${PR_NUMBER}"
+              echo "Prow Exit Code: ${PROW_EXIT_CODE}"
+              echo "Source Branch: ${SOURCE_BRANCH}"
+              ACTION_LOG+=("OK|PR #${PR_NUMBER} identified|exit=0|0s")
+
+              # --- Generate GitHub App installation token ---
+              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+              APP_PEM="/credentials/github-app/github_app_private_key.pem"
+
+              REPO_INFO=$(curl -s "https://api.github.com/repos/${REPO_SLUG}")
+              IS_FORK=$(echo "${REPO_INFO}" | jq -r '.fork // false')
+              if [[ "${IS_FORK}" == "true" ]]; then
+                UPSTREAM_SLUG=$(echo "${REPO_INFO}" | jq -r '.parent.full_name')
+                echo "Fork detected: ${REPO_SLUG} -> upstream: ${UPSTREAM_SLUG}"
+                REPO_SLUG="${UPSTREAM_SLUG}"
+              fi
+              GH_API="https://api.github.com/repos/${REPO_SLUG}"
+
+              NOW=$(date +%s)
+              IAT=$((NOW - 60))
+              EXP=$((NOW + 600))
+              HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              SIGNATURE=$(printf '%s.%s' "${HEADER}" "${PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
+
+              INSTALLATION_ID=$(curl -s -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "${GH_API}/installation" | jq -r '.id')
+
+              if [[ -z "${INSTALLATION_ID}" || "${INSTALLATION_ID}" == "null" ]]; then
+                echo "ERROR: Could not find GitHub App installation for ${REPO_SLUG}"
+                ACTION_LOG+=("FAILED|GitHub App auth|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
+              GITHUB_TOKEN=$(curl -s -X POST \
+                -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
+                | jq -r '.token')
+
+              if [[ -z "${GITHUB_TOKEN}" || "${GITHUB_TOKEN}" == "null" ]]; then
+                echo "ERROR: Could not generate installation token"
+                ACTION_LOG+=("FAILED|GitHub App token|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|GitHub App auth|exit=0|0s")
+
+              gh_api_call() {
+                local method="$1" endpoint="$2" data="${3:-}"
+                local response http_code
+                if [[ -n "${data}" ]]; then
+                  response=$(curl -s -w "\n%{http_code}" -X "${method}" \
+                    -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "Content-Type: application/json" \
+                    -d "${data}" \
+                    "${GH_API}${endpoint}")
+                else
+                  response=$(curl -s -w "\n%{http_code}" -X "${method}" \
+                    -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${GH_API}${endpoint}")
+                fi
+                http_code=$(echo "${response}" | tail -1)
+                local body
+                body=$(echo "${response}" | sed '$d')
+                if [[ "${http_code}" -ge 200 && "${http_code}" -lt 300 ]]; then
+                  echo "${body}"
+                  return 0
+                else
+                  echo "HTTP ${http_code}: $(echo "${body}" | jq -r '.message // "unknown error"')"
+                  return 1
+                fi
+              }
+
+              # --- Step 1: Push smokeResults.yaml ---
+              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
+                echo ""
+                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
+                PUSH_DIR=$(mktemp -d)
+                ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
+                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
+                   git checkout "${SOURCE_BRANCH}"; then
+                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
+                  git config user.name "${GIT_USER_NAME}"
+                  git config user.email "${GIT_USER_EMAIL}"
+                  git add smokeResults.yaml
+                  if git diff --cached --quiet; then
+                    echo "INFO: smokeResults.yaml already up to date"
+                    ACTION_LOG+=("OK|Push smokeResults (no-op)|exit=0|0s")
+                  else
+                    git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
+                    git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
+                    git push origin "${SOURCE_BRANCH}"
+                    echo "Pushed smokeResults.yaml to ${SOURCE_BRANCH}"
+                    ACTION_LOG+=("OK|Push smokeResults to ${SOURCE_BRANCH}|exit=0|0s")
+                  fi
+                  popd
+                else
+                  echo "WARN: Failed to clone/checkout for push"
+                  ACTION_LOG+=("FAILED|Push smokeResults|exit=1|0s")
+                fi
+                rm -rf "${PUSH_DIR}"
+              fi
+
+              # --- Step 2: Merge or close PR #${PR_NUMBER} ---
+              if [[ "${PROW_EXIT_CODE}" == "0" ]]; then
+                echo ""
+                echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
+                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
+                  "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline\"}"; then
+                  echo "ERROR: Failed to merge PR #${PR_NUMBER}"
+                  ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
+              else
+                echo ""
+                echo "Smoke tests FAILED (exit: ${PROW_EXIT_CODE}) — closing PR #${PR_NUMBER}"
+                gh_api_call POST "/issues/${PR_NUMBER}/comments" \
+                  "{\"body\":\"Smoke tests failed (prow exit: ${PROW_EXIT_CODE}). Closing PR without merge.\"}" \
+                  && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
+                  || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
+                if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
+                  echo "ERROR: Failed to close PR #${PR_NUMBER}"
+                  ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
+              fi
+
+              FINAL_EXIT_CODE=0
 
   workspaces:
     - name: git-auth

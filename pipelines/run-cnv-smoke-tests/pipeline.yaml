@@ -404,6 +404,7 @@ spec:
               }
 
               # --- Step 1: Push smokeResults.yaml ---
+              PUSH_OK=false
               if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
                 echo ""
                 echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
@@ -419,23 +420,35 @@ spec:
                   if git diff --cached --quiet; then
                     echo "INFO: smokeResults.yaml already up to date"
                     ACTION_LOG+=("OK|Push smokeResults (no-op)|exit=0|0s")
+                    PUSH_OK=true
                   else
                     git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
                     git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
-                    git push origin "${SOURCE_BRANCH}"
-                    echo "Pushed smokeResults.yaml to ${SOURCE_BRANCH}"
-                    ACTION_LOG+=("OK|Push smokeResults to ${SOURCE_BRANCH}|exit=0|0s")
+                    if git push origin "${SOURCE_BRANCH}"; then
+                      echo "Pushed smokeResults.yaml to ${SOURCE_BRANCH}"
+                      ACTION_LOG+=("OK|Push smokeResults to ${SOURCE_BRANCH}|exit=0|0s")
+                      PUSH_OK=true
+                    else
+                      echo "ERROR: git push failed"
+                      ACTION_LOG+=("FAILED|Push smokeResults|exit=1|0s")
+                    fi
                   fi
                   popd
                 else
-                  echo "WARN: Failed to clone/checkout for push"
+                  echo "ERROR: Failed to clone/checkout for push"
                   ACTION_LOG+=("FAILED|Push smokeResults|exit=1|0s")
                 fi
                 rm -rf "${PUSH_DIR}"
+              else
+                echo "INFO: No smoke results to push"
+                ACTION_LOG+=("OK|Skip push - no results|exit=0|0s")
+                PUSH_OK=true
               fi
 
               # --- Step 2: Merge or close PR #${PR_NUMBER} ---
-              if [[ "${PROW_EXIT_CODE}" == "0" ]]; then
+              # Merge only if Prow passed AND push succeeded.
+              # If push failed, treat as failure and close the PR.
+              if [[ "${PROW_EXIT_CODE}" == "0" && "${PUSH_OK}" == "true" ]]; then
                 echo ""
                 echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
                 if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
@@ -448,9 +461,14 @@ spec:
                 ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
               else
                 echo ""
-                echo "Smoke tests FAILED (exit: ${PROW_EXIT_CODE}) — closing PR #${PR_NUMBER}"
+                if [[ "${PUSH_OK}" != "true" ]]; then
+                  CLOSE_REASON="Push of smokeResults.yaml failed"
+                else
+                  CLOSE_REASON="Smoke tests failed (prow exit: ${PROW_EXIT_CODE})"
+                fi
+                echo "${CLOSE_REASON} — closing PR #${PR_NUMBER}"
                 gh_api_call POST "/issues/${PR_NUMBER}/comments" \
-                  "{\"body\":\"Smoke tests failed (prow exit: ${PROW_EXIT_CODE}). Closing PR without merge.\"}" \
+                  "{\"body\":\"${CLOSE_REASON}. Closing PR without merge.\"}" \
                   && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
                   || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
                 if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then

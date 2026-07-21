@@ -144,11 +144,22 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              # TEMPORARY: Force failure for testing
-              exit_code=1
-              export PROW_JOB_STATE="failure"
-              export PROW_JOB_URL="https://prow.ci.openshift.org/view/forced-failure-test"
-              export PROW_JOB_YAML="https://prow.ci.openshift.org/prowjob/forced-failure-test.yaml"
+              uv run gangway.py \
+                  --trigger "${PROW_JOB_NAME}" \
+                  --write-job-info-file ${JOB_INFO_FILE} \
+                  -e CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
+                  -e CNV_OPERATOR_CHANNEL=${CNV_OPERATOR_CHANNEL} \
+                  -e HCO_BUNDLE_VERSION=${HCO_BUNDLE_VERSION}
+
+              PROW_JOB_ID=$(yq '.prowJobId' ${JOB_INFO_FILE})
+
+              uv run gangway.py \
+                  --write-job-info-file ${JOB_INFO_FILE} \
+                  --wait-job-id ${PROW_JOB_ID} || exit_code=$?
+
+              export PROW_JOB_STATE=$(yq '.prowJobState' ${JOB_INFO_FILE})
+              export PROW_JOB_URL=$(yq '.prowJobUrl' ${JOB_INFO_FILE})
+              export PROW_JOB_YAML=$(yq '.prowJobYamlUrl' ${JOB_INFO_FILE})
 
               pushd "repo/${PATH_CONTEXT}"
 

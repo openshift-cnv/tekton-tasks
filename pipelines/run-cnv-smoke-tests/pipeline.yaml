@@ -451,7 +451,6 @@ spec:
                   exit 1
                 fi
                 ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
-                FINAL_EXIT_CODE=0
               else
                 echo ""
                 if [[ "${PUSH_OK}" != "true" ]]; then
@@ -471,8 +470,9 @@ spec:
                   exit 1
                 fi
                 ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
-                FINAL_EXIT_CODE=1
               fi
+
+              FINAL_EXIT_CODE=0
 
   workspaces:
     - name: git-auth

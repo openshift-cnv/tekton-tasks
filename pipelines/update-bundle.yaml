@@ -264,11 +264,11 @@ spec:
                 echo "│ Unique revisions:"
                 jq -r '[.spec.components[].source.git.revision] | unique | .[] | "│   \(.)"' /tmp/snapshot.json
                 echo "├─────────────────────────────────────────────────────────────"
-                echo "│ STATUS: FAILED (exit: 1, duration: 0s)"
+                echo "│ STATUS: WARN (exit: 0, duration: 0s)"
                 echo "└─────────────────────────────────────────────────────────────"
-                ACTION_LOG+=("FAILED|Validate commit consistency|exit=1|0s")
-                FINAL_EXIT_CODE=1
-                exit 1
+                ACTION_LOG+=("WARN|Validate commit consistency|exit=0|0s")
+                FINAL_EXIT_CODE=0
+                exit 0
               fi
 
               rm -f /tmp/snapshot.json

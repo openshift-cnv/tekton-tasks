@@ -41,24 +41,13 @@ spec:
           value: $(params.path-context)
         - name: prow-job
           value: $(params.prow-job)
-        - name: pull-request-number
-          value: $(params.pull-request-number)
       taskSpec:
         params:
           - name: git-url
           - name: revision
           - name: path-context
           - name: prow-job
-          - name: pull-request-number
         results:
-          - name: SMOKE_RESULTS_YAML
-            description: Generated smokeResults.yaml content for the finally task to push
-          - name: SOURCE_BRANCH
-            description: Resolved branch name from the commit
-          - name: HCO_BUNDLE_VERSION
-            description: HCO bundle version for the commit message
-          - name: PROW_EXIT_CODE
-            description: Exit code from the Prow job (0=success, non-zero=failure)
           - name: IMAGE_DIGEST
             description: Digest of the image just built
           - name: IMAGE_URL
@@ -106,7 +95,6 @@ spec:
                   secretKeyRef:
                     name: github-secrets
                     key: GIT_USER_EMAIL
-
               - name: GITHUB_APP_ID
                 valueFrom:
                   secretKeyRef:
@@ -132,7 +120,6 @@ spec:
 
               SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
               echo "Source branch resolved: ${SOURCE_BRANCH}"
-
 
               export JOB_INFO_FILE="/tmp/prow.yaml"
               export CNV_OPERATOR_CHANNEL=$(yq '.channel' payload.yaml)
@@ -163,7 +150,6 @@ spec:
 
               pushd "repo/${PATH_CONTEXT}"
 
-
               yq --null-input \
                 '
                 .bundle        = env(HCO_BUNDLE_VERSION)   |
@@ -176,46 +162,35 @@ spec:
                 .snapshotID    = env(SNAPSHOT_ID)
                 ' | yq 'sort_keys(..)' | tee smokeResults.yaml
 
-              echo -n "$(cat smokeResults.yaml)" > $(results.SMOKE_RESULTS_YAML.path)
-              echo -n "${SOURCE_BRANCH}" > $(results.SOURCE_BRANCH.path)
-              echo -n "${HCO_BUNDLE_VERSION}" > $(results.HCO_BUNDLE_VERSION.path)
-              echo -n "${exit_code:-0}" > $(results.PROW_EXIT_CODE.path)
+              git config user.name "${GIT_USER_NAME}"
+              git config user.email "${GIT_USER_EMAIL}"
 
-              # Always exit 0 so Tekton propagates results to the finally task.
-              # The actual pass/fail is communicated via PROW_EXIT_CODE result.
-              exit 0
+              git add smokeResults.yaml
+              git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
+
+              git checkout -B "${SOURCE_BRANCH}"
+
+              curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
+                | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
+
+              exit ${exit_code:-0}
 
   finally:
     - name: manage-pull-request
       params:
+        - name: test-status
+          value: $(tasks.run-smoke-tests.status)
         - name: pull-request-number
           value: $(params.pull-request-number)
         - name: git-url
           value: $(params.git-url)
-        - name: revision
-          value: $(params.revision)
-        - name: path-context
-          value: $(params.path-context)
-        - name: smoke-results-yaml
-          value: $(tasks.run-smoke-tests.results.SMOKE_RESULTS_YAML)
-        - name: source-branch
-          value: $(tasks.run-smoke-tests.results.SOURCE_BRANCH)
-        - name: hco-bundle-version
-          value: $(tasks.run-smoke-tests.results.HCO_BUNDLE_VERSION)
-        - name: prow-exit-code
-          value: $(tasks.run-smoke-tests.results.PROW_EXIT_CODE)
         - name: debug
           value: $(params.debug)
       taskSpec:
         params:
+          - name: test-status
           - name: pull-request-number
           - name: git-url
-          - name: revision
-          - name: path-context
-          - name: smoke-results-yaml
-          - name: source-branch
-          - name: hco-bundle-version
-          - name: prow-exit-code
           - name: debug
         volumes:
           - name: github-app-private-key
@@ -228,32 +203,12 @@ spec:
           - name: merge-or-close-pr
             image: quay.io/cnv-qe-devops/gangway:latest
             env:
+              - name: TEST_STATUS
+                value: $(params.test-status)
               - name: PR_NUMBER
                 value: $(params.pull-request-number)
               - name: GIT_REPOSITORY
                 value: $(params.git-url)
-              - name: GIT_REVISION
-                value: $(params.revision)
-              - name: PATH_CONTEXT
-                value: $(params.path-context)
-              - name: SMOKE_RESULTS_YAML
-                value: $(params.smoke-results-yaml)
-              - name: SOURCE_BRANCH
-                value: $(params.source-branch)
-              - name: HCO_BUNDLE_VERSION
-                value: $(params.hco-bundle-version)
-              - name: PROW_EXIT_CODE
-                value: $(params.prow-exit-code)
-              - name: GIT_USER_NAME
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GIT_USER_NAME
-              - name: GIT_USER_EMAIL
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GIT_USER_EMAIL
               - name: GITHUB_APP_ID
                 valueFrom:
                   secretKeyRef:
@@ -317,9 +272,8 @@ spec:
                 exit 0
               fi
 
-              echo "PR Number:     ${PR_NUMBER}"
-              echo "Prow Exit Code: ${PROW_EXIT_CODE}"
-              echo "Source Branch: ${SOURCE_BRANCH}"
+              echo "PR Number:    ${PR_NUMBER}"
+              echo "Test Status:  ${TEST_STATUS}"
               ACTION_LOG+=("OK|PR #${PR_NUMBER} identified|exit=0|0s")
 
               # --- Generate GitHub App installation token ---
@@ -396,59 +350,12 @@ spec:
                 fi
               }
 
-              # --- Step 1: Push smokeResults.yaml ---
-              PUSH_OK=false
-              if [[ -n "${SMOKE_RESULTS_YAML}" && -n "${SOURCE_BRANCH}" ]]; then
-                echo ""
-                echo "Pushing smokeResults.yaml to branch ${SOURCE_BRANCH}..."
-                PUSH_DIR=$(mktemp -d)
-                ORIG_REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-                if git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${ORIG_REPO_SLUG}.git" "${PUSH_DIR}" && \
-                   pushd "${PUSH_DIR}/${PATH_CONTEXT}" && \
-                   git checkout "${SOURCE_BRANCH}"; then
-                  echo "${SMOKE_RESULTS_YAML}" > smokeResults.yaml
-                  git config user.name "${GIT_USER_NAME}"
-                  git config user.email "${GIT_USER_EMAIL}"
-                  git add smokeResults.yaml
-                  if git diff --cached --quiet; then
-                    echo "INFO: smokeResults.yaml already up to date"
-                    ACTION_LOG+=("OK|Push smokeResults (no-op)|exit=0|0s")
-                    PUSH_OK=true
-                  else
-                    git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
-                    git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git"
-                    if git push origin "${SOURCE_BRANCH}"; then
-                      echo "Pushed smokeResults.yaml to ${SOURCE_BRANCH}"
-                      ACTION_LOG+=("OK|Push smokeResults to ${SOURCE_BRANCH}|exit=0|0s")
-                      PUSH_OK=true
-                    else
-                      echo "ERROR: git push failed"
-                      ACTION_LOG+=("FAILED|Push smokeResults|exit=1|0s")
-                    fi
-                  fi
-                  popd
-                else
-                  echo "ERROR: Failed to clone/checkout for push"
-                  ACTION_LOG+=("FAILED|Push smokeResults|exit=1|0s")
-                fi
-                rm -rf "${PUSH_DIR}"
-              else
-                echo "INFO: No smoke results to push"
-                ACTION_LOG+=("OK|Skip push - no results|exit=0|0s")
-                PUSH_OK=true
-              fi
-
-              # --- Step 2: Merge or close PR #${PR_NUMBER} ---
-              # Merge only if Prow passed AND push succeeded.
-              # If push failed, treat as failure and close the PR.
-              if [[ "${PROW_EXIT_CODE}" == "0" && "${PUSH_OK}" == "true" ]]; then
+              # --- Merge or close PR based on task status ---
+              if [[ "${TEST_STATUS}" == "Succeeded" ]]; then
                 echo ""
                 echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
 
                 # Update PR branch if behind base (required by branch protection)
-                PR_HEAD=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "${GH_API}/pulls/${PR_NUMBER}" | jq -r '.head.ref')
                 if ! gh_api_call PUT "/pulls/${PR_NUMBER}/update-branch" '{}' 2>/dev/null; then
                   echo "INFO: Branch already up to date or update not needed"
                 fi
@@ -464,14 +371,9 @@ spec:
                 ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
               else
                 echo ""
-                if [[ "${PUSH_OK}" != "true" ]]; then
-                  CLOSE_REASON="Push of smokeResults.yaml failed"
-                else
-                  CLOSE_REASON="Smoke tests failed (prow exit: ${PROW_EXIT_CODE})"
-                fi
-                echo "${CLOSE_REASON} — closing PR #${PR_NUMBER}"
+                echo "Smoke tests FAILED (status: ${TEST_STATUS}) — closing PR #${PR_NUMBER}"
                 gh_api_call POST "/issues/${PR_NUMBER}/comments" \
-                  "{\"body\":\"${CLOSE_REASON}. Closing PR without merge.\"}" \
+                  "{\"body\":\"Smoke tests failed (task status: ${TEST_STATUS}). Closing PR without merge.\"}" \
                   && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
                   || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
                 if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then

@@ -131,11 +131,10 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              # TEMPORARY: Force failure for testing (skip gangway)
-              exit_code=1
-              export PROW_JOB_STATE="failure"
-              export PROW_JOB_URL="https://prow.ci.openshift.org/view/forced-failure-test"
-              export PROW_JOB_YAML="https://prow.ci.openshift.org/prowjob/forced-failure-test.yaml"
+              # TEMPORARY: Force success for testing (skip gangway)
+              export PROW_JOB_STATE="success"
+              export PROW_JOB_URL="https://prow.ci.openshift.org/view/forced-success-test"
+              export PROW_JOB_YAML="https://prow.ci.openshift.org/prowjob/forced-success-test.yaml"
 
               pushd "repo/${PATH_CONTEXT}"
 

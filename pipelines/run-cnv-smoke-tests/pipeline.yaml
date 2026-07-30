@@ -184,6 +184,8 @@ spec:
           value: $(params.pull-request-number)
         - name: git-url
           value: $(params.git-url)
+        - name: path-context
+          value: $(params.path-context)
         - name: debug
           value: $(params.debug)
       taskSpec:
@@ -191,6 +193,7 @@ spec:
           - name: test-status
           - name: pull-request-number
           - name: git-url
+          - name: path-context
           - name: debug
         volumes:
           - name: github-app-private-key
@@ -209,6 +212,8 @@ spec:
                 value: $(params.pull-request-number)
               - name: GIT_REPOSITORY
                 value: $(params.git-url)
+              - name: PATH_CONTEXT
+                value: $(params.path-context)
               - name: GITHUB_APP_ID
                 valueFrom:
                   secretKeyRef:
@@ -372,8 +377,30 @@ spec:
               else
                 echo ""
                 echo "Smoke tests FAILED (status: ${TEST_STATUS}) — closing PR #${PR_NUMBER}"
+
+                # Fetch smokeResults.yaml from the PR branch for failure details
+                PR_INFO=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${GH_API}/pulls/${PR_NUMBER}")
+                PR_BRANCH=$(echo "${PR_INFO}" | jq -r '.head.ref // empty')
+                FAILURE_DETAILS=""
+                if [[ -n "${PR_BRANCH}" ]]; then
+                  SMOKE_FILE=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github.raw" \
+                    "${GH_API}/contents/${PATH_CONTEXT}/smokeResults.yaml?ref=${PR_BRANCH}" 2>/dev/null || true)
+                  if [[ -n "${SMOKE_FILE}" ]]; then
+                    PROW_URL=$(echo "${SMOKE_FILE}" | yq -r '.prowJobUrl // empty')
+                    PROW_STATE=$(echo "${SMOKE_FILE}" | yq -r '.smokeResults // empty')
+                    BUNDLE_VER=$(echo "${SMOKE_FILE}" | yq -r '.bundle // empty')
+                    if [[ -n "${PROW_URL}" ]]; then
+                      FAILURE_DETAILS="\\n\\n**Details:**\\n- Bundle: ${BUNDLE_VER}\\n- Prow Result: ${PROW_STATE}\\n- [Prow Job Logs](${PROW_URL})"
+                    fi
+                  fi
+                fi
+
+                COMMENT_BODY="Smoke tests failed (task status: ${TEST_STATUS}). Closing PR without merge.${FAILURE_DETAILS}"
                 gh_api_call POST "/issues/${PR_NUMBER}/comments" \
-                  "{\"body\":\"Smoke tests failed (task status: ${TEST_STATUS}). Closing PR without merge.\"}" \
+                  "{\"body\":\"${COMMENT_BODY}\"}" \
                   && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
                   || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
                 if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then

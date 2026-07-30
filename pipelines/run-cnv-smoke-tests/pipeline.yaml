@@ -173,6 +173,14 @@ spec:
               curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
                 | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
 
+              if [[ "${exit_code:-0}" != "0" ]]; then
+                echo ""
+                echo "error: Smoke test failed"
+                echo "  Prow Job State: ${PROW_JOB_STATE}"
+                echo "  Prow Job URL:   ${PROW_JOB_URL}"
+                echo "  Bundle Version: ${HCO_BUNDLE_VERSION}"
+              fi
+
               exit ${exit_code:-0}
 
   finally:

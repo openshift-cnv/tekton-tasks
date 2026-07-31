@@ -406,13 +406,11 @@ spec:
                   SMOKE_FILE=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
                     -H "Accept: application/vnd.github.raw" \
                     "${GH_API}/contents/${PATH_CONTEXT}/smokeResults.yaml?ref=${PR_BRANCH}" 2>/dev/null || true)
-                  if [[ -n "${SMOKE_FILE}" ]]; then
-                    PROW_URL=$(echo "${SMOKE_FILE}" | yq -r '.prowJobUrl // empty')
-                    PROW_STATE=$(echo "${SMOKE_FILE}" | yq -r '.smokeResults // empty')
-                    BUNDLE_VER=$(echo "${SMOKE_FILE}" | yq -r '.bundle // empty')
-                    if [[ -n "${PROW_URL}" ]]; then
-                      FAILURE_DETAILS="\\n\\n**Details:**\\n- Bundle: ${BUNDLE_VER}\\n- Prow Result: ${PROW_STATE}\\n- [Prow Job Logs](${PROW_URL})"
-                    fi
+                  PROW_URL=$(echo "${SMOKE_FILE}" | yq -r '.prowJobUrl' 2>/dev/null || true)
+                  PROW_STATE=$(echo "${SMOKE_FILE}" | yq -r '.smokeResults' 2>/dev/null || true)
+                  BUNDLE_VER=$(echo "${SMOKE_FILE}" | yq -r '.bundle' 2>/dev/null || true)
+                  if [[ -n "${PROW_URL}" && "${PROW_URL}" != "null" ]]; then
+                    FAILURE_DETAILS="\\n\\n**Details:**\\n- Bundle: ${BUNDLE_VER}\\n- Prow Result: ${PROW_STATE}\\n- [Prow Job Logs](${PROW_URL})"
                   fi
                 fi
 

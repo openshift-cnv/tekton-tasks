@@ -170,8 +170,29 @@ spec:
 
               git checkout -B "${SOURCE_BRANCH}"
 
-              curl -s https://gist.githubusercontent.com/rabin-io/01ab7e1d72ebd60932fd1a8e913b6245/raw/git-push.sh \
-                | bash -s -- "${GITHUB_APP_ID}" "/credentials/github-app/github_app_private_key.pem"
+              # Generate GitHub App token for push
+              APP_PEM="/credentials/github-app/github_app_private_key.pem"
+              NOW=$(date +%s)
+              IAT=$((NOW - 60))
+              EXP=$((NOW + 600))
+              JWT_HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT_PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT_SIGNATURE=$(printf '%s.%s' "${JWT_HEADER}" "${JWT_PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT="${JWT_HEADER}.${JWT_PAYLOAD}.${JWT_SIGNATURE}"
+
+              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+              PUSH_TOKEN=$(curl -s -X POST \
+                -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO_SLUG}/installation" \
+                | jq -r '.id' \
+                | xargs -I{} curl -s -X POST \
+                  -H "Authorization: Bearer ${JWT}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/app/installations/{}/access_tokens" \
+                | jq -r '.token')
+
+              git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
 
               if [[ "${exit_code:-0}" != "0" ]]; then
                 echo ""

@@ -323,28 +323,11 @@ spec:
                 exit 1
               fi
 
-              echo "=== PHASE 5: Committing and pushing changes ==="
-              if [[ -n "$(git status --porcelain)" ]]; then
-                git add .
-                git commit -m "Update HCO bundle registry with new images"
-                ACTION_LOG+=("OK|Commit changes|exit=0|0s")
-                
-                if ! exec_action "Pull with rebase" 60 "git pull --rebase origin main"; then
-                  echo "ERROR: Failed to pull with rebase"
-                  FINAL_EXIT_CODE=1
-                  exit 1
-                fi
-                
-                if ! exec_action "Push to origin" 60 "git push origin main"; then
-                  echo "ERROR: Failed to push to origin"
-                  FINAL_EXIT_CODE=1
-                  exit 1
-                fi
-                echo "│ OK: Changes pushed to GitLab"
-              else
-                ACTION_LOG+=("OK|Skip - No changes detected|exit=0|0s")
-                echo "│ SKIP: No changes detected in the bundle registry"
-              fi
+              echo "=== PHASE 4b: Saving repo to shared volume for CSV generation ==="
+              rm -rf /var/shared/hco-bundle-registry-work
+              cp -r . /var/shared/hco-bundle-registry-work
+              ACTION_LOG+=("OK|Save repo to shared volume|exit=0|0s")
+              echo "│ OK: Repo copied to /var/shared/hco-bundle-registry-work"
 
               # Copy Snapshot objects to shared volume for push-release-chart step
               mkdir -p /var/shared/snapshot-objects
@@ -400,6 +383,471 @@ spec:
 
               echo "=== update-bundle step completed ==="
               FINAL_EXIT_CODE=0
+          - name: generate-csvs
+            image: quay.io/konflux-ci/task-runner:3.1.1@sha256:790df1bb5ea7a9ce4c1717ff341398ff72c99faed1c2e939a3b4a15ff8f4a493
+            envFrom:
+              - secretRef:
+                  name: hco-updater-gitlab-token
+            volumeMounts:
+              - name: quay-creds
+                mountPath: /tmp/quay-builds-creds
+                readOnly: true
+              - name: shared-data
+                mountPath: /var/shared
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              WORK_DIR="/var/shared/hco-bundle-registry-work"
+              HCO_PATH="${WORK_DIR}/components/hco-bundle-registry"
+              CSV_BASE="${HCO_PATH}/csvs"
+              CRD_DIR="${HCO_PATH}/crds"
+              AUTH_FILE="/tmp/quay-builds-creds/.dockerconfigjson"
+              EXTRA="${HCO_PATH}/extra-params.json"
+              CORE="${HCO_PATH}/core-params.json"
+              VCONFIG="${HCO_PATH}/version-config.json"
+
+              echo "=== generate-csvs ==="
+
+              if [[ ! -d "${WORK_DIR}" ]]; then
+                echo "ERROR: ${WORK_DIR} not found — update-bundle step did not copy the repo"
+                exit 1
+              fi
+
+              cd "${WORK_DIR}"
+              git config user.name "submodule-sync"
+              git config user.email "no-reply@redhat.com"
+
+              REPO_URL=$(git remote get-url origin | sed 's|https://oauth2:[^@]*@|https://|')
+              git remote set-url origin "$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")"
+
+              QUAY=$(jq -r '."quay-prefix"' "${CORE}")
+              CSV_VER=$(jq -r '."csv-version"' "${EXTRA}")
+              CSV_REPLACES=$(jq -r '."csv-version-replaces" // ""' "${EXTRA}")
+              TARGET_NS=$(jq -r '."target-namespace"' "${EXTRA}")
+              CONTAINER_PFX=$(jq -r '."container-prefix" // "registry.redhat.io/container-native-virtualization"' "${EXTRA}")
+
+              XY=$(jq -r '.metadata.Version.XY' "${WORK_DIR}/build-bundle.json" 2>/dev/null || echo "0")
+              Z=$(jq -r  '.metadata.Version.Z'  "${WORK_DIR}/build-bundle.json" 2>/dev/null || echo "0")
+              OP_VER="${XY}.${Z}"
+
+              VER_STR=$(jq -r '.version // "v0.0"' "${VCONFIG}" | sed 's/^v//')
+              VER_NUM=$(( $(echo "$VER_STR" | cut -d. -f1) * 1000 + $(echo "$VER_STR" | cut -d. -f2) ))
+              # v4.12 uses no -rhel9 suffix on image keys; v4.13+ uses -rhel9
+              VER_SFX="-rhel9"; [[ "$VER_NUM" -lt 4013 ]] && VER_SFX=""
+              # HPP operator key naming is irregular (rhel8-operator vs operator-rhel9)
+              HPP_OP_KEY="hostpath-provisioner-operator-rhel9-image"
+              HPP_PRV_KEY="hostpath-provisioner-rhel9-image"
+              HPP_CSI_KEY="hostpath-csi-driver-rhel9-image"
+              if [[ "$VER_NUM" -lt 4013 ]]; then
+                HPP_OP_KEY="hostpath-provisioner-rhel8-operator-image"
+                HPP_PRV_KEY="hostpath-provisioner-rhel8-image"
+                HPP_CSI_KEY="hostpath-csi-driver-image"
+              fi
+
+              OPERATORS=$(jq -r '.operators[]?' "${VCONFIG}" 2>/dev/null || echo "")
+              has_op()   { echo "${OPERATORS}" | grep -qx "$1"; }
+              get_core() { jq -r ".[\"$1\"] // empty" "${CORE}"; }
+              get_extra() { jq -r ".[\"$1\"] // empty" "${EXTRA}"; }
+
+              # ── Selective regeneration — only rebuild CSVs whose images actually changed ──
+              CHANGED_KEYS=$(git diff -- \
+                components/hco-bundle-registry/core-params.json \
+                components/hco-bundle-registry/extra-params.json | \
+                grep '^+[^+]' | grep -oP '"[a-z][a-zA-Z0-9-]*"(?=\s*:)' | tr -d '"')
+
+              if [[ -z "$CHANGED_KEYS" ]]; then
+                echo "│ No image keys changed — skipping all CSV generation"
+                git add . 2>/dev/null || true
+                if [[ -n "$(git status --porcelain)" ]]; then
+                  git commit -m "Update HCO bundle registry with new images"
+                  git pull --rebase origin main && git push origin main
+                fi
+                echo "=== generate-csvs step completed ==="
+                exit 0
+              fi
+              echo "│ Changed image keys: $CHANGED_KEYS"
+
+              # Returns 0 if any of the provided image keys appear in CHANGED_KEYS
+              keys_changed() {
+                local key
+                for key in "$@"; do
+                  echo "$CHANGED_KEYS" | grep -qF "$key" && return 0
+                done
+                return 1
+              }
+
+              mkdir -p "${CSV_BASE}" "${CRD_DIR}"
+
+              # Run csv-generator inside an operator container; stdout → outfile on host (non-fatal)
+              # Set GEN_CSV_ENV=(KEY=VAL ...) before calling gen_csv to pass env vars to buildah run.
+              GEN_CSV_ENV=()
+              gen_csv() {
+                local outfile="$1" full_image="$2" csv_bin="$3"
+                shift 3
+                local ctr env_flags=()
+                for ev in "${GEN_CSV_ENV[@]}"; do env_flags+=(--env "$ev"); done
+                GEN_CSV_ENV=()  # reset after each use
+                ctr=$(buildah from --authfile "${AUTH_FILE}" --storage-driver vfs "${full_image}" 2>&1)
+                if [[ $? -ne 0 ]]; then
+                  echo "WARN: buildah from failed for ${full_image}: ${ctr}" >&2; return 0
+                fi
+                buildah run --storage-driver vfs "${env_flags[@]}" "${ctr}" -- "${csv_bin}" "$@" > "${outfile}" 2>&1 || \
+                  echo "WARN: csv-generator failed for ${full_image}" >&2
+                buildah rm --storage-driver vfs "${ctr}" 2>/dev/null || true
+              }
+
+              # ─── CNA ────────────────────────────────────────────────────────────────────
+              echo "=== CNA CSV ==="
+              mkdir -p "${CSV_BASE}/cna-csv"
+              if has_op cna && keys_changed \
+                cluster-network-addons-operator-rhel9-image cluster-network-addons-operator-image \
+                bridge-marker-rhel9-image bridge-marker-image \
+                cnv-containernetworking-plugins-rhel9-image cnv-containernetworking-plugins-image \
+                kubemacpool-rhel9-image kubemacpool-image \
+                ovs-cni-plugin-rhel9-image ovs-cni-plugin-image \
+                kubesecondarydns-rhel9-image \
+                multus-dynamic-networks-rhel9-image \
+                kubevirt-ipam-controller-rhel9-image \
+                passt-network-binding-plugin-cni-rhel9-image kube-rbac-proxy-image core-dns-image; then
+                CNA_IMG=$(get_core "cluster-network-addons-operator${VER_SFX}-image")
+                CNA_SHA="${CNA_IMG#*@}"
+                CNA_OP_NAME="cluster-network-addons-operator${VER_SFX}@sha256"
+                KSD_IMG=$(get_extra "kubesecondarydns${VER_SFX}-image")
+                MDN_IMG=$(get_extra "multus-dynamic-networks${VER_SFX}-image")
+                IPAM_IMG=$(get_extra "kubevirt-ipam-controller-rhel9-image")
+                PASST_IMG=""
+                if [[ "$VER_NUM" -ge 4017 && "$VER_NUM" -lt 4019 ]]; then
+                  PASST_IMG=$(get_extra "passt-network-binding-plugin-cni-rhel9-image")
+                fi
+                KSD_FLAG="--kube-secondary-dns"
+                [[ "$VER_NUM" -ge 4017 ]] && KSD_FLAG="--kube-secondary-dns-image"
+                CNA_ARGS=(
+                  "--version=${CSV_VER}" "--version-replaces=${CSV_REPLACES}"
+                  "--operator-version=${CNA_SHA}" "--namespace=${TARGET_NS}"
+                  "--container-prefix=${CONTAINER_PFX}"
+                  "--image-name=${CNA_OP_NAME}"
+                  "--container-tag=${CNA_SHA#*:}"
+                  "--multus-image=NOT_AVAILABLE" "--allow-multus=false"
+                  "--linux-bridge-cni-image=${CONTAINER_PFX}/$(get_extra "cnv-containernetworking-plugins${VER_SFX}-image")"
+                  "--linux-bridge-marker-image=${CONTAINER_PFX}/$(get_extra "bridge-marker${VER_SFX}-image")"
+                  "--kubemacpool-image=${CONTAINER_PFX}/$(get_extra "kubemacpool${VER_SFX}-image")"
+                  "--ovs-cni-image=${CONTAINER_PFX}/$(get_extra "ovs-cni-plugin${VER_SFX}-image")"
+                  "--macvtap-cni-image=NOT_AVAILABLE" "--image-pull-policy=IfNotPresent" "--dump-crds"
+                )
+                # rbac-proxy and core-dns were added in v4.13+
+                if [[ "$VER_NUM" -ge 4013 ]]; then
+                  CNA_ARGS+=("--kube-rbac-proxy-image=$(get_extra 'kube-rbac-proxy-image')")
+                  CNA_ARGS+=("--core-dns-image=$(get_extra 'core-dns-image')")
+                fi
+                [[ -n "$KSD_IMG" ]]  && CNA_ARGS+=("${KSD_FLAG}=${CONTAINER_PFX}/${KSD_IMG}")
+                [[ -n "$MDN_IMG" ]]  && CNA_ARGS+=("--multus-dynamic-networks-image=${CONTAINER_PFX}/${MDN_IMG}")
+                [[ -n "$IPAM_IMG" ]] && CNA_ARGS+=("--kubevirt-ipam-controller-image=${CONTAINER_PFX}/${IPAM_IMG}")
+                [[ -n "$PASST_IMG" ]] && CNA_ARGS+=("--passt-binding-cni-image=${CONTAINER_PFX}/${PASST_IMG}")
+                gen_csv "${CSV_BASE}/cna-csv/cna-csv-output.yaml" "${QUAY}/${CNA_IMG}" /usr/bin/csv-generator "${CNA_ARGS[@]}"
+              else
+                echo "  SKIP: cna not in operators list or no relevant image changed"
+              fi
+
+              # ─── Virt ───────────────────────────────────────────────────────────────────
+              echo "=== Virt CSV ==="
+              mkdir -p "${CSV_BASE}/virt-csv"
+              if has_op virt && keys_changed \
+                virt-operator-rhel9-image virt-operator-image \
+                virt-api-rhel9-image virt-api-image \
+                virt-controller-rhel9-image virt-controller-image \
+                virt-handler-rhel9-image virt-handler-image \
+                virt-launcher-rhel9-image virt-launcher-image \
+                virt-exportproxy-rhel9-image virt-exportproxy-image \
+                virt-exportserver-rhel9-image virt-exportserver-image \
+                libguestfs-tools-rhel9-image libguestfs-tools-image \
+                pr-helper-rhel9-image sidecar-shim-rhel9-image \
+                virt-synchronization-controller-rhel9-image \
+                virt-template-apiserver-rhel9-image virt-template-controller-rhel9-image \
+                network-resources-injector-image; then
+                VIRT_IMG=$(get_core "virt-operator${VER_SFX}-image")
+                VIRT_SHA="${VIRT_IMG#*@}"
+                if [[ "$VER_NUM" -lt 4013 ]]; then
+                  # v4.12: SHA-based csv-generator API (kubevirt ≤0.58 style)
+                  gen_csv "${CSV_BASE}/virt-csv/virt-csv-output.yaml" "${QUAY}/${VIRT_IMG}" /usr/bin/csv-generator \
+                    "--namespace=${TARGET_NS}" "--operatorImageVersion=${OP_VER}" \
+                    "--dockerPrefix=${CONTAINER_PFX}" "--kubeVirtVersion=${VIRT_SHA}" "--imagePrefix=" \
+                    "--csvVersion=${CSV_VER}" "--replacesCsvVersion=${CSV_REPLACES}" \
+                    "--apiSha=$(get_extra 'virt-api-image' | cut -d@ -f2)" \
+                    "--controllerSha=$(get_extra 'virt-controller-image' | cut -d@ -f2)" \
+                    "--handlerSha=$(get_extra 'virt-handler-image' | cut -d@ -f2)" \
+                    "--launcherSha=$(get_extra 'virt-launcher-image' | cut -d@ -f2)" \
+                    "--gsSha=$(get_extra 'libguestfs-tools-image' | cut -d@ -f2)" \
+                    "--kubevirtLogo=kubevirtLogo" "--dumpCRDs"
+                else
+                  # v4.13+: image-ref API
+                  CP_FLAG=""; PR_FLAG=""; SC_FLAG=""; SYNC_FLAG=""; TMPL_API_FLAG=""; TMPL_CTRL_FLAG=""
+                  [[ "$VER_NUM" -ge 4021 ]] && CP_FLAG="--with-kubevirt-control-plane-label=true"
+                  [[ "$VER_NUM" -ge 4014 ]] && PR_FLAG="--pr-helper-image=${CONTAINER_PFX}/$(get_extra 'pr-helper-rhel9-image')"
+                  [[ "$VER_NUM" -ge 4016 ]] && SC_FLAG="--sidecar-shim-image=${CONTAINER_PFX}/$(get_extra 'sidecar-shim-rhel9-image')"
+                  SYNC_IMG=$(get_extra "virt-synchronization-controller-rhel9-image")
+                  [[ -n "$SYNC_IMG" ]] && SYNC_FLAG="--virt-synchronization-controller-image=${CONTAINER_PFX}/${SYNC_IMG}"
+                  TMPL_API_IMG=$(get_extra "virt-template-apiserver-rhel9-image")
+                  [[ -n "$TMPL_API_IMG" ]] && TMPL_API_FLAG="--virt-template-apiserver-image=${CONTAINER_PFX}/${TMPL_API_IMG}"
+                  TMPL_CTRL_IMG=$(get_extra "virt-template-controller-rhel9-image")
+                  [[ -n "$TMPL_CTRL_IMG" ]] && TMPL_CTRL_FLAG="--virt-template-controller-image=${CONTAINER_PFX}/${TMPL_CTRL_IMG}"
+                  VIRT_ARGS=(
+                    "--namespace=${TARGET_NS}" "--operatorImageVersion=${OP_VER}"
+                    "--dockerPrefix=${CONTAINER_PFX}" "--kubeVirtVersion=${VIRT_SHA}" "--imagePrefix="
+                    "--csvVersion=${CSV_VER}" "--replacesCsvVersion=${CSV_REPLACES}"
+                    "--virt-api-image=${CONTAINER_PFX}/$(get_extra 'virt-api-rhel9-image')"
+                    "--virt-controller-image=${CONTAINER_PFX}/$(get_extra 'virt-controller-rhel9-image')"
+                    "--virt-handler-image=${CONTAINER_PFX}/$(get_extra 'virt-handler-rhel9-image')"
+                    "--virt-launcher-image=${CONTAINER_PFX}/$(get_extra 'virt-launcher-rhel9-image')"
+                    "--virt-export-proxy-image=${CONTAINER_PFX}/$(get_extra 'virt-exportproxy-rhel9-image')"
+                    "--virt-export-server-image=${CONTAINER_PFX}/$(get_extra 'virt-exportserver-rhel9-image')"
+                    "--gs-image=${CONTAINER_PFX}/$(get_extra 'libguestfs-tools-rhel9-image')"
+                    "--virt-operator-image=${CONTAINER_PFX}/${VIRT_IMG}"
+                    "--kubevirtLogo=kubevirtLogo" "--dumpCRDs"
+                  )
+                  [[ -n "$CP_FLAG" ]]        && VIRT_ARGS+=("${CP_FLAG}")
+                  [[ -n "$PR_FLAG" ]]        && VIRT_ARGS+=("${PR_FLAG}")
+                  [[ -n "$SC_FLAG" ]]        && VIRT_ARGS+=("${SC_FLAG}")
+                  [[ -n "$SYNC_FLAG" ]]      && VIRT_ARGS+=("${SYNC_FLAG}")
+                  [[ -n "$TMPL_API_FLAG" ]]  && VIRT_ARGS+=("${TMPL_API_FLAG}")
+                  [[ -n "$TMPL_CTRL_FLAG" ]] && VIRT_ARGS+=("${TMPL_CTRL_FLAG}")
+                  gen_csv "${CSV_BASE}/virt-csv/virt-csv-output.yaml" "${QUAY}/${VIRT_IMG}" /usr/bin/csv-generator "${VIRT_ARGS[@]}"
+                fi
+              else
+                echo "  SKIP: virt not in operators list or no relevant image changed"
+              fi
+
+              # ─── SSP ────────────────────────────────────────────────────────────────────
+              echo "=== SSP CSV ==="
+              mkdir -p "${CSV_BASE}/ssp-csv"
+              if has_op ssp && keys_changed \
+                kubevirt-ssp-operator-rhel9-image kubevirt-ssp-operator-image \
+                kubevirt-template-validator-rhel9-image kubevirt-template-validator-image \
+                vm-console-proxy-rhel9-image \
+                kubevirt-tekton-tasks-create-datavolume-rhel9-image \
+                kubevirt-tekton-tasks-disk-virt-customize-rhel9-image virtio-win-rhel9-image; then
+                SSP_IMG=$(get_core "kubevirt-ssp-operator${VER_SFX}-image")
+                VM_PROXY_IMG=$(get_extra "vm-console-proxy${VER_SFX}-image")
+                SSP_ARGS=(
+                  "--csv-version=${CSV_VER}" "--namespace=${TARGET_NS}"
+                  "--operator-image=${CONTAINER_PFX}/${SSP_IMG}"
+                  "--validator-image=${CONTAINER_PFX}/$(get_extra "kubevirt-template-validator${VER_SFX}-image")"
+                  "--dump-crds" "--operator-version=${OP_VER}"
+                )
+                [[ -n "$VM_PROXY_IMG" ]] && SSP_ARGS+=("--vm-console-proxy-image=${CONTAINER_PFX}/${VM_PROXY_IMG}")
+                # v4.14-4.15: tekton-tasks and virtio images passed as env vars to the csv-generator
+                if [[ "$VER_NUM" -ge 4014 && "$VER_NUM" -lt 4016 ]]; then
+                  TK_IMG=$(get_extra "kubevirt-tekton-tasks-create-datavolume-rhel9-image")
+                  DV_IMG=$(get_extra "kubevirt-tekton-tasks-disk-virt-customize-rhel9-image")
+                  VW_IMG=$(get_extra "virtio-win-rhel9-image")
+                  GEN_CSV_ENV=(
+                    "TEKTON_TASKS_IMAGE=${CONTAINER_PFX}/${TK_IMG}"
+                    "TEKTON_TASKS_DISK_VIRT_IMAGE=${CONTAINER_PFX}/${DV_IMG}"
+                    "VIRTIO_IMG=${CONTAINER_PFX}/${VW_IMG}"
+                  )
+                fi
+                gen_csv "${CSV_BASE}/ssp-csv/ssp-csv-output.yaml" "${QUAY}/${SSP_IMG}" /csv-generator "${SSP_ARGS[@]}"
+              else
+                echo "  SKIP: ssp not in operators list or no relevant image changed"
+              fi
+
+              # ─── CDI ────────────────────────────────────────────────────────────────────
+              echo "=== CDI CSV ==="
+              mkdir -p "${CSV_BASE}/cdi-csv"
+              if has_op cdi && keys_changed \
+                virt-cdi-operator-rhel9-image virt-cdi-operator-image \
+                virt-cdi-controller-rhel9-image virt-cdi-controller-image \
+                virt-cdi-importer-rhel9-image virt-cdi-importer-image \
+                virt-cdi-cloner-rhel9-image virt-cdi-cloner-image \
+                virt-cdi-apiserver-rhel9-image virt-cdi-apiserver-image \
+                virt-cdi-uploadserver-rhel9-image virt-cdi-uploadserver-image \
+                virt-cdi-uploadproxy-rhel9-image virt-cdi-uploadproxy-image \
+                cdi-ovirt-populator-image; then
+                CDI_IMG=$(get_core "virt-cdi-operator${VER_SFX}-image")
+                OVIRT_IMG=$(get_extra 'cdi-ovirt-populator-image')
+                CDI_ARGS=(
+                  "--csv-version=${CSV_VER}" "--replaces-csv-version=${CSV_REPLACES}"
+                  "--namespace=${TARGET_NS}" "--cdi-logo-base64=logo" "--operator-version=${OP_VER}"
+                  "--operator-image=${CONTAINER_PFX}/${CDI_IMG}"
+                  "--controller-image=${CONTAINER_PFX}/$(get_extra "virt-cdi-controller${VER_SFX}-image")"
+                  "--importer-image=${CONTAINER_PFX}/$(get_extra "virt-cdi-importer${VER_SFX}-image")"
+                  "--cloner-image=${CONTAINER_PFX}/$(get_extra "virt-cdi-cloner${VER_SFX}-image")"
+                  "--apiserver-image=${CONTAINER_PFX}/$(get_extra "virt-cdi-apiserver${VER_SFX}-image")"
+                  "--uploadproxy-image=${CONTAINER_PFX}/$(get_extra "virt-cdi-uploadproxy${VER_SFX}-image")"
+                  "--uploadserver-image=${CONTAINER_PFX}/$(get_extra "virt-cdi-uploadserver${VER_SFX}-image")"
+                  "--pull-policy=IfNotPresent" "--dump-crds"
+                )
+                # ovirt-populator absent in v4.14-v4.15
+                [[ -n "$OVIRT_IMG" ]] && CDI_ARGS+=("--ovirt-populator-image=${OVIRT_IMG}")
+                gen_csv "${CSV_BASE}/cdi-csv/cdi-csv-output.yaml" "${QUAY}/${CDI_IMG}" /usr/bin/csv-generator "${CDI_ARGS[@]}"
+              else
+                echo "  SKIP: cdi not in operators list or no relevant image changed"
+              fi
+
+              # ─── HPP ────────────────────────────────────────────────────────────────────
+              echo "=== HPP CSV ==="
+              mkdir -p "${CSV_BASE}/hpp-csv"
+              if has_op hpp && keys_changed \
+                hostpath-provisioner-operator-rhel9-image hostpath-provisioner-rhel8-operator-image \
+                hostpath-provisioner-rhel9-image hostpath-provisioner-rhel8-image \
+                hostpath-csi-driver-rhel9-image hostpath-csi-driver-image \
+                csi-node-driver-rhel9-image csi-node-driver-image \
+                csi-liveness-probe-rhel9-image csi-liveness-probe-image \
+                csi-external-provisioner-rhel9-image csi-external-provisioner-image \
+                csi-external-snapshotter-rhel9-image csi-external-snapshotter-image; then
+                HPP_IMG=$(get_core "${HPP_OP_KEY}")
+                gen_csv "${CSV_BASE}/hpp-csv/hpp-csv-output.yaml" "${QUAY}/${HPP_IMG}" /usr/bin/csv-generator \
+                  "--csv-version=${CSV_VER}" \
+                  "--operator-image-name=${CONTAINER_PFX}/${HPP_IMG}" \
+                  "--provisioner-image-name=${CONTAINER_PFX}/$(get_extra "${HPP_PRV_KEY}")" \
+                  "--csi-driver-image-name=${CONTAINER_PFX}/$(get_extra "${HPP_CSI_KEY}")" \
+                  "--namespace=${TARGET_NS}" "--pull-policy=IfNotPresent" \
+                  "--csi-node-driver-image-name=$(get_extra 'csi-node-driver-image')" \
+                  "--csi-liveness-probe-image-name=$(get_extra 'csi-liveness-probe-image')" \
+                  "--csi-external-provisioner-image-name=$(get_extra 'csi-external-provisioner-image')" \
+                  "--csi-snapshotter-image-name=$(get_extra 'csi-external-snapshotter-image')" \
+                  "--dump-crds"
+              else
+                echo "  SKIP: hpp not in operators list or no relevant image changed"
+              fi
+
+              # ─── AAQ ────────────────────────────────────────────────────────────────────
+              echo "=== AAQ CSV ==="
+              mkdir -p "${CSV_BASE}/aaq-csv"
+              if has_op aaq && keys_changed \
+                aaq-operator-rhel9-image aaq-controller-rhel9-image aaq-server-rhel9-image; then
+                AAQ_IMG=$(get_core "aaq-operator-rhel9-image")
+                gen_csv "${CSV_BASE}/aaq-csv/aaq-csv-output.yaml" "${QUAY}/${AAQ_IMG}" /usr/bin/csv-generator \
+                  "--csv-version=${CSV_VER}" "--operator-version=${OP_VER}" \
+                  "--operator-image=${CONTAINER_PFX}/${AAQ_IMG}" \
+                  "--controller-image=${CONTAINER_PFX}/$(get_extra 'aaq-controller-rhel9-image')" \
+                  "--aaq-server-image=${CONTAINER_PFX}/$(get_extra 'aaq-server-rhel9-image')" \
+                  "--namespace=${TARGET_NS}" "--pull-policy=IfNotPresent" "--dump-crds"
+              else
+                echo "  SKIP: aaq not in operators list or no relevant image changed"
+              fi
+
+              # ─── MTQ ────────────────────────────────────────────────────────────────────
+              echo "=== MTQ CSV ==="
+              mkdir -p "${CSV_BASE}/mtq-csv"
+              if has_op mtq && keys_changed \
+                mtq-operator-rhel9-image mtq-controller-rhel9-image mtq-lock-server-rhel9-image; then
+                MTQ_IMG=$(get_core "mtq-operator-rhel9-image")
+                gen_csv "${CSV_BASE}/mtq-csv/mtq-csv-output.yaml" "${QUAY}/${MTQ_IMG}" /usr/bin/csv-generator \
+                  "--csv-version=${CSV_VER}" "--operator-version=${OP_VER}" \
+                  "--operator-image=${CONTAINER_PFX}/${MTQ_IMG}" \
+                  "--controller-image=${CONTAINER_PFX}/$(get_extra 'mtq-controller-rhel9-image')" \
+                  "--mtq-lock-server-image=${CONTAINER_PFX}/$(get_extra 'mtq-lock-server-rhel9-image')" \
+                  "--namespace=${TARGET_NS}" "--dump-crds"
+              else
+                echo "  SKIP: mtq not in operators list or no relevant image changed"
+              fi
+
+              # ─── TTO ────────────────────────────────────────────────────────────────────
+              echo "=== TTO CSV ==="
+              mkdir -p "${CSV_BASE}/tto-csv"
+              if has_op tto && keys_changed \
+                kubevirt-tekton-tasks-operator-image kubevirt-tekton-tasks-operator-rhel9-image \
+                kubevirt-tekton-tasks-wait-for-vmi-status-rhel9-image \
+                kubevirt-tekton-tasks-modify-vm-template-rhel9-image \
+                kubevirt-tekton-tasks-disk-virt-sysprep-rhel9-image \
+                kubevirt-tekton-tasks-disk-virt-customize-rhel9-image \
+                kubevirt-tekton-tasks-create-vm-from-template-rhel9-image \
+                kubevirt-tekton-tasks-create-datavolume-rhel9-image \
+                kubevirt-tekton-tasks-copy-template-rhel9-image \
+                kubevirt-tekton-tasks-cleanup-vm-rhel9-image \
+                virtio-win-rhel9-image; then
+                TTO_IMG=$(get_core "kubevirt-tekton-tasks-operator-image")
+                [[ -z "$TTO_IMG" ]] && TTO_IMG=$(jq -r '."kubevirt-tekton-tasks-operator-rhel9-image" // empty' "${CORE}")
+                if [[ -n "$TTO_IMG" ]]; then
+                  TTO_SFX="-image"; [[ "$VER_NUM" -ge 4013 ]] && TTO_SFX="-rhel9-image"
+                  gen_csv "${CSV_BASE}/tto-csv/tto-csv-output.yaml" "${QUAY}/${TTO_IMG}" /csv-generator \
+                    "--csv-version=${CSV_VER}" "--namespace=${TARGET_NS}" "--operator-version=${OP_VER}" \
+                    "--operator-image=${CONTAINER_PFX}/${TTO_IMG}" "--pipelines-namespace=${TARGET_NS}" \
+                    "--wait-for-vmi-status-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-wait-for-vmi-status${TTO_SFX}")" \
+                    "--modify-vm-template-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-modify-vm-template${TTO_SFX}")" \
+                    "--disk-virt-sysprep-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-disk-virt-sysprep${TTO_SFX}")" \
+                    "--disk-virt-customize-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-disk-virt-customize${TTO_SFX}")" \
+                    "--create-vm-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-create-vm-from-template${TTO_SFX}")" \
+                    "--modify-data-object-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-create-datavolume${TTO_SFX}")" \
+                    "--copy-template-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-copy-template${TTO_SFX}")" \
+                    "--cleanup-vm-image=${CONTAINER_PFX}/$(get_extra "kubevirt-tekton-tasks-cleanup-vm${TTO_SFX}")" \
+                    "--dump-crds"
+                else
+                  echo "  SKIP: tto image not found in core-params.json"
+                fi
+              else
+                echo "  SKIP: tto not in operators list or no relevant image changed"
+              fi
+
+              # ─── Virt-migration ─────────────────────────────────────────────────────────
+              echo "=== Virt-migration CSV ==="
+              mkdir -p "${CSV_BASE}/virt-migration-csv"
+              if has_op virt-migration && keys_changed \
+                virt-migration-operator-rhel9-image virt-migration-controller-rhel9-image; then
+                VM_IMG=$(get_core "virt-migration-operator-rhel9-image")
+                gen_csv "${CSV_BASE}/virt-migration-csv/virt-migration-csv-output.yaml" \
+                  "${QUAY}/${VM_IMG}" /usr/bin/csv-generator \
+                  "--csv-version=${CSV_VER}" "--operator-version=${OP_VER}" \
+                  "--operator-image=${CONTAINER_PFX}/${VM_IMG}" \
+                  "--controller-image=${CONTAINER_PFX}/$(get_extra 'virt-migration-controller-rhel9-image')" \
+                  "--namespace=${TARGET_NS}" "--pull-policy=IfNotPresent" "--dump-crds"
+              else
+                echo "  SKIP: virt-migration not in operators list or no relevant image changed"
+              fi
+
+              # ─── Virt-platform-autopilot ────────────────────────────────────────────────
+              echo "=== Virt-platform-autopilot CSV ==="
+              mkdir -p "${CSV_BASE}/virt-platform-autopilot-csv"
+              if has_op virt-platform-autopilot && keys_changed \
+                virt-platform-autopilot-rhel9-image kubevirt-metrics-exporter-rhel9-image; then
+                VPA_IMG=$(get_core "virt-platform-autopilot-rhel9-image")
+                VPA_ARGS=(
+                  "--csv-version=${CSV_VER}" "--operator-version=${OP_VER}"
+                  "--operator-image=${CONTAINER_PFX}/${VPA_IMG}"
+                  "--namespace=${TARGET_NS}" "--pull-policy=IfNotPresent" "--dump-crds"
+                )
+                ME_IMG=$(get_extra "kubevirt-metrics-exporter-rhel9-image")
+                [[ -n "$ME_IMG" ]] && VPA_ARGS+=("--additional-images=RELATED_IMAGE_KUBEVIRT_METRICS_EXPORTER:${CONTAINER_PFX}/${ME_IMG}")
+                gen_csv "${CSV_BASE}/virt-platform-autopilot-csv/virt-platform-autopilot-csv-output.yaml" \
+                  "${QUAY}/${VPA_IMG}" /usr/bin/csv-generator "${VPA_ARGS[@]}"
+              else
+                echo "  SKIP: virt-platform-autopilot not in operators list or no relevant image changed"
+              fi
+
+              # ─── HCO CRDs ───────────────────────────────────────────────────────────────
+              echo "=== HCO CRDs ==="
+              HCO_IMG=$(get_core "hyperconverged-cluster-operator${VER_SFX}-image")
+              if [[ -n "$HCO_IMG" ]] && keys_changed hyperconverged-cluster-operator-rhel9-image hyperconverged-cluster-operator-image; then
+                HCO_CTR=$(buildah from --authfile "${AUTH_FILE}" --storage-driver vfs "${QUAY}/${HCO_IMG}" 2>&1)
+                if [[ $? -eq 0 ]]; then
+                  buildah run --storage-driver vfs "${HCO_CTR}" -- \
+                    bash -c 'if command -v /usr/local/bin/csv-merger &>/dev/null; then /usr/local/bin/csv-merger --output-mode=CRDs; else /usr/local/bin/crd-generator; fi' \
+                    > "${CRD_DIR}/hco-crds-output.yaml" 2>&1 || echo "WARN: HCO CRD generation failed" >&2
+                  buildah rm --storage-driver vfs "${HCO_CTR}" 2>/dev/null || true
+                  echo "  OK: HCO CRDs written"
+                else
+                  echo "WARN: buildah from failed for HCO image: ${HCO_CTR}" >&2
+                fi
+              else
+                echo "  SKIP: HCO image not changed or not found"
+              fi
+
+              # ─── Git commit and push ─────────────────────────────────────────────────────
+              echo "=== Committing and pushing ==="
+              git add components/hco-bundle-registry/csvs components/hco-bundle-registry/crds 2>/dev/null || true
+              git add . 2>/dev/null || true
+
+              if [[ -n "$(git status --porcelain)" ]]; then
+                git commit -m "Update HCO bundle registry with new images and CSVs"
+                git pull --rebase origin main
+                git push origin main
+                echo "│ OK: Changes pushed"
+              else
+                echo "│ SKIP: No changes detected"
+              fi
+
+              echo "=== generate-csvs step completed ==="
           - name: push-release-chart
             image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:18f9f819e9393891ce7ae19414a5672786e3efb120bdeaa2c254d8ba5d8e2493
             env:

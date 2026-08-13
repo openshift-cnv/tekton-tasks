@@ -25,6 +25,9 @@ spec:
       type: string
       default: ""
       description: PR number provided by PaC via {{pull_request_number}}
+    - name: git-auth-secret
+      type: string
+      description: PaC-generated secret name containing git-provider-token (passed via {{ git_auth_secret }})
     - name: debug
       type: string
       default: "false"
@@ -41,12 +44,15 @@ spec:
           value: $(params.path-context)
         - name: prow-job
           value: $(params.prow-job)
+        - name: git-auth-secret
+          value: $(params.git-auth-secret)
       taskSpec:
         params:
           - name: git-url
           - name: revision
           - name: path-context
           - name: prow-job
+          - name: git-auth-secret
         results:
           - name: IMAGE_DIGEST
             description: Digest of the image just built
@@ -59,15 +65,6 @@ spec:
           - name: SBOM_BLOB_URL
             description: Reference of SBOM blob digest to enable digest-based verification from provenance
             type: string
-        volumes:
-          - name: credentials
-            emptyDir: {}
-          - name: github-app-private-key
-            secret:
-              secretName: github-secrets
-              items:
-                - key: GITHUB_APP_PRIVATE_KEY
-                  path: github_app_private_key.pem
         steps:
           - name: trigger-prow-job-via-gangway
             image: quay.io/cnv-qe-devops/gangway:latest
@@ -85,32 +82,11 @@ spec:
                   secretKeyRef:
                     name: github-secrets
                     key: GANGWAY_TOKEN
-              - name: GIT_USER_NAME
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GIT_USER_NAME
-              - name: GIT_USER_EMAIL
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GIT_USER_EMAIL
-              - name: GITHUB_APP_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GITHUB_APP_ID
               - name: GITHUB_TOKEN
                 valueFrom:
                   secretKeyRef:
-                    name: github-secrets
-                    key: GITHUB_TOKEN
-            volumeMounts:
-              - name: credentials
-                mountPath: /credentials
-              - name: github-app-private-key
-                mountPath: /credentials/github-app
-                readOnly: true
+                    name: $(params.git-auth-secret)
+                    key: git-provider-token
             script: |
               #!/bin/bash
 
@@ -162,37 +138,16 @@ spec:
                 .snapshotID    = env(SNAPSHOT_ID)
                 ' | yq 'sort_keys(..)' | tee smokeResults.yaml
 
-              git config user.name "${GIT_USER_NAME}"
-              git config user.email "${GIT_USER_EMAIL}"
+              git config user.name "kargo-konflux[bot]"
+              git config user.email "1092100+kargo-konflux[bot]@users.noreply.github.com"
 
               git add smokeResults.yaml
               git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
 
               git checkout -B "${SOURCE_BRANCH}"
 
-              # Generate GitHub App token for push
-              APP_PEM="/credentials/github-app/github_app_private_key.pem"
-              NOW=$(date +%s)
-              IAT=$((NOW - 60))
-              EXP=$((NOW + 600))
-              JWT_HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
-              JWT_PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
-              JWT_SIGNATURE=$(printf '%s.%s' "${JWT_HEADER}" "${JWT_PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
-              JWT="${JWT_HEADER}.${JWT_PAYLOAD}.${JWT_SIGNATURE}"
-
               REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-              INSTALL_ID=$(curl -s \
-                -H "Authorization: Bearer ${JWT}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO_SLUG}/installation" \
-                | jq -r '.id')
-              PUSH_TOKEN=$(curl -s -X POST \
-                -H "Authorization: Bearer ${JWT}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" \
-                | jq -r '.token')
-
-              git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
+              git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
 
               if [[ "${exit_code:-0}" != "0" ]]; then
                 echo ""
@@ -217,6 +172,8 @@ spec:
           value: $(params.path-context)
         - name: debug
           value: $(params.debug)
+        - name: git-auth-secret
+          value: $(params.git-auth-secret)
       taskSpec:
         params:
           - name: test-status
@@ -224,13 +181,7 @@ spec:
           - name: git-url
           - name: path-context
           - name: debug
-        volumes:
-          - name: github-app-private-key
-            secret:
-              secretName: github-secrets
-              items:
-                - key: GITHUB_APP_PRIVATE_KEY
-                  path: github_app_private_key.pem
+          - name: git-auth-secret
         steps:
           - name: merge-or-close-pr
             image: quay.io/cnv-qe-devops/gangway:latest
@@ -243,20 +194,11 @@ spec:
                 value: $(params.git-url)
               - name: PATH_CONTEXT
                 value: $(params.path-context)
-              - name: GITHUB_APP_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: github-secrets
-                    key: GITHUB_APP_ID
               - name: GITHUB_TOKEN
                 valueFrom:
                   secretKeyRef:
-                    name: github-secrets
-                    key: GITHUB_TOKEN
-            volumeMounts:
-              - name: github-app-private-key
-                mountPath: /credentials/github-app
-                readOnly: true
+                    name: $(params.git-auth-secret)
+                    key: git-provider-token
             script: |
               #!/usr/bin/env bash
 
@@ -310,11 +252,21 @@ spec:
               echo "Test Status:  ${TEST_STATUS}"
               ACTION_LOG+=("OK|PR #${PR_NUMBER} identified|exit=0|0s")
 
-              # --- Generate GitHub App installation token ---
-              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-              APP_PEM="/credentials/github-app/github_app_private_key.pem"
+              # --- Validate PaC token ---
+              if [[ -z "${GITHUB_TOKEN}" ]]; then
+                echo "ERROR: GITHUB_TOKEN is empty — PaC secret may not be mounted"
+                ACTION_LOG+=("FAILED|Validate GITHUB_TOKEN|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|GITHUB_TOKEN validated|exit=0|0s")
 
-              REPO_INFO=$(curl -s "https://api.github.com/repos/${REPO_SLUG}")
+              # --- Resolve repo slug and API base ---
+              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+
+              REPO_INFO=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO_SLUG}")
               IS_FORK=$(echo "${REPO_INFO}" | jq -r '.fork // false')
               if [[ "${IS_FORK}" == "true" ]]; then
                 UPSTREAM_SLUG=$(echo "${REPO_INFO}" | jq -r '.parent.full_name')
@@ -322,39 +274,6 @@ spec:
                 REPO_SLUG="${UPSTREAM_SLUG}"
               fi
               GH_API="https://api.github.com/repos/${REPO_SLUG}"
-
-              NOW=$(date +%s)
-              IAT=$((NOW - 60))
-              EXP=$((NOW + 600))
-              HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
-              PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
-              SIGNATURE=$(printf '%s.%s' "${HEADER}" "${PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
-              JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
-
-              INSTALLATION_ID=$(curl -s -H "Authorization: Bearer ${JWT}" \
-                -H "Accept: application/vnd.github+json" \
-                "${GH_API}/installation" | jq -r '.id')
-
-              if [[ -z "${INSTALLATION_ID}" || "${INSTALLATION_ID}" == "null" ]]; then
-                echo "ERROR: Could not find GitHub App installation for ${REPO_SLUG}"
-                ACTION_LOG+=("FAILED|GitHub App auth|exit=1|0s")
-                FINAL_EXIT_CODE=1
-                exit 1
-              fi
-
-              GITHUB_TOKEN=$(curl -s -X POST \
-                -H "Authorization: Bearer ${JWT}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
-                | jq -r '.token')
-
-              if [[ -z "${GITHUB_TOKEN}" || "${GITHUB_TOKEN}" == "null" ]]; then
-                echo "ERROR: Could not generate installation token"
-                ACTION_LOG+=("FAILED|GitHub App token|exit=1|0s")
-                FINAL_EXIT_CODE=1
-                exit 1
-              fi
-              ACTION_LOG+=("OK|GitHub App auth|exit=0|0s")
 
               gh_api_call() {
                 local method="$1" endpoint="$2" data="${3:-}"

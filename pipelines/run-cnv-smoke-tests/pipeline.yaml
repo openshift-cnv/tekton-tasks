@@ -46,6 +46,9 @@ spec:
           value: $(params.prow-job)
         - name: git-auth-secret
           value: $(params.git-auth-secret)
+      workspaces:
+        - name: git-auth
+          workspace: git-auth
       taskSpec:
         params:
           - name: git-url
@@ -53,6 +56,9 @@ spec:
           - name: path-context
           - name: prow-job
           - name: git-auth-secret
+        workspaces:
+          - name: git-auth
+            optional: true
         results:
           - name: IMAGE_DIGEST
             description: Digest of the image just built
@@ -82,15 +88,17 @@ spec:
                   secretKeyRef:
                     name: github-secrets
                     key: GANGWAY_TOKEN
-              - name: GITHUB_TOKEN
-                valueFrom:
-                  secretKeyRef:
-                    name: $(params.git-auth-secret)
-                    key: git-provider-token
             script: |
               #!/bin/bash
 
               set -xeuo pipefail
+
+              # Configure git credentials from PaC workspace
+              if [[ -d "$(workspaces.git-auth.path)" ]]; then
+                cp "$(workspaces.git-auth.path)/.gitconfig" ~/.gitconfig 2>/dev/null || true
+                cp "$(workspaces.git-auth.path)/.git-credentials" ~/.git-credentials 2>/dev/null || true
+                chmod 0400 ~/.git-credentials 2>/dev/null || true
+              fi
 
               git clone "${GIT_REPOSITORY}" repo && pushd "repo/${PATH_CONTEXT}" && git checkout "${GIT_REVISION}"
 
@@ -146,8 +154,7 @@ spec:
 
               git checkout -B "${SOURCE_BRANCH}"
 
-              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
-              git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
+              git push origin "${SOURCE_BRANCH}"
 
               if [[ "${exit_code:-0}" != "0" ]]; then
                 echo ""

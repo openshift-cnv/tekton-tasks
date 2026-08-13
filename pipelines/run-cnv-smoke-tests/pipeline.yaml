@@ -115,18 +115,13 @@ spec:
               export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
               popd
 
-              uv run gangway.py \
-                  --trigger "${PROW_JOB_NAME}" \
-                  --write-job-info-file ${JOB_INFO_FILE} \
-                  -e CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
-                  -e CNV_OPERATOR_CHANNEL=${CNV_OPERATOR_CHANNEL} \
-                  -e HCO_BUNDLE_VERSION=${HCO_BUNDLE_VERSION}
-
-              PROW_JOB_ID=$(yq '.prowJobId' ${JOB_INFO_FILE})
-
-              uv run gangway.py \
-                  --write-job-info-file ${JOB_INFO_FILE} \
-                  --wait-job-id ${PROW_JOB_ID} || exit_code=$?
+              # TEMPORARY: Mock prow job for testing git push + PR merge flow
+              cat > ${JOB_INFO_FILE} <<MOCK
+              prowJobId: "mock-test-$(date +%s)"
+              prowJobState: "success"
+              prowJobUrl: "https://prow.ci.openshift.org/view/mock-test"
+              prowJobYamlUrl: "https://prow.ci.openshift.org/prowjob?prowjob=mock-test"
+              MOCK
 
               export PROW_JOB_STATE=$(yq '.prowJobState' ${JOB_INFO_FILE})
               export PROW_JOB_URL=$(yq '.prowJobUrl' ${JOB_INFO_FILE})

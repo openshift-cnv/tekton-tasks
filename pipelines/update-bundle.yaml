@@ -548,9 +548,9 @@ spec:
               set -eo pipefail
 
               echo "=== PHASE 1: Checking if hco-bundle-registry release ==="
-              if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
-                ACTION_LOG+=("OK|Skip - Not hco-bundle-registry|exit=0|0s")
-                echo "│ SKIP: Snapshot does not contain 'hco-bundle-registry'"
+              if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]] || [[ "$(params.SNAPSHOT)" == *"dedicated-builds"* ]]; then
+                ACTION_LOG+=("OK|Skip - Not hco-bundle-registry or dedicated build|exit=0|0s")
+                echo "│ SKIP: Not an hco-bundle-registry release (dedicated build or different snapshot)"
                 FINAL_EXIT_CODE=0
                 exit 0
               fi

@@ -191,6 +191,23 @@ spec:
               echo "│ Application: $APPLICATION"
               echo "│ Version: $VERSION"
 
+              IS_DEDICATED_BUILD=false
+              TARGET_BRANCH="main"
+              BUNDLE_DIR=""
+
+              if [[ "$APPLICATION" == "dedicated-builds" ]]; then
+                IS_DEDICATED_BUILD=true
+                TARGET_BRANCH=$(jq -r '.metadata.annotations["build.appstudio.redhat.com/target_branch"]' <<< "$SNAPSHOT_DATA")
+                if [[ -z "$TARGET_BRANCH" || "$TARGET_BRANCH" == "null" ]]; then
+                  echo "ERROR: Dedicated build snapshot missing target_branch annotation"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                BUNDLE_DIR="hco-bundle-registry/"
+                echo "│ Dedicated build detected"
+                echo "│ Target branch: $TARGET_BRANCH"
+              fi
+
               echo "=== PHASE 2: Cloning hco-bundle-registry ==="
 
               # Validate GITLAB_TOKEN
@@ -201,10 +218,14 @@ spec:
               fi
               ACTION_LOG+=("OK|Validate GITLAB_TOKEN|exit=0|0s")
 
-              REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
+              if [[ "$IS_DEDICATED_BUILD" == "true" ]]; then
+                REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/dedicated-builds/dedicated-builds.git"
+              else
+                REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/konflux-builds/${VERSION}/hco-bundle-registry.git"
+              fi
               REPO_URL_WITH_AUTH=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
 
-              if ! exec_action "Clone hco-bundle-registry" 120 "git clone $REPO_URL_WITH_AUTH --depth 50 hco-bundle-registry"; then
+              if ! exec_action "Clone repo" 120 "git clone $REPO_URL_WITH_AUTH --depth 50 -b $TARGET_BRANCH hco-bundle-registry"; then
                 echo "ERROR: Failed to clone repository"
                 FINAL_EXIT_CODE=1
                 exit 1
@@ -275,7 +296,7 @@ spec:
 
               # Save Snapshot object for GC resilience (stripped, with velero label)
               if [[ "$APPLICATION" != *"-test-"* ]]; then
-                snapshot_objects_dir="components/hco-bundle-registry/snapshot-objects"
+                snapshot_objects_dir="${BUNDLE_DIR}components/hco-bundle-registry/snapshot-objects"
                 mkdir -p "$snapshot_objects_dir"
                 if ! exec_action "Save Snapshot object for ${APPLICATION}" 30 "set -o pipefail; kubectl get snapshot '$SNAPSHOT_ID' -oyaml | yq 'del(.metadata.ownerReferences) | .metadata.labels[\"velero.io/restore-name\"] = \"snapshot-persistence\"' > '${snapshot_objects_dir}/${APPLICATION}.yaml'"; then
                   echo "WARN: Failed to save Snapshot object for ${APPLICATION} (non-fatal)"
@@ -283,7 +304,7 @@ spec:
               fi
 
               # Define snapshots_file outside function so it's available in main script
-              snapshots_file="components/hco-bundle-registry/snapshots.json"
+              snapshots_file="${BUNDLE_DIR}components/hco-bundle-registry/snapshots.json"
 
               function update_images_snapshots() {
                 for img in $IMAGES; do
@@ -292,9 +313,9 @@ spec:
 
                   # Virt-platform-autopilot should also be in the core-params
                   if [[ ("$image_name" == *"-operator"* || "$image_name" == *"virt-platform-autopilot"*) && "$image_name" != *"-test-"* ]]; then
-                    json_file="components/hco-bundle-registry/core-params.json"
+                    json_file="${BUNDLE_DIR}components/hco-bundle-registry/core-params.json"
                   else
-                    json_file="components/hco-bundle-registry/extra-params.json"
+                    json_file="${BUNDLE_DIR}components/hco-bundle-registry/extra-params.json"
                   fi
                   jq -S ".\"${image_name}-image\" = \"${image_name_sha}\"" "$json_file" > "${json_file}.tmp" && mv "${json_file}.tmp" "$json_file"
                 done
@@ -316,11 +337,23 @@ spec:
               echo "=== PHASE 4: Updating image references ==="
               # Export function AND variables needed by function when run in subshell via exec_action
               export -f update_images_snapshots
-              export IMAGES APPLICATION SNAPSHOT_ID snapshots_file
+              export IMAGES APPLICATION SNAPSHOT_ID snapshots_file BUNDLE_DIR
               if ! exec_action "Update image references" 60 "update_images_snapshots"; then
                 echo "ERROR: Failed to update image references"
                 FINAL_EXIT_CODE=1
                 exit 1
+              fi
+
+              # For dedicated builds, mark component readiness in version-config.json
+              if [[ "$IS_DEDICATED_BUILD" == "true" ]]; then
+                VCONFIG="${BUNDLE_DIR}components/hco-bundle-registry/version-config.json"
+                if [[ -f "$VCONFIG" ]]; then
+                  for img in $IMAGES; do
+                    image_name=$(echo "${img##*/}" | cut -d'@' -f1)
+                    jq -S ".private_build.components_readiness[\"${image_name}\"] = \"true\"" "$VCONFIG" > "${VCONFIG}.tmp" && mv "${VCONFIG}.tmp" "$VCONFIG"
+                  done
+                  ACTION_LOG+=("OK|Update component readiness in version-config.json|exit=0|0s")
+                fi
               fi
 
               echo "=== PHASE 5: Committing and pushing changes ==="
@@ -329,13 +362,13 @@ spec:
                 git commit -m "Update HCO bundle registry with new images"
                 ACTION_LOG+=("OK|Commit changes|exit=0|0s")
                 
-                if ! exec_action "Pull with rebase" 60 "git pull --rebase origin main"; then
+                if ! exec_action "Pull with rebase" 60 "git pull --rebase origin $TARGET_BRANCH"; then
                   echo "ERROR: Failed to pull with rebase"
                   FINAL_EXIT_CODE=1
                   exit 1
                 fi
                 
-                if ! exec_action "Push to origin" 60 "git push origin main"; then
+                if ! exec_action "Push to origin" 60 "git push origin $TARGET_BRANCH"; then
                   echo "ERROR: Failed to push to origin"
                   FINAL_EXIT_CODE=1
                   exit 1
@@ -348,7 +381,7 @@ spec:
 
               # Copy Snapshot objects to shared volume for push-release-chart step
               mkdir -p /var/shared/snapshot-objects
-              cp components/hco-bundle-registry/snapshot-objects/*.yaml /var/shared/snapshot-objects/ 2>/dev/null || true
+              cp ${BUNDLE_DIR}components/hco-bundle-registry/snapshot-objects/*.yaml /var/shared/snapshot-objects/ 2>/dev/null || true
 
               if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
                 echo "=== PHASE 6: Preparing release data for hco-bundle-registry ==="

@@ -48,7 +48,7 @@ spec:
             image: quay.io/konflux-ci/release-service-utils@sha256:2f9e6863e82bbc9ddce5a290f3fd0e87657c475e3de8a832b2ef7f8d0671e7d3
             envFrom:
               - secretRef:
-                  name: hco-updater-gitlab-token
+                  name: hco-updater-gitlab-token-2
             volumeMounts:
               - name: shared-data
                 mountPath: /var/shared
@@ -440,7 +440,7 @@ spec:
                 value: /tmp
             envFrom:
               - secretRef:
-                  name: hco-updater-gitlab-token
+                  name: hco-updater-gitlab-token-2
               - secretRef:
                   name: quay-builds-creds
             volumeMounts:

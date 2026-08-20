@@ -207,7 +207,7 @@ spec:
                 echo "│ Dedicated build detected"
                 echo "│ Target branch: $TARGET_BRANCH"
 
-                if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
+                if jq -e '[.spec.components[].containerImage] | any(contains("hco-bundle-registry"))' <<< "$SNAPSHOT_DATA" > /dev/null 2>&1; then
                   ACTION_LOG+=("OK|Skip - dedicated build hco-bundle-registry image|exit=0|0s")
                   echo "│ SKIP: hco-bundle-registry image in dedicated build — nothing to update to avoid infinite loop"
                   FINAL_EXIT_CODE=0

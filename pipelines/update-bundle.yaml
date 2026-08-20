@@ -206,6 +206,13 @@ spec:
                 BUNDLE_DIR="hco-bundle-registry/"
                 echo "│ Dedicated build detected"
                 echo "│ Target branch: $TARGET_BRANCH"
+
+                if [[ "$(params.SNAPSHOT)" == *"hco-bundle-registry"* ]]; then
+                  ACTION_LOG+=("OK|Skip - dedicated build hco-bundle-registry image|exit=0|0s")
+                  echo "│ SKIP: hco-bundle-registry image in dedicated build — nothing to update to avoid infinite loop"
+                  FINAL_EXIT_CODE=0
+                  exit 0
+                fi
               fi
 
               echo "=== PHASE 2: Cloning hco-bundle-registry ==="

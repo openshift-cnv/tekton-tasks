@@ -114,7 +114,7 @@ spec:
             script: |
               #!/bin/bash
 
-              set -xeuo pipefail
+              set -euo pipefail
 
               git clone "${GIT_REPOSITORY}" repo && pushd "repo/${PATH_CONTEXT}" && git checkout "${GIT_REVISION}"
 
@@ -170,7 +170,9 @@ spec:
 
               git checkout -B "${SOURCE_BRANCH}"
 
-              # Generate GitHub App token for push
+              # Generate GitHub App token for push. Keep xtrace off so JWT/token
+              # never appear in Tekton logs.
+              set +x
               APP_PEM="/credentials/github-app/github_app_private_key.pem"
               NOW=$(date +%s)
               IAT=$((NOW - 60))
@@ -192,7 +194,9 @@ spec:
                 "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" \
                 | jq -r '.token')
 
-              git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
+              git -c "http.extraHeader=Authorization: Bearer ${PUSH_TOKEN}" \
+                push "https://github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
+              unset JWT JWT_HEADER JWT_PAYLOAD JWT_SIGNATURE PUSH_TOKEN
 
               if [[ "${exit_code:-0}" != "0" ]]; then
                 echo ""
@@ -298,6 +302,14 @@ spec:
               # ============================================================
               set -eo pipefail
 
+              xtrace_off() {
+                case "$-" in *x*) _XTRACE_RESTORE=1 ;; *) _XTRACE_RESTORE=0 ;; esac
+                set +x
+              }
+              xtrace_on() {
+                if [[ "${_XTRACE_RESTORE}" == "1" ]]; then set -x; fi
+              }
+
               # --- Validate PR number ---
               if [[ -z "${PR_NUMBER}" ]]; then
                 echo "INFO: No pull-request-number provided — skipping PR management"
@@ -323,6 +335,7 @@ spec:
               fi
               GH_API="https://api.github.com/repos/${REPO_SLUG}"
 
+              xtrace_off
               NOW=$(date +%s)
               IAT=$((NOW - 60))
               EXP=$((NOW + 600))
@@ -334,6 +347,7 @@ spec:
               INSTALLATION_ID=$(curl -s -H "Authorization: Bearer ${JWT}" \
                 -H "Accept: application/vnd.github+json" \
                 "${GH_API}/installation" | jq -r '.id')
+              xtrace_on
 
               if [[ -z "${INSTALLATION_ID}" || "${INSTALLATION_ID}" == "null" ]]; then
                 echo "ERROR: Could not find GitHub App installation for ${REPO_SLUG}"
@@ -342,11 +356,14 @@ spec:
                 exit 1
               fi
 
+              xtrace_off
               GITHUB_TOKEN=$(curl -s -X POST \
                 -H "Authorization: Bearer ${JWT}" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
                 | jq -r '.token')
+              unset JWT HEADER PAYLOAD SIGNATURE
+              xtrace_on
 
               if [[ -z "${GITHUB_TOKEN}" || "${GITHUB_TOKEN}" == "null" ]]; then
                 echo "ERROR: Could not generate installation token"
@@ -359,6 +376,7 @@ spec:
               gh_api_call() {
                 local method="$1" endpoint="$2" data="${3:-}"
                 local response http_code
+                xtrace_off
                 if [[ -n "${data}" ]]; then
                   response=$(curl -s -w "\n%{http_code}" -X "${method}" \
                     -H "Authorization: token ${GITHUB_TOKEN}" \
@@ -372,6 +390,7 @@ spec:
                     -H "Accept: application/vnd.github+json" \
                     "${GH_API}${endpoint}")
                 fi
+                xtrace_on
                 http_code=$(echo "${response}" | tail -1)
                 local body
                 body=$(echo "${response}" | sed '$d')
@@ -384,19 +403,71 @@ spec:
                 fi
               }
 
+              close_unmergeable_pr() {
+                local comment
+                comment="Smoke tests passed, but PR #${PR_NUMBER} is not mergeable due to merge conflicts with the base branch. Closing this PR so Kargo can recreate it from the current base."
+                echo "${comment}"
+                gh_api_call POST "/issues/${PR_NUMBER}/comments" \
+                  "$(jq -n --arg body "${comment}" '{body: $body}')" \
+                  && ACTION_LOG+=("OK|Comment conflict on PR #${PR_NUMBER}|exit=0|0s") \
+                  || ACTION_LOG+=("FAILED|Comment conflict on PR #${PR_NUMBER}|exit=1|0s")
+                if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
+                  echo "ERROR: Failed to close unmergeable PR #${PR_NUMBER}"
+                  ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Close unmergeable PR #${PR_NUMBER}|exit=0|0s")
+                FINAL_EXIT_CODE=0
+                exit 0
+              }
+
               # --- Merge or close PR based on task status ---
               if [[ "${TEST_STATUS}" == "Succeeded" ]]; then
                 echo ""
                 echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
 
+                MERGEABLE_STATE="unknown"
+                MERGEABLE="null"
+                for attempt in 1 2 3 4 5; do
+                  xtrace_off
+                  PR_JSON=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${GH_API}/pulls/${PR_NUMBER}")
+                  xtrace_on
+                  MERGEABLE_STATE=$(echo "${PR_JSON}" | jq -r '.mergeable_state // "unknown"')
+                  MERGEABLE=$(echo "${PR_JSON}" | jq -r '.mergeable')
+                  echo "PR mergeable=${MERGEABLE} mergeable_state=${MERGEABLE_STATE}"
+                  if [[ "${MERGEABLE_STATE}" != "unknown" && "${MERGEABLE}" != "null" ]]; then
+                    break
+                  fi
+                  sleep 3
+                done
+
+                if [[ "${MERGEABLE_STATE}" == "dirty" || "${MERGEABLE}" == "false" ]]; then
+                  close_unmergeable_pr
+                fi
+
                 # Update PR branch if behind base (required by branch protection)
-                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/update-branch" '{}' 2>/dev/null; then
+                UPDATE_OUT=$(gh_api_call PUT "/pulls/${PR_NUMBER}/update-branch" '{}' 2>/dev/null) || true
+                if echo "${UPDATE_OUT}" | grep -qi 'conflict'; then
+                  close_unmergeable_pr
+                elif echo "${UPDATE_OUT}" | grep -q '^HTTP '; then
                   echo "INFO: Branch already up to date or update not needed"
                 fi
                 sleep 3
 
                 if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
                   "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline\"}"; then
+                  xtrace_off
+                  PR_JSON=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${GH_API}/pulls/${PR_NUMBER}")
+                  xtrace_on
+                  MERGEABLE_STATE=$(echo "${PR_JSON}" | jq -r '.mergeable_state // "unknown"')
+                  if [[ "${MERGEABLE_STATE}" == "dirty" ]]; then
+                    close_unmergeable_pr
+                  fi
                   echo "ERROR: Failed to merge PR #${PR_NUMBER}"
                   ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
                   FINAL_EXIT_CODE=1
@@ -408,15 +479,19 @@ spec:
                 echo "Smoke tests FAILED (status: ${TEST_STATUS}) — closing PR #${PR_NUMBER}"
 
                 # Fetch smokeResults.yaml from the PR branch for failure details
+                xtrace_off
                 PR_INFO=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
                   -H "Accept: application/vnd.github+json" \
                   "${GH_API}/pulls/${PR_NUMBER}")
+                xtrace_on
                 PR_BRANCH=$(echo "${PR_INFO}" | jq -r '.head.ref // empty')
                 FAILURE_DETAILS=""
                 if [[ -n "${PR_BRANCH}" ]]; then
+                  xtrace_off
                   SMOKE_FILE=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
                     -H "Accept: application/vnd.github.raw" \
                     "${GH_API}/contents/${PATH_CONTEXT}/smokeResults.yaml?ref=${PR_BRANCH}" 2>/dev/null || true)
+                  xtrace_on
                   PROW_URL=$(echo "${SMOKE_FILE}" | yq -r '.prowJobUrl' 2>/dev/null || true)
                   PROW_STATE=$(echo "${SMOKE_FILE}" | yq -r '.smokeResults' 2>/dev/null || true)
                   BUNDLE_VER=$(echo "${SMOKE_FILE}" | yq -r '.bundle' 2>/dev/null || true)

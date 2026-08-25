@@ -705,6 +705,20 @@ spec:
               fi
               ACTION_LOG+=("OK|Verify Chart.yaml hydration|exit=0|0s")
 
+              if ! exec_action "Hydrate template identifiers" 30 "sed -i \"s/hco-bundle-registry-osver/${HYDRATED_CHART_NAME}/g\" templates/_helpers.tpl templates/releases.yaml"; then
+                echo "ERROR: Failed to hydrate template identifiers"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              echo "│ OK: Template identifiers hydrated"
+
+              if ! exec_action "Verify template identifiers" 30 "! grep -q \"hco-bundle-registry-osver\" templates/_helpers.tpl templates/releases.yaml && grep -q \"${HYDRATED_CHART_NAME}.labels\" templates/_helpers.tpl"; then
+                echo "ERROR: Template identifier hydration verification failed"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              echo "│ OK: Template identifiers verified"
+
               echo "=== PHASE 7: Hydrating values.yaml ==="
 
               if [[ ! -f "values.yaml" ]]; then

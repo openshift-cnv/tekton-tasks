@@ -705,14 +705,32 @@ spec:
               fi
               ACTION_LOG+=("OK|Verify Chart.yaml hydration|exit=0|0s")
 
-              if ! exec_action "Hydrate template identifiers" 30 "sed -i \"s/hco-bundle-registry-osver/${HYDRATED_CHART_NAME}/g\" templates/_helpers.tpl templates/releases.yaml"; then
+              # Guard: HYDRATED_CHART_NAME is embedded in a sed pattern that exec_action
+              # re-parses via a second "bash -c" -- restrict it to a safe charset (no "/",
+              # "$", backticks, quotes, ";") so it can never be interpreted as shell syntax
+              # or collide with the sed delimiter, and require it non-empty so a blank value
+              # can't collapse the substitution into a destructive strip.
+              if [[ -z "$HYDRATED_CHART_NAME" ]]; then
+                echo "ERROR: HYDRATED_CHART_NAME is empty; refusing to hydrate template identifiers"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              if [[ ! "$HYDRATED_CHART_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                echo "ERROR: HYDRATED_CHART_NAME contains unexpected characters: $HYDRATED_CHART_NAME"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              export HYDRATED_CHART_NAME
+              ACTION_LOG+=("OK|Validate HYDRATED_CHART_NAME|exit=0|0s")
+
+              if ! exec_action "Hydrate template identifiers" 30 'sed -i "s/hco-bundle-registry-osver/${HYDRATED_CHART_NAME}/g" templates/_helpers.tpl templates/releases.yaml'; then
                 echo "ERROR: Failed to hydrate template identifiers"
                 FINAL_EXIT_CODE=1
                 exit 1
               fi
               echo "│ OK: Template identifiers hydrated"
 
-              if ! exec_action "Verify template identifiers" 30 "! grep -q \"hco-bundle-registry-osver\" templates/_helpers.tpl templates/releases.yaml && grep -q \"${HYDRATED_CHART_NAME}.labels\" templates/_helpers.tpl"; then
+              if ! exec_action "Verify template identifiers" 30 '! grep -q "hco-bundle-registry-osver" templates/_helpers.tpl templates/releases.yaml && grep -qF "${HYDRATED_CHART_NAME}.labels" templates/_helpers.tpl && grep -qF "${HYDRATED_CHART_NAME}" templates/releases.yaml'; then
                 echo "ERROR: Template identifier hydration verification failed"
                 FINAL_EXIT_CODE=1
                 exit 1

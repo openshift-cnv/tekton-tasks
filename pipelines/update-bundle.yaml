@@ -474,34 +474,11 @@ spec:
                 return $exit_code
               }
 
-              # Shared exit path for the fatal-error checks below: log, mark the
-              # script failed, and exit -- avoids repeating the same three lines
-              # at every guard.
-              fail() {
-                echo "ERROR: $1"
-                FINAL_EXIT_CODE=1
-                exit 1
-              }
-
-              # HYDRATED_CHART_NAME is embedded in a sed pattern that exec_action
-              # re-parses via a second "bash -c" -- restrict it to a safe charset (no
-              # "/", "$", backticks, quotes, ";") so it can never be interpreted as
-              # shell syntax or collide with the sed delimiter, and require it
-              # non-empty so a blank value can't collapse the substitution into a
-              # destructive strip. Exercised directly by
-              # tests/test_update_bundle_hydration.sh -- keep in sync.
-              validate_hydrated_chart_name() {
-                local name="$1"
-                [[ -n "$name" ]] || return 1
-                [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
-                return 0
-              }
-
               execution_summary() {
                 local script_exit_code=$?
                 local script_end=$(date +%s)
                 local total_duration=$((script_end - SCRIPT_START))
-
+                
                 echo ""
                 echo "╔═════════════════════════════════════════════════════════════"
                 echo "║ EXECUTION SUMMARY - push-release-chart"
@@ -536,10 +513,6 @@ spec:
               # RUN LOGIC - Business logic with fail-fast behavior
               # ============================================================
               set -eo pipefail
-              # Force the C locale so charset checks (e.g. the HYDRATED_CHART_NAME
-              # guard below) match byte ranges consistently regardless of the
-              # container's configured locale.
-              export LC_ALL=C
 
               echo "=== PHASE 1: Checking if hco-bundle-registry release ==="
               if [[ "$(params.SNAPSHOT)" != *"hco-bundle-registry"* ]]; then
@@ -732,23 +705,35 @@ spec:
               fi
               ACTION_LOG+=("OK|Verify Chart.yaml hydration|exit=0|0s")
 
-              # Single source of truth for the sentinel substituted below -- keep the
-              # sed and grep uses of it in lock-step instead of two hardcoded copies.
-              SENTINEL="hco-bundle-registry-osver"
-
-              if ! validate_hydrated_chart_name "$HYDRATED_CHART_NAME"; then
-                fail "HYDRATED_CHART_NAME is empty or contains unexpected characters: $HYDRATED_CHART_NAME"
+              # Guard: HYDRATED_CHART_NAME is embedded in a sed pattern that exec_action
+              # re-parses via a second "bash -c" -- restrict it to a safe charset (no "/",
+              # "$", backticks, quotes, ";") so it can never be interpreted as shell syntax
+              # or collide with the sed delimiter, and require it non-empty so a blank value
+              # can't collapse the substitution into a destructive strip.
+              if [[ -z "$HYDRATED_CHART_NAME" ]]; then
+                echo "ERROR: HYDRATED_CHART_NAME is empty; refusing to hydrate template identifiers"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              if [[ ! "$HYDRATED_CHART_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+                echo "ERROR: HYDRATED_CHART_NAME contains unexpected characters: $HYDRATED_CHART_NAME"
+                FINAL_EXIT_CODE=1
+                exit 1
               fi
               export HYDRATED_CHART_NAME
               ACTION_LOG+=("OK|Validate HYDRATED_CHART_NAME|exit=0|0s")
 
-              if ! exec_action "Hydrate template identifiers" 30 'sed -i "s/'"${SENTINEL}"'/${HYDRATED_CHART_NAME}/g" templates/_helpers.tpl templates/releases.yaml'; then
-                fail "Failed to hydrate template identifiers"
+              if ! exec_action "Hydrate template identifiers" 30 'sed -i "s/hco-bundle-registry-osver/${HYDRATED_CHART_NAME}/g" templates/_helpers.tpl templates/releases.yaml'; then
+                echo "ERROR: Failed to hydrate template identifiers"
+                FINAL_EXIT_CODE=1
+                exit 1
               fi
               echo "│ OK: Template identifiers hydrated"
 
-              if ! exec_action "Verify template identifiers" 30 '! grep -q "'"${SENTINEL}"'" templates/_helpers.tpl templates/releases.yaml && grep -qF "${HYDRATED_CHART_NAME}.labels" templates/_helpers.tpl && grep -qF "${HYDRATED_CHART_NAME}" templates/releases.yaml'; then
-                fail "Template identifier hydration verification failed"
+              if ! exec_action "Verify template identifiers" 30 '! grep -q "hco-bundle-registry-osver" templates/_helpers.tpl templates/releases.yaml && grep -qF "${HYDRATED_CHART_NAME}.labels" templates/_helpers.tpl && grep -qF "${HYDRATED_CHART_NAME}" templates/releases.yaml'; then
+                echo "ERROR: Template identifier hydration verification failed"
+                FINAL_EXIT_CODE=1
+                exit 1
               fi
               echo "│ OK: Template identifiers verified"
 

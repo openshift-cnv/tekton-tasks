@@ -503,8 +503,22 @@ spec:
                 echo "╠═════════════════════════════════════════════════════════════"
                 echo "║ OK: $ok_count | FAILED: $fail_count | TIMEOUT: $timeout_count"
                 echo "╚═════════════════════════════════════════════════════════════"
-                
+
                 exit ${FINAL_EXIT_CODE:-$script_exit_code}
+              }
+
+              # HYDRATED_CHART_NAME is embedded in a sed pattern that exec_action
+              # re-parses via a second "bash -c" -- restrict it to a safe charset (no
+              # "/", "$", backticks, quotes, ";") so it can never be interpreted as
+              # shell syntax or collide with the sed delimiter, and require it
+              # non-empty so a blank value can't collapse the substitution into a
+              # destructive strip. Exercised directly by
+              # tests/test_update_bundle_hydration.sh -- keep in sync.
+              validate_hydrated_chart_name() {
+                local name="$1"
+                [[ -n "$name" ]] || return 1
+                [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+                return 0
               }
 
               trap execution_summary EXIT
@@ -678,6 +692,14 @@ spec:
                 HYDRATED_CHART_NAME="${CHART_NAME}"
               fi
 
+              if ! validate_hydrated_chart_name "$HYDRATED_CHART_NAME"; then
+                echo "ERROR: HYDRATED_CHART_NAME is empty or contains unexpected characters: $HYDRATED_CHART_NAME"
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              export HYDRATED_CHART_NAME
+              ACTION_LOG+=("OK|Validate HYDRATED_CHART_NAME|exit=0|0s")
+
               APP_VERSION="v${BUNDLE_VERSION}"
 
               if ! exec_action "Hydrate Chart.yaml" 30 "yq -i '.name = \"${HYDRATED_CHART_NAME}\"' Chart.yaml && yq -i '.version = \"${CHART_VERSION}\"' Chart.yaml && yq -i '.appVersion = \"${APP_VERSION}\"' Chart.yaml"; then
@@ -705,23 +727,14 @@ spec:
               fi
               ACTION_LOG+=("OK|Verify Chart.yaml hydration|exit=0|0s")
 
-              # Guard: HYDRATED_CHART_NAME is embedded in a sed pattern that exec_action
-              # re-parses via a second "bash -c" -- restrict it to a safe charset (no "/",
-              # "$", backticks, quotes, ";") so it can never be interpreted as shell syntax
-              # or collide with the sed delimiter, and require it non-empty so a blank value
-              # can't collapse the substitution into a destructive strip.
-              if [[ -z "$HYDRATED_CHART_NAME" ]]; then
-                echo "ERROR: HYDRATED_CHART_NAME is empty; refusing to hydrate template identifiers"
+              # Pre-sed sentinel assert: fail loudly if the hco-bundle-registry-osver
+              # sentinel is missing from the template files, instead of letting the
+              # sed below silently no-op and ship a chart with stale identifiers.
+              if ! exec_action "Verify sentinel present" 30 'grep -qF "hco-bundle-registry-osver" templates/_helpers.tpl templates/releases.yaml'; then
+                echo "ERROR: hco-bundle-registry-osver sentinel not found in template files; refusing to hydrate"
                 FINAL_EXIT_CODE=1
                 exit 1
               fi
-              if [[ ! "$HYDRATED_CHART_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-                echo "ERROR: HYDRATED_CHART_NAME contains unexpected characters: $HYDRATED_CHART_NAME"
-                FINAL_EXIT_CODE=1
-                exit 1
-              fi
-              export HYDRATED_CHART_NAME
-              ACTION_LOG+=("OK|Validate HYDRATED_CHART_NAME|exit=0|0s")
 
               if ! exec_action "Hydrate template identifiers" 30 'sed -i "s/hco-bundle-registry-osver/${HYDRATED_CHART_NAME}/g" templates/_helpers.tpl templates/releases.yaml'; then
                 echo "ERROR: Failed to hydrate template identifiers"

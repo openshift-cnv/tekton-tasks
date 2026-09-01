@@ -948,17 +948,17 @@ spec:
                 params="--migrate-level=bundle-object-to-csv-metadata"
               fi
 
-              cat >> "$GRAPH_YAML" <<EOF
-  - schema: olm.bundle
-    image: ${HCO_BUNDLE_IMAGE}
-    # hco-bundle-registry ${version}
-  - entries:
-      - name: kubevirt-hyperconverged-operator.${entry_version}
-        skipRange: '<${entry_version#v}'
-    name: ${request_id}
-    package: kubevirt-hyperconverged
-    schema: olm.channel
-EOF
+              {
+                printf '  - schema: olm.bundle\n'
+                printf '    image: %s\n' "${HCO_BUNDLE_IMAGE}"
+                printf '    # hco-bundle-registry %s\n' "${version}"
+                printf '  - entries:\n'
+                printf '      - name: kubevirt-hyperconverged-operator.%s\n' "${entry_version}"
+                printf "        skipRange: '<%s'\n" "${entry_version#v}"
+                printf '    name: %s\n' "${request_id}"
+                printf '    package: kubevirt-hyperconverged\n'
+                printf '    schema: olm.channel\n'
+              } >> "$GRAPH_YAML"
 
               echo "│ Appended olm.bundle and olm.channel for ${request_id} to ${GRAPH_YAML}"
               opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json

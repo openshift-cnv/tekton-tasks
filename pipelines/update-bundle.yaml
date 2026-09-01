@@ -855,6 +855,8 @@ spec:
                 value: chroot
               - name: STORAGE_DRIVER
                 value: vfs
+              - name: _CONTAINERS_ROOTLESS_UID
+                value: "0"
             envFrom:
               - secretRef:
                   name: dedicated-builds-creds
@@ -981,9 +983,14 @@ spec:
               } >> "$GRAPH_YAML"
 
               echo "│ Appended olm.bundle and olm.channel for ${request_id} to ${GRAPH_YAML}"
+              echo "=== Rendering catalog ==="
               /tmp/opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
+              echo "=== Validating catalog ==="
               /tmp/opm validate catalog
+              echo "=== Generating Dockerfile ==="
               rm -f catalog.Dockerfile && /tmp/opm generate dockerfile catalog
+              echo "=== Building catalog ==="
               buildah --storage-driver=vfs build --isolation=chroot --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
+              echo "=== Pushing catalog ==="
               buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
               buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}-$(date +%s)"

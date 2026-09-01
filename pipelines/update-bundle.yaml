@@ -848,6 +848,8 @@ spec:
               FINAL_EXIT_CODE=0
           - name: build-private-build-fbc
             image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:40ffa96ff47305eb5d01211ed0537b9a3ae3ac32094c2967dd2a2068189a7096
+            securityContext:
+              runAsUser: 0
             env:
               - name: HOME
                 value: /tmp
@@ -855,8 +857,6 @@ spec:
                 value: chroot
               - name: STORAGE_DRIVER
                 value: vfs
-              - name: _CONTAINERS_ROOTLESS_UID
-                value: "0"
             envFrom:
               - secretRef:
                   name: dedicated-builds-creds

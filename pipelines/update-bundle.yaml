@@ -926,6 +926,7 @@ spec:
               echo "│ Y-stream: $y_stream"
               echo "│ Entry version: $entry_version"
 
+              cd "${HOME}"
               git clone https://github.com/openshift-cnv/cnv-fbc --branch production --depth 1
               cd "cnv-fbc/${y_stream}/"
 

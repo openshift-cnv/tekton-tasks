@@ -892,17 +892,9 @@ spec:
                 exit 1
               fi
 
-              DOCKER_CONFIG=$(cat /tmp/dedicated-builds-creds/.dockerconfigjson)
-              QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.username')
-              QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.password')
-
-              if [[ -z "${QUAY_USERNAME}" || "${QUAY_USERNAME}" == "null" ]]; then
-                echo "ERROR: Could not extract quay.io credentials from dedicated-builds-creds"
-                exit 1
-              fi
-
-              echo "${QUAY_PASSWORD}" | buildah login quay.io --username "${QUAY_USERNAME}" --password-stdin
-              echo "│ OK: Logged in to quay.io as ${QUAY_USERNAME}"
+              mkdir -p "${HOME}/.docker"
+              cp /tmp/dedicated-builds-creds/.dockerconfigjson "${HOME}/.docker/config.json"
+              echo "│ OK: Registry credentials configured"
 
               echo "=== Inspecting HCO bundle image ==="
               INSPECT_JSON=$(skopeo inspect --no-tags "docker://${HCO_BUNDLE_IMAGE}")

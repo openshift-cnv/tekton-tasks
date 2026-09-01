@@ -973,6 +973,6 @@ spec:
               /tmp/opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
               /tmp/opm validate catalog
               rm -f catalog.Dockerfile && /tmp/opm generate dockerfile catalog
-              buildah build --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
-              buildah push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
-              buildah push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}-$(date +%s)"
+              buildah --storage-driver=vfs build --isolation=chroot --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
+              buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
+              buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}-$(date +%s)"

@@ -848,8 +848,6 @@ spec:
               FINAL_EXIT_CODE=0
           - name: build-private-build-fbc
             image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:40ffa96ff47305eb5d01211ed0537b9a3ae3ac32094c2967dd2a2068189a7096
-            securityContext:
-              runAsUser: 0
             env:
               - name: HOME
                 value: /tmp
@@ -857,6 +855,8 @@ spec:
                 value: chroot
               - name: STORAGE_DRIVER
                 value: vfs
+              - name: BUILDAH_NO_PIVOT
+                value: "1"
             envFrom:
               - secretRef:
                   name: dedicated-builds-creds
@@ -990,6 +990,9 @@ spec:
               echo "=== Generating Dockerfile ==="
               rm -f catalog.Dockerfile && /tmp/opm generate dockerfile catalog
               echo "=== Building catalog ==="
+              export BUILDAH_ISOLATION=chroot
+              export BUILDAH_NO_PIVOT=1
+              export STORAGE_DRIVER=vfs
               buildah --storage-driver=vfs build --isolation=chroot --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
               echo "=== Pushing catalog ==="
               buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"

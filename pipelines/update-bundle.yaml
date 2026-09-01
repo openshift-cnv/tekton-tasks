@@ -41,6 +41,9 @@ spec:
           - name: quay-creds
             secret:
               secretName: quay-builds-creds
+          - name: dedicated-builds-creds
+            secret:
+              secretName: dedicated-builds-creds
           - name: shared-data
             emptyDir: {}
         steps:
@@ -192,6 +195,7 @@ spec:
               echo "│ Version: $VERSION"
 
               IS_DEDICATED_BUILD=false
+              IS_HCO_BUNDLE_REGISTRY=false
               TARGET_BRANCH="main"
               BUNDLE_DIR=""
 
@@ -208,8 +212,17 @@ spec:
                 echo "│ Target branch: $TARGET_BRANCH"
 
                 if jq -e '[.spec.components[].containerImage] | any(contains("hco-bundle-registry"))' <<< "$SNAPSHOT_DATA" > /dev/null 2>&1; then
+                  IS_HCO_BUNDLE_REGISTRY=true
+                  HCO_BUNDLE_IMAGE=$(jq -r '[.spec.components[].containerImage | select(contains("hco-bundle-registry"))][0]' <<< "$SNAPSHOT_DATA")
+                  REQUEST_ID=$(jq -r '.metadata.annotations["pac.test.appstudio.openshift.io/branch"]' <<< "$SNAPSHOT_DATA")
+                  echo -n "$IS_DEDICATED_BUILD" > /var/shared/is-dedicated-build
+                  echo -n "$IS_HCO_BUNDLE_REGISTRY" > /var/shared/is-hco-bundle-registry
+                  echo -n "$HCO_BUNDLE_IMAGE" > /var/shared/hco-bundle-image
+                  echo -n "$REQUEST_ID" > /var/shared/request-id
                   ACTION_LOG+=("OK|Skip - dedicated build hco-bundle-registry image|exit=0|0s")
                   echo "│ SKIP: hco-bundle-registry image in dedicated build — nothing to update to avoid infinite loop"
+                  echo "│ HCO bundle image: $HCO_BUNDLE_IMAGE"
+                  echo "│ Request ID (branch): $REQUEST_ID"
                   FINAL_EXIT_CODE=0
                   exit 0
                 fi
@@ -386,6 +399,10 @@ spec:
                 echo "│ SKIP: No changes detected in the bundle registry"
               fi
 
+              # Persist flags to shared volume for downstream steps
+              echo -n "$IS_DEDICATED_BUILD" > /var/shared/is-dedicated-build
+              echo -n "$IS_HCO_BUNDLE_REGISTRY" > /var/shared/is-hco-bundle-registry
+
               # Copy Snapshot objects to shared volume for push-release-chart step
               mkdir -p /var/shared/snapshot-objects
               cp ${BUNDLE_DIR}components/hco-bundle-registry/snapshot-objects/*.yaml /var/shared/snapshot-objects/ 2>/dev/null || true
@@ -441,7 +458,7 @@ spec:
               echo "=== update-bundle step completed ==="
               FINAL_EXIT_CODE=0
           - name: push-release-chart
-            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:9ce339c68da7eeca3eadb05fe5e32784cbbe5c3fad2d50fe91fee4029448e8eb
+            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:40ffa96ff47305eb5d01211ed0537b9a3ae3ac32094c2967dd2a2068189a7096
             env:
               - name: HOME
                 value: /tmp
@@ -824,3 +841,129 @@ spec:
               echo "=== push-release-chart step completed ==="
               echo "│ Published ${HYDRATED_CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
               FINAL_EXIT_CODE=0
+          - name: build-private-build-fbc
+            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:40ffa96ff47305eb5d01211ed0537b9a3ae3ac32094c2967dd2a2068189a7096
+            env:
+              - name: HOME
+                value: /tmp
+            envFrom:
+              - secretRef:
+                  name: dedicated-builds-creds
+            volumeMounts:
+              - name: dedicated-builds-creds
+                mountPath: /tmp/dedicated-builds-creds
+                readOnly: true
+              - name: shared-data
+                mountPath: /var/shared
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              IS_DEDICATED_BUILD=$(cat /var/shared/is-dedicated-build 2>/dev/null || echo "false")
+              IS_HCO_BUNDLE_REGISTRY=$(cat /var/shared/is-hco-bundle-registry 2>/dev/null || echo "false")
+
+              if [[ "$IS_DEDICATED_BUILD" != "true" || "$IS_HCO_BUNDLE_REGISTRY" != "true" ]]; then
+                echo "SKIP: build-private-build-fbc — requires dedicated build + hco-bundle-registry image"
+                echo "│ IS_DEDICATED_BUILD=$IS_DEDICATED_BUILD"
+                echo "│ IS_HCO_BUNDLE_REGISTRY=$IS_HCO_BUNDLE_REGISTRY"
+                exit 0
+              fi
+
+              HCO_BUNDLE_IMAGE=$(cat /var/shared/hco-bundle-image 2>/dev/null || echo "")
+              if [[ -z "$HCO_BUNDLE_IMAGE" ]]; then
+                echo "ERROR: hco-bundle-image not found on shared volume"
+                exit 1
+              fi
+
+              request_id=$(cat /var/shared/request-id 2>/dev/null || echo "")
+              if [[ -z "$request_id" ]]; then
+                echo "ERROR: request-id (branch) not found on shared volume"
+                exit 1
+              fi
+
+              echo "│ HCO bundle image: $HCO_BUNDLE_IMAGE"
+              echo "│ Request ID: $request_id"
+
+              echo "=== build-private-build-fbc: dedicated build with hco-bundle-registry detected, proceeding ==="
+
+              echo "=== Registry login ==="
+              if [[ ! -f "/tmp/dedicated-builds-creds/.dockerconfigjson" ]]; then
+                echo "ERROR: Credentials file not found at /tmp/dedicated-builds-creds/.dockerconfigjson"
+                exit 1
+              fi
+
+              DOCKER_CONFIG=$(cat /tmp/dedicated-builds-creds/.dockerconfigjson)
+              QUAY_USERNAME=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.username')
+              QUAY_PASSWORD=$(echo "${DOCKER_CONFIG}" | jq -r '[.auths | to_entries[] | select(.key | contains("quay.io"))] | first | .value.password')
+
+              if [[ -z "${QUAY_USERNAME}" || "${QUAY_USERNAME}" == "null" ]]; then
+                echo "ERROR: Could not extract quay.io credentials from dedicated-builds-creds"
+                exit 1
+              fi
+
+              echo "${QUAY_PASSWORD}" | buildah login quay.io --username "${QUAY_USERNAME}" --password-stdin
+              echo "│ OK: Logged in to quay.io as ${QUAY_USERNAME}"
+
+              echo "=== Inspecting HCO bundle image ==="
+              INSPECT_JSON=$(skopeo inspect --no-tags "docker://${HCO_BUNDLE_IMAGE}")
+              if [[ -z "$INSPECT_JSON" ]]; then
+                echo "ERROR: skopeo inspect returned empty result for $HCO_BUNDLE_IMAGE"
+                exit 1
+              fi
+
+              img_version=$(echo "$INSPECT_JSON" | jq -r '.Labels.version')
+              img_release=$(echo "$INSPECT_JSON" | jq -r '.Labels.release')
+
+              if [[ -z "$img_version" || "$img_version" == "null" || -z "$img_release" || "$img_release" == "null" ]]; then
+                echo "ERROR: Failed to extract version/release labels from image"
+                echo "│ version=$img_version release=$img_release"
+                exit 1
+              fi
+
+              version="${img_version}-${img_release}"
+              echo "│ Image version: $version"
+
+              y_stream=$(echo "$version" | cut -d'.' -f1,2)
+              if [[ "$y_stream" == "v4.99" ]]; then
+                y_stream="v4.22"
+                oc image extract --confirm "${HCO_BUNDLE_IMAGE}" --file=/manifests/kubevirt-hyperconverged-operator.clusterserviceversion.yaml
+                entry_version="v$(yq '.metadata.name | split(".v") | .[1]' kubevirt-hyperconverged-operator.clusterserviceversion.yaml)"
+              else
+                entry_version=$(echo "$version" | cut -d'.' -f1,2,3 | cut -d'-' -f1)
+              fi
+              echo "│ Y-stream: $y_stream"
+              echo "│ Entry version: $entry_version"
+
+              git clone https://github.com/openshift-cnv/cnv-fbc --branch production --depth 1
+              cd "cnv-fbc/${y_stream}/"
+
+              GRAPH_YAML="graph.yaml"
+              if [[ ! -f "$GRAPH_YAML" ]]; then
+                echo "ERROR: $GRAPH_YAML not found in $(pwd)"
+                exit 1
+              fi
+
+              params=
+              if [[ ! "$y_stream" < "v4.17" ]]; then
+                params="--migrate-level=bundle-object-to-csv-metadata"
+              fi
+
+              cat >> "$GRAPH_YAML" <<EOF
+  - schema: olm.bundle
+    image: ${HCO_BUNDLE_IMAGE}
+    # hco-bundle-registry ${version}
+  - entries:
+      - name: kubevirt-hyperconverged-operator.${entry_version}
+        skipRange: '<${entry_version#v}'
+    name: ${request_id}
+    package: kubevirt-hyperconverged
+    schema: olm.channel
+EOF
+
+              echo "│ Appended olm.bundle and olm.channel for ${request_id} to ${GRAPH_YAML}"
+              opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
+              opm validate catalog
+              rm -f catalog.Dockerfile && opm generate dockerfile catalog
+              buildah build --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
+              buildah push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
+              buildah push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}-$(date +%s)"

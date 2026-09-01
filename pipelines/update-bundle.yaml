@@ -869,6 +869,10 @@ spec:
                 exit 0
               fi
 
+              cd "${HOME}"
+              wget "https://github.com/operator-framework/operator-registry/releases/download/v1.73.0/linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')-opm" -O /tmp/opm
+              chmod +x /tmp/opm
+
               HCO_BUNDLE_IMAGE=$(cat /var/shared/hco-bundle-image 2>/dev/null || echo "")
               if [[ -z "$HCO_BUNDLE_IMAGE" ]]; then
                 echo "ERROR: hco-bundle-image not found on shared volume"
@@ -926,7 +930,6 @@ spec:
               echo "│ Y-stream: $y_stream"
               echo "│ Entry version: $entry_version"
 
-              cd "${HOME}"
               git clone https://github.com/openshift-cnv/cnv-fbc --branch production --depth 1
               cd "cnv-fbc/${y_stream}/"
 
@@ -954,9 +957,9 @@ spec:
               } >> "$GRAPH_YAML"
 
               echo "│ Appended olm.bundle and olm.channel for ${request_id} to ${GRAPH_YAML}"
-              opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
-              opm validate catalog
-              rm -f catalog.Dockerfile && opm generate dockerfile catalog
+              /tmp/opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
+              /tmp/opm validate catalog
+              rm -f catalog.Dockerfile && /tmp/opm generate dockerfile catalog
               buildah build --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
               buildah push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
               buildah push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}-$(date +%s)"

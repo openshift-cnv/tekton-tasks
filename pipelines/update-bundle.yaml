@@ -214,6 +214,12 @@ spec:
                 echo "│ Dedicated build detected"
                 echo "│ Target branch: $TARGET_BRANCH"
 
+                if jq -e '[.spec.components[].containerImage] | any(contains("catalogs"))' <<< "$SNAPSHOT_DATA" > /dev/null 2>&1; then
+                  echo "│ SKIP: catalog image in dedicated build — nothing to update."
+                  FINAL_EXIT_CODE=0
+                  exit 0
+                fi
+
                 if jq -e '[.spec.components[].containerImage] | any(contains("hco-bundle-registry"))' <<< "$SNAPSHOT_DATA" > /dev/null 2>&1; then
                   IS_HCO_BUNDLE_REGISTRY=true
                   HCO_BUNDLE_IMAGE=$(jq -r '[.spec.components[].containerImage | select(contains("hco-bundle-registry"))][0]' <<< "$SNAPSHOT_DATA")

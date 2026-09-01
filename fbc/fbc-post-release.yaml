@@ -1,0 +1,340 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: fbc-post-release
+spec:
+  description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
+  params:
+    - name: snapshot
+      type: string
+    - name: cnv_version
+      type: string
+    - name: releaseplan_id
+      type: string
+    - name: environment
+      type: string
+  tasks:
+    - name: get-info
+      params:
+        - name: SNAPSHOT
+          value: "$(params.snapshot)"
+        - name: CNV_VERSION
+          value: "$(params.cnv_version)"
+        - name: RELEASEPLAN_ID
+          value: "$(params.releaseplan_id)"
+        - name: ENVIRONMENT
+          value: "$(params.environment)"
+      taskSpec:
+        params:
+          - name: SNAPSHOT
+            type: string
+          - name: CNV_VERSION
+            type: string
+          - name: RELEASEPLAN_ID
+            type: string
+          - name: ENVIRONMENT
+            type: string
+        results:
+          - name: channel
+            description: Release channel (candidate or stable)
+          - name: environment
+            description: Release environment (stage or production)
+          - name: hco-bundle-version
+            description: Full bundle version from updated_image.yaml
+        steps:
+          - name: get-info
+            image: quay.io/konflux-ci/release-service-utils:105474114b10c0bd52eda96bc67490447131b784
+            envFrom:
+              - secretRef:
+                  name: cnv-ci-release-token
+            script: |
+              #!/usr/bin/env bash
+              set -eo pipefail
+
+              snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
+              release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
+              jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
+              '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
+
+              released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
+              if [ "$released_status" != "True" ]; then
+                echo "Release failed. Not continuing with post-release."
+                exit 1
+              fi
+
+              cnv_version="$(params.CNV_VERSION)"
+              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
+              fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
+              index_image=$(kubectl get release "${release_id}" -oyaml | yq ".status.artifacts.index_image.\"${cnv_version}\".index_image")
+              from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
+
+              git_commit=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.revision')
+              git_repo=$(echo "${snapshot_data}" | yq '.spec.components[0].source.git.url')
+              gitfbcdir=$(mktemp -d) && cd "${gitfbcdir}"
+              git init
+              git remote add origin "${git_repo}.git"
+              git fetch origin "${git_commit}" --depth 1
+              git checkout "${git_commit}"
+              image_sha=$(yq '.image' ${cnv_version}/updated_image.yaml)
+              channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
+              hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
+              hco_bundle_url=$(yq '.hco-bundle-url' ${cnv_version}/updated_image.yaml)
+
+              if [[ $hco_bundle_version == v4.99* ]]; then
+                cnv_version="v4.99"
+              fi
+
+              gitpayloaddir=$(mktemp -d) && cd "${gitpayloaddir}"
+              # github_token and github_username are injected from cnv-ci-release-token secret
+              git clone https://${github_token}@github.com/openshift-cnv/cnv-fbc-payloads-new.git && cd cnv-fbc-payloads-new
+              git config --global user.name "${github_username}"
+              git config --global user.email "no-reply@redhat.com"
+
+              case $(params.ENVIRONMENT) in
+              "production")
+                NEXT_STAGE="verify-production-release"
+                ;;
+              "stage")
+                NEXT_STAGE="stage"
+                ;;
+              *)
+                echo "Unknown environment: $(params.ENVIRONMENT)"
+                exit 1
+                ;;
+              esac
+              save_folder="${cnv_version//./-}/lanes/${channel}/${NEXT_STAGE}"
+              mkdir -p "${save_folder}"
+              echo "" > "${save_folder}/payload.yaml"
+              yq e ".index_image = \"${index_image}\"" -i ${save_folder}/payload.yaml
+              yq e ".snapshot_id = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
+              yq e ".from_index = \"${from_index}\"" -i ${save_folder}/payload.yaml
+              yq e ".fbc_fragment = \"${fbc_fragment}\"" -i ${save_folder}/payload.yaml
+              yq e ".channel = \"${channel}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_registry_by_sha = \"${image_sha}\"" -i ${save_folder}/payload.yaml
+              image_base=$(echo "${image_sha}" | cut -d'@' -f1)
+              yq e ".hco_bundle_registry_by_tag = \"${image_base}:${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_version = \"${hco_bundle_version}\"" -i ${save_folder}/payload.yaml
+              yq e ".hco_bundle_url = \"${hco_bundle_url}\"" -i ${save_folder}/payload.yaml
+              # Add the minor version number from the bundle for Kargo
+              yq e '.minorVersion = (.hco_bundle_version | split("-") | .[0])' -i ${save_folder}/payload.yaml
+              yq e '.rhelVersion = (.minorVersion | split(".") | .[3])' -i ${save_folder}/payload.yaml
+              yq e ".version = \"${cnv_version//./-}\"" -i ${save_folder}/payload.yaml
+              yq e ".releasePlan = \"${NEXT_STAGE}\"" -i ${save_folder}/payload.yaml
+              yq e ".freightName = \"${snapshot_id}\"" -i ${save_folder}/payload.yaml
+              yq e ".freightID = null" -i ${save_folder}/payload.yaml
+              yq e ".prNumber = null" -i ${save_folder}/payload.yaml
+              # add a firstRelease flag to the payload
+              patch_version=$(echo "$hco_bundle_version" | grep -oP 'v\d+\.\d+\.\K\d+')
+              if [ "$patch_version" -eq 0 ]; then
+                yq -i '.firstRelease = true' ${save_folder}/payload.yaml
+              else
+                yq -i '.firstRelease = false' ${save_folder}/payload.yaml
+              fi
+
+
+              git add .
+              git commit -m "Update payload $hco_bundle_version"
+
+              MAX_RETRIES=5
+              for attempt in $(seq 1 $MAX_RETRIES); do
+                if git push origin main; then
+                  echo "Push succeeded on attempt ${attempt}"
+                  break
+                fi
+                if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+                  echo "Push failed after ${MAX_RETRIES} attempts"
+                  exit 1
+                fi
+                echo "Push rejected (attempt ${attempt}/${MAX_RETRIES}), rebasing..."
+                git pull --rebase origin main
+              done
+
+              echo -n "${channel}" > /tekton/results/channel
+              echo -n "$(params.ENVIRONMENT)" > /tekton/results/environment
+              echo -n "${hco_bundle_version}" > /tekton/results/hco-bundle-version
+          - name: update-smartsheet
+            image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
+            env:
+              - name: SMARTSHEET_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: smartsheets
+                    key: token
+                    optional: true
+              - name: SHEET_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: smartsheets
+                    key: SheetId
+                    optional: true
+            script: |
+              #!/usr/bin/env bash
+              set -u
+
+              ENVIRONMENT=$(cat /tekton/results/environment)
+              if [[ "$ENVIRONMENT" != "production" ]]; then
+                echo "Skipping Smartsheet update: environment is '${ENVIRONMENT}', not 'production'"
+                exit 0
+              fi
+
+              CHANNEL=$(cat /tekton/results/channel)
+              HCO_BUNDLE_VERSION=$(cat /tekton/results/hco-bundle-version)
+
+              echo "=== FBC Prod Release Smartsheet Update ==="
+              echo "Environment: $ENVIRONMENT"
+              echo "Channel:     $CHANNEL"
+              echo "Bundle:      $HCO_BUNDLE_VERSION"
+              echo ""
+
+              fail_safe() {
+                echo ""
+                echo "╔═════════════════════════════════════════"
+                echo "║ WARN: Smartsheet update failed"
+                echo "║ Reason:  $1"
+                echo "║ Channel: ${CHANNEL:-unknown}"
+                echo "║ Bundle:  ${HCO_BUNDLE_VERSION:-unknown}"
+                echo "║ Payload git push was NOT affected"
+                echo "╚═════════════════════════════════════════"
+                exit 0
+              }
+
+              if [[ -z "${SMARTSHEET_TOKEN:-}" || -z "${SHEET_ID:-}" ]]; then
+                fail_safe "smartsheets secret not configured (missing token or SheetId)"
+              fi
+
+              VERSION=$(echo "$HCO_BUNDLE_VERSION" | grep -oP 'v?\d+\.\d+' | head -1)
+              if [[ -z "$VERSION" ]]; then
+                fail_safe "Could not derive version from $HCO_BUNDLE_VERSION"
+              fi
+
+              BUNDLE_ID_VALUE=$(echo "$HCO_BUNDLE_VERSION" | sed 's/-\(rhel[0-9]*\)\./.\1-/')
+              echo "Version row:  $VERSION"
+              echo "BundleID:     $BUNDLE_ID_VALUE"
+              echo ""
+
+              smartsheet_api_call() {
+                local METHOD="$1" ENDPOINT="$2" DATA="${3:-}"
+                local MAX_RETRIES=3 RETRY_DELAY=2
+
+                for ((i=1; i<=MAX_RETRIES; i++)); do
+                  local CURL_ARGS=(-s -w "\n%{http_code}" -X "$METHOD"
+                    "https://api.smartsheet.com/2.0${ENDPOINT}"
+                    -H "Authorization: Bearer ${SMARTSHEET_TOKEN}"
+                    -H "Content-Type: application/json")
+                  [[ -n "$DATA" ]] && CURL_ARGS+=(-d "$DATA")
+
+                  RESPONSE=$(curl "${CURL_ARGS[@]}" 2>/dev/null)
+                  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                  BODY=$(echo "$RESPONSE" | sed '$d')
+
+                  case "$HTTP_CODE" in
+                    200|201) echo "$BODY"; return 0 ;;
+                    429)
+                      echo "WARN: Rate limited, waiting ${RETRY_DELAY}s (attempt $i/$MAX_RETRIES)" >&2
+                      sleep "$RETRY_DELAY"; RETRY_DELAY=$((RETRY_DELAY * 2)) ;;
+                    401|403)
+                      echo "ERROR: Auth failed (HTTP $HTTP_CODE)" >&2; return 1 ;;
+                    *)
+                      echo "WARN: API error $HTTP_CODE (attempt $i/$MAX_RETRIES)" >&2
+                      sleep "$RETRY_DELAY"; RETRY_DELAY=$((RETRY_DELAY * 2)) ;;
+                  esac
+                done
+                echo "ERROR: Max retries exceeded" >&2; return 1
+              }
+
+              echo "Discovering Smartsheet columns..."
+              COLUMNS_JSON=$(smartsheet_api_call "GET" "/sheets/${SHEET_ID}/columns" "") \
+                || fail_safe "Column discovery failed"
+
+              COL_NAME=$(echo "$COLUMNS_JSON" | jq -r '.data[] | select(.title=="Name") | .id')
+              COL_BUNDLEID=$(echo "$COLUMNS_JSON" | jq -r '.data[] | select(.title=="BundleID") | .id')
+              COL_CANDIDATE_PROD=$(echo "$COLUMNS_JSON" | jq -r '.data[] | select(.title=="Candidate Prod") | .id')
+              COL_CANDIDATE_DATE=$(echo "$COLUMNS_JSON" | jq -r '.data[] | select(.title=="Candidate Prod Date") | .id')
+              COL_STABLE_PROD=$(echo "$COLUMNS_JSON" | jq -r '.data[] | select(.title=="Stable Prod") | .id')
+              COL_STABLE_DATE=$(echo "$COLUMNS_JSON" | jq -r '.data[] | select(.title=="Stable Prod Date") | .id')
+
+              if [[ -z "$COL_NAME" || "$COL_NAME" == "null" ]]; then
+                fail_safe "Primary column 'Name' not found"
+              fi
+              if [[ -z "$COL_BUNDLEID" || "$COL_BUNDLEID" == "null" ]]; then
+                fail_safe "Column 'BundleID' not found"
+              fi
+
+              case "$CHANNEL" in
+                "candidate")
+                  COL_PROD="$COL_CANDIDATE_PROD"
+                  COL_DATE="$COL_CANDIDATE_DATE"
+                  ;;
+                "stable")
+                  COL_PROD="$COL_STABLE_PROD"
+                  COL_DATE="$COL_STABLE_DATE"
+                  ;;
+                *)
+                  fail_safe "Unknown channel: $CHANNEL"
+                  ;;
+              esac
+
+              if [[ -z "$COL_PROD" || "$COL_PROD" == "null" ]]; then
+                fail_safe "Column '${CHANNEL^} Prod' not found -- add it to the Smartsheet first"
+              fi
+              if [[ -z "$COL_DATE" || "$COL_DATE" == "null" ]]; then
+                fail_safe "Column '${CHANNEL^} Prod Date' not found -- add it to the Smartsheet first"
+              fi
+              echo "Column IDs discovered"
+
+              SHEET_DATA=$(smartsheet_api_call "GET" "/sheets/${SHEET_ID}" "") \
+                || fail_safe "Failed to fetch sheet data"
+
+              VERSION_ROW_ID=$(echo "$SHEET_DATA" | jq -r --arg v "$VERSION" --argjson c "$COL_NAME" \
+                '[.rows[]? | select(.parentId == null) |
+                 select(.cells[]? | select(.columnId == $c and .value == $v))] | first | .id // empty')
+
+              if [[ -z "$VERSION_ROW_ID" || "$VERSION_ROW_ID" == "null" ]]; then
+                fail_safe "Version row '$VERSION' not found in build sheet"
+              fi
+              echo "Found L0 version row: $VERSION_ROW_ID"
+
+              APP_ROW_ID=$(echo "$SHEET_DATA" | jq -r --arg app "hco-bundle-registry" --argjson c "$COL_NAME" --argjson pid "$VERSION_ROW_ID" \
+                '[.rows[]? | select(.parentId == $pid) |
+                 select(.cells[]? | select(.columnId == $c and .value == $app))] | first | .id // empty')
+
+              if [[ -z "$APP_ROW_ID" || "$APP_ROW_ID" == "null" ]]; then
+                fail_safe "Application row 'hco-bundle-registry' not found under '$VERSION'"
+              fi
+              echo "Found L1 application row: $APP_ROW_ID"
+
+              COMPONENT_ROW_ID=$(echo "$SHEET_DATA" | jq -r \
+                --arg bid "$BUNDLE_ID_VALUE" \
+                --argjson cb "$COL_BUNDLEID" \
+                --argjson pid "$APP_ROW_ID" \
+                '[.rows[]? | select(.parentId == $pid) |
+                 select(.cells[]? | select(.columnId == $cb and .value == $bid))] | first | .id // empty')
+
+              if [[ -z "$COMPONENT_ROW_ID" || "$COMPONENT_ROW_ID" == "null" ]]; then
+                fail_safe "No build row with BundleID '$BUNDLE_ID_VALUE' found under hco-bundle-registry"
+              fi
+              echo "Found L2 component row: $COMPONENT_ROW_ID (BundleID: $BUNDLE_ID_VALUE)"
+
+              TIMESTAMP=$(date -Iseconds)
+              UPDATE_DATA=$(jq -n \
+                --argjson rid "$COMPONENT_ROW_ID" \
+                --argjson cp "$COL_PROD" \
+                --argjson cd "$COL_DATE" \
+                --arg date "$TIMESTAMP" \
+                '[{id: $rid, cells: [
+                  {columnId: $cp, value: true},
+                  {columnId: $cd, value: $date}
+                ]}]')
+
+              smartsheet_api_call "PUT" "/sheets/${SHEET_ID}/rows" "$UPDATE_DATA" >/dev/null \
+                || fail_safe "Failed to update Smartsheet row"
+
+              echo ""
+              echo "╔═════════════════════════════════════════"
+              echo "║ FBC Prod Release marked in Smartsheet"
+              echo "║ Version:  $VERSION"
+              echo "║ Bundle:   $HCO_BUNDLE_VERSION"
+              echo "║ Channel:  $CHANNEL"
+              echo "║ Column:   ${CHANNEL^} Prod = true"
+              echo "╚═════════════════════════════════════════"

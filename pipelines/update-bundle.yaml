@@ -918,8 +918,8 @@ spec:
               y_stream=$(echo "$version" | cut -d'.' -f1,2)
               if [[ "$y_stream" == "v4.99" ]]; then
                 y_stream="v4.22"
-                oc image extract --confirm "${HCO_BUNDLE_IMAGE}" --file=/manifests/kubevirt-hyperconverged-operator.clusterserviceversion.yaml
-                entry_version="v$(yq '.metadata.name | split(".v") | .[1]' kubevirt-hyperconverged-operator.clusterserviceversion.yaml)"
+                oc image extract --confirm --path=/manifests/kubevirt-hyperconverged-operator.clusterserviceversion.yaml:"${HOME}" "${HCO_BUNDLE_IMAGE}"
+                entry_version="v$(yq '.metadata.name | split(".v") | .[1]' "${HOME}/kubevirt-hyperconverged-operator.clusterserviceversion.yaml")"
               else
                 entry_version=$(echo "$version" | cut -d'.' -f1,2,3 | cut -d'-' -f1)
               fi

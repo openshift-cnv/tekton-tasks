@@ -849,6 +849,10 @@ spec:
             env:
               - name: HOME
                 value: /tmp
+              - name: BUILDAH_ISOLATION
+                value: chroot
+              - name: STORAGE_DRIVER
+                value: vfs
             envFrom:
               - secretRef:
                   name: dedicated-builds-creds

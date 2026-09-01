@@ -5,6 +5,9 @@ metadata:
   name: update-bundle
 spec:
   description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
+  workspaces:
+    - name: fbc-source
+      optional: true
   params:
     - name: snapshot
       type: string
@@ -24,6 +27,9 @@ spec:
           value: "$(params.skeleton-chart-version)"
         - name: DEBUG
           value: "$(params.debug)"
+      workspaces:
+        - name: fbc-source
+          workspace: fbc-source
       taskSpec:
         params:
           - name: SNAPSHOT
@@ -37,6 +43,15 @@ spec:
             description: Contents of the snapshots.json file
           - name: bundle-version
             description: NVR of the bundle
+          - name: is-fbc-build
+            description: Whether an FBC build should be triggered
+          - name: fbc-image
+            description: Target image for the FBC catalog
+          - name: fbc-image-timestamp
+            description: Additional timestamp tag for the FBC catalog
+        workspaces:
+          - name: fbc-source
+            optional: true
         volumes:
           - name: quay-creds
             secret:
@@ -48,8 +63,6 @@ spec:
             secret:
               secretName: registry-redhat-io-authentication
           - name: shared-data
-            emptyDir: {}
-          - name: varlibcontainers
             emptyDir: {}
         steps:
           - name: update-bundle
@@ -851,12 +864,6 @@ spec:
             env:
               - name: HOME
                 value: /tmp
-              - name: BUILDAH_ISOLATION
-                value: chroot
-              - name: STORAGE_DRIVER
-                value: vfs
-              - name: BUILDAH_NO_PIVOT
-                value: "1"
             envFrom:
               - secretRef:
                   name: dedicated-builds-creds
@@ -869,8 +876,6 @@ spec:
                 readOnly: true
               - name: shared-data
                 mountPath: /var/shared
-              - name: varlibcontainers
-                mountPath: /var/lib/containers
             script: |
               #!/usr/bin/env bash
               set -eo pipefail
@@ -882,11 +887,14 @@ spec:
                 echo "SKIP: build-private-build-fbc — requires dedicated build + hco-bundle-registry image"
                 echo "│ IS_DEDICATED_BUILD=$IS_DEDICATED_BUILD"
                 echo "│ IS_HCO_BUNDLE_REGISTRY=$IS_HCO_BUNDLE_REGISTRY"
+                echo -n "false" > /tekton/results/is-fbc-build
+                echo -n "" > /tekton/results/fbc-image
+                echo -n "" > /tekton/results/fbc-image-timestamp
                 exit 0
               fi
 
               cd "${HOME}"
-              wget "https://github.com/operator-framework/operator-registry/releases/download/v1.73.0/linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')-opm" -O /tmp/opm
+              wget -q "https://github.com/operator-framework/operator-registry/releases/download/v1.73.0/linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')-opm" -O /tmp/opm
               chmod +x /tmp/opm
 
               HCO_BUNDLE_IMAGE=$(cat /var/shared/hco-bundle-image 2>/dev/null || echo "")
@@ -922,8 +930,6 @@ spec:
                 /tmp/registry-redhat-io-creds/.dockerconfigjson \
                 > "${HOME}/.docker/config.json"
 
-              mkdir -p "${HOME}/.config/containers"
-              printf '[storage]\ndriver = "vfs"\n' > "${HOME}/.config/containers/storage.conf"
               echo "│ OK: Registry credentials configured (quay.io + registry.redhat.io)"
 
               echo "=== Inspecting HCO bundle image ==="
@@ -956,6 +962,7 @@ spec:
               echo "│ Y-stream: $y_stream"
               echo "│ Entry version: $entry_version"
 
+              cd "${HOME}"
               git clone https://github.com/openshift-cnv/cnv-fbc --branch production --depth 1
               cd "cnv-fbc/${y_stream}/"
 
@@ -989,11 +996,78 @@ spec:
               /tmp/opm validate catalog
               echo "=== Generating Dockerfile ==="
               rm -f catalog.Dockerfile && /tmp/opm generate dockerfile catalog
-              echo "=== Building catalog ==="
-              export BUILDAH_ISOLATION=chroot
-              export BUILDAH_NO_PIVOT=1
-              export STORAGE_DRIVER=vfs
-              buildah --storage-driver=vfs build --isolation=chroot --platform linux/amd64 -t "${request_id}" -f catalog.Dockerfile
-              echo "=== Pushing catalog ==="
-              buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
-              buildah --storage-driver=vfs push "${request_id}" "docker://quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}-$(date +%s)"
+
+              echo "=== Copying prepared source to workspace ==="
+              WORKSPACE="$(workspaces.fbc-source.path)"
+              if [[ "$(workspaces.fbc-source.bound)" == "true" ]]; then
+                cp -r catalog "${WORKSPACE}/"
+                cp catalog.Dockerfile "${WORKSPACE}/Dockerfile"
+                echo "│ OK: FBC source copied to workspace"
+              else
+                echo "WARN: fbc-source workspace not bound — skipping copy (build-fbc-image task will be skipped)"
+              fi
+
+              FBC_IMAGE="quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
+              FBC_TS_TAG="${request_id}-$(date +%s)"
+
+              echo -n "true" > /tekton/results/is-fbc-build
+              echo -n "${FBC_IMAGE}" > /tekton/results/fbc-image
+              echo -n "${FBC_TS_TAG}" > /tekton/results/fbc-image-timestamp
+              echo "│ FBC image: ${FBC_IMAGE}"
+              echo "│ FBC additional tag: ${FBC_TS_TAG}"
+    - name: build-fbc-image
+      runAfter:
+        - update-bundle
+      when:
+        - input: $(tasks.update-bundle.results.is-fbc-build)
+          operator: in
+          values: ["true"]
+      params:
+        - name: IMAGE
+          value: $(tasks.update-bundle.results.fbc-image)
+        - name: DOCKERFILE
+          value: Dockerfile
+        - name: CONTEXT
+          value: .
+        - name: PLATFORM
+          value: linux/amd64
+        - name: COMMIT_SHA
+          value: ""
+        - name: SKIP_SBOM_GENERATION
+          value: "true"
+      workspaces:
+        - name: source
+          workspace: fbc-source
+      taskRef:
+        resolver: bundles
+        params:
+          - name: bundle
+            value: quay.io/konflux-ci/tekton-catalog/task-buildah-remote:0.12.0@sha256:0339cb6ef0f671f82d6803c072af508a145471f95d5196e479f03babebd1fade
+          - name: name
+            value: buildah-remote
+          - name: kind
+            value: task
+    - name: apply-fbc-tags
+      runAfter:
+        - build-fbc-image
+      when:
+        - input: $(tasks.update-bundle.results.is-fbc-build)
+          operator: in
+          values: ["true"]
+      params:
+        - name: IMAGE_URL
+          value: $(tasks.build-fbc-image.results.IMAGE_URL)
+        - name: IMAGE_DIGEST
+          value: $(tasks.build-fbc-image.results.IMAGE_DIGEST)
+        - name: ADDITIONAL_TAGS
+          value:
+            - $(tasks.update-bundle.results.fbc-image-timestamp)
+      taskRef:
+        resolver: bundles
+        params:
+          - name: bundle
+            value: quay.io/konflux-ci/tekton-catalog/task-apply-tags:0.3@sha256:4a4dfe9d15f165d346eae60a67571672eeaa1d4d4789f036a732f8f28254f870
+          - name: name
+            value: apply-tags
+          - name: kind
+            value: task

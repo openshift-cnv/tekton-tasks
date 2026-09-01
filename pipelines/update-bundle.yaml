@@ -7,7 +7,6 @@ spec:
   description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
   workspaces:
     - name: fbc-source
-      optional: true
   params:
     - name: snapshot
       type: string
@@ -51,7 +50,6 @@ spec:
             description: Additional timestamp tag for the FBC catalog
         workspaces:
           - name: fbc-source
-            optional: true
         volumes:
           - name: quay-creds
             secret:
@@ -999,13 +997,9 @@ spec:
 
               echo "=== Copying prepared source to workspace ==="
               WORKSPACE="$(workspaces.fbc-source.path)"
-              if [[ "$(workspaces.fbc-source.bound)" == "true" ]]; then
-                cp -r catalog "${WORKSPACE}/"
-                cp catalog.Dockerfile "${WORKSPACE}/Dockerfile"
-                echo "│ OK: FBC source copied to workspace"
-              else
-                echo "WARN: fbc-source workspace not bound — skipping copy (build-fbc-image task will be skipped)"
-              fi
+              cp -r catalog "${WORKSPACE}/"
+              cp catalog.Dockerfile "${WORKSPACE}/Dockerfile"
+              echo "│ OK: FBC source copied to workspace"
 
               FBC_IMAGE="quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
               FBC_TS_TAG="${request_id}-$(date +%s)"

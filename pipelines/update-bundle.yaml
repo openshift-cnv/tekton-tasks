@@ -921,10 +921,7 @@ spec:
                 > "${HOME}/.docker/config.json"
 
               mkdir -p "${HOME}/.config/containers"
-              cat > "${HOME}/.config/containers/storage.conf" <<'STORAGECONF'
-[storage]
-driver = "vfs"
-STORAGECONF
+              printf '[storage]\ndriver = "vfs"\n' > "${HOME}/.config/containers/storage.conf"
               echo "│ OK: Registry credentials configured (quay.io + registry.redhat.io)"
 
               echo "=== Inspecting HCO bundle image ==="

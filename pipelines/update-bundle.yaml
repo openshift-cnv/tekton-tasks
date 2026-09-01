@@ -44,6 +44,9 @@ spec:
           - name: dedicated-builds-creds
             secret:
               secretName: dedicated-builds-creds
+          - name: registry-redhat-io-creds
+            secret:
+              secretName: registry-redhat-io-authentication
           - name: shared-data
             emptyDir: {}
         steps:
@@ -853,6 +856,9 @@ spec:
               - name: dedicated-builds-creds
                 mountPath: /tmp/dedicated-builds-creds
                 readOnly: true
+              - name: registry-redhat-io-creds
+                mountPath: /tmp/registry-redhat-io-creds
+                readOnly: true
               - name: shared-data
                 mountPath: /var/shared
             script: |
@@ -895,10 +901,17 @@ spec:
                 echo "ERROR: Credentials file not found at /tmp/dedicated-builds-creds/.dockerconfigjson"
                 exit 1
               fi
+              if [[ ! -f "/tmp/registry-redhat-io-creds/.dockerconfigjson" ]]; then
+                echo "ERROR: Credentials file not found at /tmp/registry-redhat-io-creds/.dockerconfigjson"
+                exit 1
+              fi
 
               mkdir -p "${HOME}/.docker"
-              cp /tmp/dedicated-builds-creds/.dockerconfigjson "${HOME}/.docker/config.json"
-              echo "│ OK: Registry credentials configured"
+              jq -s '.[0].auths * .[1].auths | {auths: .}' \
+                /tmp/dedicated-builds-creds/.dockerconfigjson \
+                /tmp/registry-redhat-io-creds/.dockerconfigjson \
+                > "${HOME}/.docker/config.json"
+              echo "│ OK: Registry credentials configured (quay.io + registry.redhat.io)"
 
               echo "=== Inspecting HCO bundle image ==="
               INSPECT_JSON=$(skopeo inspect --no-tags "docker://${HCO_BUNDLE_IMAGE}")

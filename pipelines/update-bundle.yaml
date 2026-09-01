@@ -5,8 +5,6 @@ metadata:
   name: update-bundle
 spec:
   description: This tasks gets all the required data of an FBC build and commits it to a payload repository to be used in a GitOps environment.
-  workspaces:
-    - name: fbc-source
   params:
     - name: snapshot
       type: string
@@ -26,9 +24,6 @@ spec:
           value: "$(params.skeleton-chart-version)"
         - name: DEBUG
           value: "$(params.debug)"
-      workspaces:
-        - name: fbc-source
-          workspace: fbc-source
       taskSpec:
         params:
           - name: SNAPSHOT
@@ -42,14 +37,6 @@ spec:
             description: Contents of the snapshots.json file
           - name: bundle-version
             description: NVR of the bundle
-          - name: is-fbc-build
-            description: Whether an FBC build should be triggered
-          - name: fbc-image
-            description: Target image for the FBC catalog
-          - name: fbc-image-timestamp
-            description: Additional timestamp tag for the FBC catalog
-        workspaces:
-          - name: fbc-source
         volumes:
           - name: quay-creds
             secret:
@@ -235,6 +222,7 @@ spec:
                   echo -n "$IS_HCO_BUNDLE_REGISTRY" > /var/shared/is-hco-bundle-registry
                   echo -n "$HCO_BUNDLE_IMAGE" > /var/shared/hco-bundle-image
                   echo -n "$REQUEST_ID" > /var/shared/request-id
+                  echo -n "$TARGET_BRANCH" > /var/shared/target-branch
                   ACTION_LOG+=("OK|Skip - dedicated build hco-bundle-registry image|exit=0|0s")
                   echo "│ SKIP: hco-bundle-registry image in dedicated build — nothing to update to avoid infinite loop"
                   echo "│ HCO bundle image: $HCO_BUNDLE_IMAGE"
@@ -474,7 +462,7 @@ spec:
               echo "=== update-bundle step completed ==="
               FINAL_EXIT_CODE=0
           - name: push-release-chart
-            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:40ffa96ff47305eb5d01211ed0537b9a3ae3ac32094c2967dd2a2068189a7096
+            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools:6069be70f6b8d68d415a9501c4fa0e0d6ae9e6ea
             env:
               - name: HOME
                 value: /tmp
@@ -858,13 +846,15 @@ spec:
               echo "│ Published ${HYDRATED_CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
               FINAL_EXIT_CODE=0
           - name: build-private-build-fbc
-            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools@sha256:40ffa96ff47305eb5d01211ed0537b9a3ae3ac32094c2967dd2a2068189a7096
+            image: quay.io/redhat-user-workloads/ocp-virt-images-tenant/pipeline-tools:6069be70f6b8d68d415a9501c4fa0e0d6ae9e6ea
             env:
               - name: HOME
                 value: /tmp
             envFrom:
               - secretRef:
                   name: dedicated-builds-creds
+              - secretRef:
+                  name: hco-updater-gitlab-token-2
             volumeMounts:
               - name: dedicated-builds-creds
                 mountPath: /tmp/dedicated-builds-creds
@@ -885,15 +875,10 @@ spec:
                 echo "SKIP: build-private-build-fbc — requires dedicated build + hco-bundle-registry image"
                 echo "│ IS_DEDICATED_BUILD=$IS_DEDICATED_BUILD"
                 echo "│ IS_HCO_BUNDLE_REGISTRY=$IS_HCO_BUNDLE_REGISTRY"
-                echo -n "false" > /tekton/results/is-fbc-build
-                echo -n "" > /tekton/results/fbc-image
-                echo -n "" > /tekton/results/fbc-image-timestamp
                 exit 0
               fi
 
               cd "${HOME}"
-              wget -q "https://github.com/operator-framework/operator-registry/releases/download/v1.73.0/linux-$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')-opm" -O /tmp/opm
-              chmod +x /tmp/opm
 
               HCO_BUNDLE_IMAGE=$(cat /var/shared/hco-bundle-image 2>/dev/null || echo "")
               if [[ -z "$HCO_BUNDLE_IMAGE" ]]; then
@@ -989,79 +974,45 @@ spec:
 
               echo "│ Appended olm.bundle and olm.channel for ${request_id} to ${GRAPH_YAML}"
               echo "=== Rendering catalog ==="
-              /tmp/opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
+              opm alpha render-template basic ${params} graph.yaml > catalog/kubevirt-hyperconverged/catalog.json
               echo "=== Validating catalog ==="
-              /tmp/opm validate catalog
+              opm validate catalog
               echo "=== Generating Dockerfile ==="
-              rm -f catalog.Dockerfile && /tmp/opm generate dockerfile catalog
+              rm -f catalog.Dockerfile && opm generate dockerfile catalog
 
-              echo "=== Copying prepared source to workspace ==="
-              WORKSPACE="$(workspaces.fbc-source.path)"
-              cp -r catalog "${WORKSPACE}/"
-              cp catalog.Dockerfile "${WORKSPACE}/Dockerfile"
-              echo "│ OK: FBC source copied to workspace"
+              echo "=== Pushing FBC to dedicated-builds repo ==="
+              if [[ -z "${GITLAB_TOKEN:-}" ]]; then
+                echo "ERROR: GITLAB_TOKEN not set"
+                exit 1
+              fi
 
-              FBC_IMAGE="quay.io/openshift-virtualization/dedicated-builds/catalogs:${request_id}"
-              FBC_TS_TAG="${request_id}-$(date +%s)"
+              TARGET_BRANCH=$(cat /var/shared/target-branch 2>/dev/null || echo "")
+              if [[ -z "$TARGET_BRANCH" ]]; then
+                echo "ERROR: target-branch not found on shared volume"
+                exit 1
+              fi
 
-              echo -n "true" > /tekton/results/is-fbc-build
-              echo -n "${FBC_IMAGE}" > /tekton/results/fbc-image
-              echo -n "${FBC_TS_TAG}" > /tekton/results/fbc-image-timestamp
-              echo "│ FBC image: ${FBC_IMAGE}"
-              echo "│ FBC additional tag: ${FBC_TS_TAG}"
-    - name: build-fbc-image
-      runAfter:
-        - update-bundle
-      when:
-        - input: $(tasks.update-bundle.results.is-fbc-build)
-          operator: in
-          values: ["true"]
-      params:
-        - name: IMAGE
-          value: $(tasks.update-bundle.results.fbc-image)
-        - name: DOCKERFILE
-          value: Dockerfile
-        - name: CONTEXT
-          value: .
-        - name: PLATFORM
-          value: linux/amd64
-        - name: COMMIT_SHA
-          value: ""
-        - name: SKIP_SBOM_GENERATION
-          value: "true"
-      workspaces:
-        - name: source
-          workspace: fbc-source
-      taskRef:
-        resolver: bundles
-        params:
-          - name: bundle
-            value: quay.io/konflux-ci/tekton-catalog/task-buildah-remote:0.12.0@sha256:0339cb6ef0f671f82d6803c072af508a145471f95d5196e479f03babebd1fade
-          - name: name
-            value: buildah-remote
-          - name: kind
-            value: task
-    - name: apply-fbc-tags
-      runAfter:
-        - build-fbc-image
-      when:
-        - input: $(tasks.update-bundle.results.is-fbc-build)
-          operator: in
-          values: ["true"]
-      params:
-        - name: IMAGE_URL
-          value: $(tasks.build-fbc-image.results.IMAGE_URL)
-        - name: IMAGE_DIGEST
-          value: $(tasks.build-fbc-image.results.IMAGE_DIGEST)
-        - name: ADDITIONAL_TAGS
-          value:
-            - $(tasks.update-bundle.results.fbc-image-timestamp)
-      taskRef:
-        resolver: bundles
-        params:
-          - name: bundle
-            value: quay.io/konflux-ci/tekton-catalog/task-apply-tags:0.3@sha256:4a4dfe9d15f165d346eae60a67571672eeaa1d4d4789f036a732f8f28254f870
-          - name: name
-            value: apply-tags
-          - name: kind
-            value: task
+              REPO_URL="https://gitlab.cee.redhat.com/openshift-virtualization/dedicated-builds/dedicated-builds.git"
+              REPO_URL_WITH_AUTH=$(echo "$REPO_URL" | sed "s|https://|https://oauth2:${GITLAB_TOKEN}@|")
+
+              cd "${HOME}"
+              git clone "$REPO_URL_WITH_AUTH" --depth 1 -b "$TARGET_BRANCH" dedicated-builds-repo
+              cd dedicated-builds-repo
+              git config user.name "submodule-sync"
+              git config user.email "no-reply@redhat.com"
+
+              FBC_DIR="fbc"
+              rm -rf "${FBC_DIR}"
+              mkdir -p "${FBC_DIR}"
+              cp -r "${HOME}/cnv-fbc/${y_stream}/catalog" "${FBC_DIR}/"
+              cp "${HOME}/cnv-fbc/${y_stream}/catalog.Dockerfile" "${FBC_DIR}/"
+
+              git add .
+              if [[ -z "$(git status --porcelain)" ]]; then
+                echo "│ No FBC changes to commit"
+              else
+                git commit -m "Add FBC catalog for ${request_id} (${version})"
+                git pull --rebase origin "$TARGET_BRANCH"
+                git push origin "$TARGET_BRANCH"
+                echo "│ OK: FBC catalog pushed to ${REPO_URL} (branch: ${TARGET_BRANCH})"
+              fi

@@ -829,3 +829,25 @@ spec:
               echo "=== push-release-chart step completed ==="
               echo "│ Published ${HYDRATED_CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
               FINAL_EXIT_CODE=0
+  finally:
+    - name: slack-webhook-notification
+      params:
+        - name: message
+          value: ":x: update-bundle PipelineRun $(context.pipelineRun.name) failed!"
+        - name: secret-name
+          value: slack-cnv-ci-release
+        - name: key-name
+          value: cnv-ci-release
+      taskRef:
+        params:
+          - name: bundle
+            value: quay.io/konflux-ci/tekton-catalog/task-slack-webhook-notification:0.1@sha256:02842e9c752056c47a409f69ed462cfd38cbd6b15facb796564a610b549222ea
+          - name: name
+            value: slack-webhook-notification
+          - name: kind
+            value: Task
+        resolver: bundles
+      when:
+        - input: $(tasks.status)
+          operator: in
+          values: ["Failed"]

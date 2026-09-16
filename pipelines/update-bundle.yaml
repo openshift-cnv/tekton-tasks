@@ -833,7 +833,7 @@ spec:
     - name: slack-webhook-notification
       params:
         - name: message
-          value: ":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2>"
+          value: ":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
         - name: secret-name
           value: slack-cnv-ci-release
         - name: key-name

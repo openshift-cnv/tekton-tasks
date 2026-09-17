@@ -164,7 +164,7 @@ spec:
                     optional: true
               - name: SHEET_ID
                 valueFrom:
-                  secretKeyRef:
+                  secrertKeyRef:
                     name: smartsheets
                     key: SheetId
                     optional: true
@@ -338,3 +338,25 @@ spec:
               echo "║ Channel:  $CHANNEL"
               echo "║ Column:   ${CHANNEL^} Prod = true"
               echo "╚═════════════════════════════════════════"
+  finally:
+    - name: slack-webhook-notification
+      params:
+        - name: message
+          value: ":x: fbc-post-release PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
+        - name: secret-name
+          value: slack-cnv-ci-release
+        - name: key-name
+          value: cnv-ci-release
+      taskRef:
+        params:
+          - name: bundle
+            value: quay.io/konflux-ci/tekton-catalog/task-slack-webhook-notification:0.1@sha256:02842e9c752056c47a409f69ed462cfd38cbd6b15facb796564a610b549222ea
+          - name: name
+            value: slack-webhook-notification
+          - name: kind
+            value: Task
+        resolver: bundles
+      when:
+        - input: $(tasks.status)
+          operator: in
+          values: ["Failed"]

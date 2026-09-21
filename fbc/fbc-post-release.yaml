@@ -164,7 +164,7 @@ spec:
                     optional: true
               - name: SHEET_ID
                 valueFrom:
-                  secrertKeyRef:
+                  secretKeyRef:
                     name: smartsheets
                     key: SheetId
                     optional: true

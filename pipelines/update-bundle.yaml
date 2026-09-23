@@ -831,41 +831,24 @@ spec:
               FINAL_EXIT_CODE=0
   finally:
     - name: slack-webhook-notification
+      timeout: "1m"
+      params:
+        - name: message
+          value: ":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
+        - name: secret-name
+          value: slack-cnv-ci-release
+        - name: key-name
+          value: cnv-ci-release
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: https://github.com/openshift-cnv/tekton-tasks.git
+          - name: revision
+            value: 11104c4f944061cdca738e6f4380e642515b669d
+          - name: pathInRepo
+            value: tasks/slack-webhook-notification.yaml
       when:
         - input: $(tasks.status)
           operator: in
           values: ["Failed"]
-      taskSpec:
-        steps:
-          - name: send-notification
-            image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
-            env:
-              - name: WEBHOOK_URL
-                valueFrom:
-                  secretKeyRef:
-                    name: slack-cnv-ci-release
-                    key: cnv-ci-release
-                    optional: true
-            script: |
-              #!/usr/bin/env bash
-              set -uo pipefail
-
-              MESSAGE=":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
-
-              if [[ -z "${WEBHOOK_URL:-}" ]]; then
-                echo "WARN: slack-cnv-ci-release secret not found — skipping notification"
-                exit 0
-              fi
-
-              PAYLOAD=$(jq -n --arg msg "$MESSAGE" '{text: $msg}')
-              HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X POST \
-                -H "Content-Type: application/json" \
-                -d "$PAYLOAD" "$WEBHOOK_URL" 2>&1) || true
-
-              if [[ "$HTTP_CODE" == "200" ]]; then
-                echo "Slack notification sent successfully"
-              else
-                echo "WARN: Slack webhook returned HTTP $HTTP_CODE — notification may not have been delivered"
-              fi
-
-              exit 0

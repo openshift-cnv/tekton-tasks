@@ -850,7 +850,19 @@ spec:
               #!/usr/bin/env bash
               set -uo pipefail
 
-              MESSAGE=":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
+              PIPELINE="update-bundle"
+              PIPELINERUN="$(context.pipelineRun.name)"
+              NAMESPACE="$(context.pipelineRun.namespace)"
+              CONSOLE_URL="https://konflux.apps.kflux-osd-rh01.pg1f.p1.openshiftapps.com/workspaces/ocp-virt/applications/pipelineruns/${PIPELINERUN}"
+
+              MESSAGE=$(cat <<EOF
+              :x: *${PIPELINE}* failed!
+              *PipelineRun:* ${PIPELINERUN}
+              *Namespace:* ${NAMESPACE}
+              *Console:* ${CONSOLE_URL}
+              cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>
+              EOF
+              )
 
               if [[ -z "${WEBHOOK_URL:-}" ]]; then
                 echo "WARN: slack-cnv-ci-release secret not found — skipping notification"

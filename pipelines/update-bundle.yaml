@@ -831,23 +831,51 @@ spec:
               FINAL_EXIT_CODE=0
   finally:
     - name: slack-webhook-notification
-      params:
-        - name: message
-          value: ":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
-        - name: secret-name
-          value: slack-cnv-ci-release
-        - name: key-name
-          value: cnv-ci-release
-      taskRef:
-        params:
-          - name: bundle
-            value: quay.io/konflux-ci/tekton-catalog/task-slack-webhook-notification:0.1@sha256:02842e9c752056c47a409f69ed462cfd38cbd6b15facb796564a610b549222ea
-          - name: name
-            value: slack-webhook-notification
-          - name: kind
-            value: Task
-        resolver: bundles
+      timeout: "1m"
       when:
         - input: $(tasks.status)
           operator: in
           values: ["Failed"]
+      taskSpec:
+        steps:
+          - name: send-notification
+            image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
+            env:
+              - name: WEBHOOK_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: slack-cnv-ci-release
+                    key: cnv-ci-release
+                    optional: true
+            script: |
+              #!/usr/bin/env bash
+              set -uo pipefail
+
+              MESSAGE=":x: update-bundle PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
+
+              if [[ -z "${WEBHOOK_URL:-}" ]]; then
+                echo "WARN: slack-cnv-ci-release secret not found — skipping notification"
+                exit 0
+              fi
+
+              PAYLOAD=$(jq -n --arg msg "$MESSAGE" '{text: $msg}')
+
+              MAX_RETRIES=3
+              for attempt in $(seq 1 $MAX_RETRIES); do
+                HTTP_CODE=$(curl -sf --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" "$WEBHOOK_URL") || HTTP_CODE="000"
+
+                if [[ "$HTTP_CODE" == "200" ]]; then
+                  echo "Slack notification sent successfully"
+                  exit 0
+                fi
+
+                echo "WARN: Slack webhook returned HTTP $HTTP_CODE (attempt ${attempt}/${MAX_RETRIES})"
+                if [[ "$attempt" -lt "$MAX_RETRIES" ]]; then
+                  sleep 2
+                fi
+              done
+
+              echo "ERROR: Slack notification failed after ${MAX_RETRIES} attempts"
+              exit 1

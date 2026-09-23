@@ -831,6 +831,7 @@ spec:
               FINAL_EXIT_CODE=0
   finally:
     - name: slack-webhook-notification
+      timeout: "1m"
       when:
         - input: $(tasks.status)
           operator: in
@@ -858,14 +859,23 @@ spec:
               fi
 
               PAYLOAD=$(jq -n --arg msg "$MESSAGE" '{text: $msg}')
-              HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X POST \
-                -H "Content-Type: application/json" \
-                -d "$PAYLOAD" "$WEBHOOK_URL" 2>&1) || true
 
-              if [[ "$HTTP_CODE" == "200" ]]; then
-                echo "Slack notification sent successfully"
-              else
-                echo "WARN: Slack webhook returned HTTP $HTTP_CODE — notification may not have been delivered"
-              fi
+              MAX_RETRIES=3
+              for attempt in $(seq 1 $MAX_RETRIES); do
+                HTTP_CODE=$(curl -sf --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" "$WEBHOOK_URL") || HTTP_CODE="000"
 
-              exit 0
+                if [[ "$HTTP_CODE" == "200" ]]; then
+                  echo "Slack notification sent successfully"
+                  exit 0
+                fi
+
+                echo "WARN: Slack webhook returned HTTP $HTTP_CODE (attempt ${attempt}/${MAX_RETRIES})"
+                if [[ "$attempt" -lt "$MAX_RETRIES" ]]; then
+                  sleep 2
+                fi
+              done
+
+              echo "ERROR: Slack notification failed after ${MAX_RETRIES} attempts"
+              exit 1

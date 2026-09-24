@@ -356,22 +356,45 @@ spec:
                     name: slack-cnv-ci-release
                     key: cnv-ci-release
                     optional: true
+              - name: PIPELINE_NAME
+                value: "fbc-post-release"
+              - name: PIPELINERUN_NAME
+                value: "$(context.pipelineRun.name)"
+              - name: PIPELINERUN_NS
+                value: "$(context.pipelineRun.namespace)"
+              - name: CNV_VERSION
+                value: "$(params.cnv_version)"
+              - name: ENVIRONMENT
+                value: "$(params.environment)"
+              - name: SNAPSHOT
+                value: "$(params.snapshot)"
             script: |
               #!/usr/bin/env bash
               set -uo pipefail
-
-              MESSAGE=":x: fbc-post-release PipelineRun $(context.pipelineRun.name) failed! cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>"
 
               if [[ -z "${WEBHOOK_URL:-}" ]]; then
                 echo "WARN: slack-cnv-ci-release secret not found — skipping notification"
                 exit 0
               fi
 
-              PAYLOAD=$(jq -n --arg msg "$MESSAGE" '{text: $msg}')
+              PAYLOAD=$(jq -n \
+                --arg pipeline "$PIPELINE_NAME" \
+                --arg run "$PIPELINERUN_NAME" \
+                --arg ns "$PIPELINERUN_NS" \
+                --arg version "$CNV_VERSION" \
+                --arg env "$ENVIRONMENT" \
+                --arg snap "$SNAPSHOT" \
+                '{text: (":x: *" + $pipeline + "* failed!\n"
+                  + "*PipelineRun:* " + $run + "\n"
+                  + "*Namespace:* " + $ns + "\n"
+                  + "*CNV Version:* " + $version + "\n"
+                  + "*Environment:* " + $env + "\n"
+                  + "*Snapshot:* " + $snap + "\n"
+                  + "cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>")}')
 
               MAX_RETRIES=3
               for attempt in $(seq 1 $MAX_RETRIES); do
-                HTTP_CODE=$(curl -sf --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+                HTTP_CODE=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
                   -H "Content-Type: application/json" \
                   -d "$PAYLOAD" "$WEBHOOK_URL") || HTTP_CODE="000"
 
@@ -386,5 +409,5 @@ spec:
                 fi
               done
 
-              echo "ERROR: Slack notification failed after ${MAX_RETRIES} attempts"
-              exit 1
+              echo "WARN: Slack notification failed after ${MAX_RETRIES} attempts"
+              exit 0

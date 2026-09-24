@@ -866,7 +866,7 @@ spec:
 
               APPLICATION="unknown"
               COMPONENT="unknown"
-              PR_JSON=$(kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" -o json 2>/dev/null) || true
+              PR_JSON=$(timeout 5 kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=5s -o json 2>/dev/null) || true
               if [[ -n "$PR_JSON" ]]; then
                 APPLICATION=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/application"] // "unknown"')
                 COMPONENT=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/component"] // "unknown"')

@@ -877,7 +877,7 @@ spec:
 
               MAX_RETRIES=3
               for attempt in $(seq 1 $MAX_RETRIES); do
-                HTTP_CODE=$(curl -sf --max-time 30 -o /dev/null -w "%{http_code}" -X POST \
+                HTTP_CODE=$(curl -sf --max-time 10 -o /dev/null -w "%{http_code}" -X POST \
                   -H "Content-Type: application/json" \
                   -d "$PAYLOAD" "$WEBHOOK_URL") || HTTP_CODE="000"
 

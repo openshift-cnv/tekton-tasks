@@ -864,12 +864,24 @@ spec:
                 exit 0
               fi
 
+              APPLICATION="unknown"
+              COMPONENT="unknown"
+              PR_JSON=$(timeout 5 kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=5s -o json 2>/dev/null) || true
+              if [[ -n "$PR_JSON" ]]; then
+                APPLICATION=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/application"] // "unknown"')
+                COMPONENT=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/component"] // "unknown"')
+              fi
+
               PAYLOAD=$(jq -n \
                 --arg pipeline "$PIPELINE_NAME" \
                 --arg run "$PIPELINERUN_NAME" \
                 --arg ns "$PIPELINERUN_NS" \
                 --arg snap "$SNAPSHOT" \
+                --arg app "$APPLICATION" \
+                --arg comp "$COMPONENT" \
                 '{text: (":x: *" + $pipeline + "* failed!\n"
+                  + "*Application:* " + $app + "\n"
+                  + "*Component:* " + $comp + "\n"
                   + "*PipelineRun:* " + $run + "\n"
                   + "*Namespace:* " + $ns + "\n"
                   + "*Snapshot:* " + $snap + "\n"

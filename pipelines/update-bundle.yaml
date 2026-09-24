@@ -875,13 +875,9 @@ spec:
                   + "*Snapshot:* " + $snap + "\n"
                   + "cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>")}')
 
-              HTTP_CODE=$(curl -sf --max-time 30 -o /dev/null -w "%{http_code}" -X POST \
-                -H "Content-Type: application/json" \
-                -d "$PAYLOAD" "$WEBHOOK_URL" 2>&1) || true
-
               MAX_RETRIES=3
               for attempt in $(seq 1 $MAX_RETRIES); do
-                HTTP_CODE=$(curl -sf --max-time 15 -o /dev/null -w "%{http_code}" -X POST \
+                HTTP_CODE=$(curl -sf --max-time 30 -o /dev/null -w "%{http_code}" -X POST \
                   -H "Content-Type: application/json" \
                   -d "$PAYLOAD" "$WEBHOOK_URL") || HTTP_CODE="000"
 
@@ -896,5 +892,5 @@ spec:
                 fi
               done
 
-              echo "ERROR: Slack notification failed after ${MAX_RETRIES} attempts"
-              exit 1
+              echo "WARN: Slack notification failed after ${MAX_RETRIES} attempts"
+              exit 0

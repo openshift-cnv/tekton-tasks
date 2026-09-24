@@ -382,18 +382,30 @@ spec:
               APPLICATION="unknown"
               COMPONENT="unknown"
               RELEASE_NAME="unknown"
+
+              SNAPSHOT_NS=$(echo "$SNAPSHOT" | awk -F'/' '{print $1}')
               SNAPSHOT_ID=$(echo "$SNAPSHOT" | awk -F'/' '{print $2}')
+              if [[ -z "$SNAPSHOT_ID" || "$SNAPSHOT_NS" == "$SNAPSHOT_ID" ]]; then
+                SNAPSHOT_ID="$SNAPSHOT_NS"
+                SNAPSHOT_NS="$PIPELINERUN_NS"
+              fi
+
               if [[ -n "$SNAPSHOT_ID" ]]; then
-                SNAP_JSON=$(timeout 5 kubectl get snapshot "$SNAPSHOT_ID" --request-timeout=5s -o json 2>/dev/null) || true
-                if [[ -n "${SNAP_JSON:-}" ]]; then
+                if ! SNAP_JSON=$(kubectl get snapshot "$SNAPSHOT_ID" -n "$SNAPSHOT_NS" --request-timeout=30s -o json 2>/tmp/snapshot-err); then
+                  echo "WARN: snapshot lookup failed for $SNAPSHOT_NS/$SNAPSHOT_ID: $(cat /tmp/snapshot-err)"
+                else
                   APPLICATION=$(echo "$SNAP_JSON" | jq -r '.spec.application // "unknown"')
                   COMPONENT=$(echo "$SNAP_JSON" | jq -r '.spec.components[0].name // "unknown"')
                 fi
-                RELEASE_NAME=$(timeout 5 kubectl get release --request-timeout=5s -o json 2>/dev/null \
-                  | jq -r --arg snap "$SNAPSHOT_ID" --arg rp "$RELEASEPLAN_ID" \
-                  '.items[] | select(.spec.snapshot == $snap and .spec.releasePlan == $rp) | .metadata.name' \
-                  | tail -n 1) || RELEASE_NAME="unknown"
-                [[ -z "$RELEASE_NAME" ]] && RELEASE_NAME="unknown"
+
+                if ! RELEASE_JSON=$(kubectl get release -n "$SNAPSHOT_NS" --request-timeout=30s -o json 2>/tmp/release-err); then
+                  echo "WARN: release lookup failed in $SNAPSHOT_NS: $(cat /tmp/release-err)"
+                else
+                  RELEASE_NAME=$(echo "$RELEASE_JSON" \
+                    | jq -r --arg snap "$SNAPSHOT_ID" --arg rp "$RELEASEPLAN_ID" \
+                    '[.items[] | select(.spec.snapshot == $snap and .spec.releasePlan == $rp)] | sort_by(.metadata.creationTimestamp) | last | .metadata.name // "unknown"')
+                  [[ -z "$RELEASE_NAME" || "$RELEASE_NAME" == "null" ]] && RELEASE_NAME="unknown"
+                fi
               fi
 
               PAYLOAD=$(jq -n \

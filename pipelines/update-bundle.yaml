@@ -866,10 +866,18 @@ spec:
 
               APPLICATION="unknown"
               COMPONENT="unknown"
+
+              SNAPSHOT_NS=$(echo "$SNAPSHOT" | awk -F'/' '{print $1}')
               SNAPSHOT_ID=$(echo "$SNAPSHOT" | awk -F'/' '{print $2}')
+              if [[ -z "$SNAPSHOT_ID" || "$SNAPSHOT_NS" == "$SNAPSHOT_ID" ]]; then
+                SNAPSHOT_ID="$SNAPSHOT_NS"
+                SNAPSHOT_NS="$PIPELINERUN_NS"
+              fi
+
               if [[ -n "$SNAPSHOT_ID" ]]; then
-                SNAP_JSON=$(timeout 5 kubectl get snapshot "$SNAPSHOT_ID" --request-timeout=5s -o json 2>/dev/null) || true
-                if [[ -n "${SNAP_JSON:-}" ]]; then
+                if ! SNAP_JSON=$(kubectl get snapshot "$SNAPSHOT_ID" -n "$SNAPSHOT_NS" --request-timeout=30s -o json 2>/tmp/snapshot-err); then
+                  echo "WARN: snapshot lookup failed for $SNAPSHOT_NS/$SNAPSHOT_ID: $(cat /tmp/snapshot-err)"
+                else
                   APPLICATION=$(echo "$SNAP_JSON" | jq -r '.spec.application // "unknown"')
                   COMPONENT=$(echo "$SNAP_JSON" | jq -r '.spec.components[0].name // "unknown"')
                 fi

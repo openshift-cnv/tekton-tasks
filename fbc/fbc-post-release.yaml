@@ -392,7 +392,7 @@ spec:
                   + "*Snapshot:* " + $snap + "\n"
                   + "cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>")}')
 
-              HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X POST \
+              HTTP_CODE=$(curl -sf --max-time 30 -o /dev/null -w "%{http_code}" -X POST \
                 -H "Content-Type: application/json" \
                 -d "$PAYLOAD" "$WEBHOOK_URL" 2>&1) || true
 

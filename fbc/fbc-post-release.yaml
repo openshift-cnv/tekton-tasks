@@ -426,8 +426,7 @@ spec:
                   + "*Namespace:* " + $ns + "\n"
                   + "*CNV Version:* " + $version + "\n"
                   + "*Environment:* " + $env + "\n"
-                  + "*Snapshot:* " + $snap + "\n"
-                  + "cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>")}')
+                  + "*Snapshot:* " + $snap)}')
 
               MAX_RETRIES=3
               for attempt in $(seq 1 $MAX_RETRIES); do

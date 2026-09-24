@@ -379,10 +379,13 @@ spec:
 
               APPLICATION="unknown"
               COMPONENT="unknown"
-              PR_JSON=$(timeout 5 kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=5s -o json 2>/dev/null) || true
-              if [[ -n "$PR_JSON" ]]; then
-                APPLICATION=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/application"] // "unknown"')
-                COMPONENT=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/component"] // "unknown"')
+              SNAPSHOT_ID=$(echo "$SNAPSHOT" | awk -F'/' '{print $2}')
+              if [[ -n "$SNAPSHOT_ID" ]]; then
+                SNAP_JSON=$(timeout 5 kubectl get snapshot "$SNAPSHOT_ID" --request-timeout=5s -o json 2>/dev/null) || true
+                if [[ -n "${SNAP_JSON:-}" ]]; then
+                  APPLICATION=$(echo "$SNAP_JSON" | jq -r '.spec.application // "unknown"')
+                  COMPONENT=$(echo "$SNAP_JSON" | jq -r '.spec.components[0].name // "unknown"')
+                fi
               fi
 
               PAYLOAD=$(jq -n \

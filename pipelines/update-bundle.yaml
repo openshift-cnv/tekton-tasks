@@ -865,7 +865,7 @@ spec:
               fi
 
               APPLICATION="unknown"
-              COMPONENT="unknown"
+              RELEASE_NAME="unknown"
 
               SNAPSHOT_NS=$(echo "$SNAPSHOT" | awk -F'/' '{print $1}')
               SNAPSHOT_ID=$(echo "$SNAPSHOT" | awk -F'/' '{print $2}')
@@ -879,8 +879,23 @@ spec:
                   echo "WARN: snapshot lookup failed for $SNAPSHOT_NS/$SNAPSHOT_ID: $(cat /tmp/snapshot-err)"
                 else
                   APPLICATION=$(echo "$SNAP_JSON" | jq -r '.spec.application // "unknown"')
-                  COMPONENT=$(echo "$SNAP_JSON" | jq -r '.spec.components[0].name // "unknown"')
                 fi
+              fi
+
+              if PR_JSON=$(kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=30s -o json 2>/tmp/pipelinerun-err); then
+                RELEASE_NAME=$(echo "$PR_JSON" | jq -r '.metadata.labels["release.appstudio.openshift.io/name"] // "unknown"')
+              else
+                echo "WARN: pipelinerun label lookup failed for $PIPELINERUN_NS/$PIPELINERUN_NAME: $(cat /tmp/pipelinerun-err)"
+              fi
+
+              KONFLUX_UI_BASE="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+              if [[ "$APPLICATION" != "unknown" ]]; then
+                KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/applications/${APPLICATION}/pipelineruns/${PIPELINERUN_NAME}"
+                if [[ "$RELEASE_NAME" != "unknown" ]]; then
+                  KONFLUX_URL="${KONFLUX_URL}?releaseName=${RELEASE_NAME}"
+                fi
+              else
+                KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/pipelineruns"
               fi
 
               PAYLOAD=$(jq -n \
@@ -889,13 +904,16 @@ spec:
                 --arg ns "$PIPELINERUN_NS" \
                 --arg snap "$SNAPSHOT" \
                 --arg app "$APPLICATION" \
-                --arg comp "$COMPONENT" \
+                --arg release "$RELEASE_NAME" \
+                --arg url "$KONFLUX_URL" \
                 '{text: (":x: *" + $pipeline + "* failed!\n"
                   + "*Application:* " + $app + "\n"
-                  + "*Component:* " + $comp + "\n"
+                  + "*Release:* " + $release + "\n"
                   + "*PipelineRun:* " + $run + "\n"
                   + "*Namespace:* " + $ns + "\n"
-                  + "*Snapshot:* " + $snap)}')
+                  + "*Snapshot:* " + $snap + "\n"
+                  + "*Konflux UI:* <" + $url + "|View pipeline run>\n"
+                  + "cc <@U07H968M7E2> <@U05105F0P3J> <@U0B2VSFH9GW> <@U0B2T349UN4>")}')
 
               MAX_RETRIES=3
               for attempt in $(seq 1 $MAX_RETRIES); do

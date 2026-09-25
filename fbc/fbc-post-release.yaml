@@ -42,6 +42,12 @@ spec:
             description: Release environment (stage or production)
           - name: hco-bundle-version
             description: Full bundle version from updated_image.yaml
+          - name: application
+            description: Snapshot application name
+          - name: component
+            description: Snapshot component name
+          - name: release-name
+            description: Release CR name
         steps:
           - name: get-info
             image: quay.io/konflux-ci/release-service-utils:105474114b10c0bd52eda96bc67490447131b784
@@ -51,6 +57,10 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -eo pipefail
+
+              printf 'unknown' > /tekton/results/application
+              printf 'unknown' > /tekton/results/component
+              printf 'unknown' > /tekton/results/release-name
 
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
               release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
@@ -66,6 +76,10 @@ spec:
               cnv_version="$(params.CNV_VERSION)"
               snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
               fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
+
+              echo "${snapshot_data}" | yq '.spec.application' | tr -d '\n' > /tekton/results/application
+              echo "${snapshot_data}" | yq '.spec.components[0].name' | tr -d '\n' > /tekton/results/component
+              printf '%s' "${release_id}" > /tekton/results/release-name
               index_image=$(kubectl get release "${release_id}" -oyaml | yq ".status.artifacts.index_image.\"${cnv_version}\".index_image")
               from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
 
@@ -345,7 +359,21 @@ spec:
         - input: $(tasks.status)
           operator: in
           values: ["Failed"]
+      params:
+        - name: APPLICATION
+          value: "$(tasks.get-info.results.application)"
+        - name: COMPONENT
+          value: "$(tasks.get-info.results.component)"
+        - name: RELEASE_NAME
+          value: "$(tasks.get-info.results.release-name)"
       taskSpec:
+        params:
+          - name: APPLICATION
+            type: string
+          - name: COMPONENT
+            type: string
+          - name: RELEASE_NAME
+            type: string
         steps:
           - name: send-notification
             image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
@@ -368,8 +396,12 @@ spec:
                 value: "$(params.environment)"
               - name: SNAPSHOT
                 value: "$(params.snapshot)"
-              - name: RELEASEPLAN_ID
-                value: "$(params.releaseplan_id)"
+              - name: APPLICATION
+                value: "$(params.APPLICATION)"
+              - name: COMPONENT
+                value: "$(params.COMPONENT)"
+              - name: RELEASE_NAME
+                value: "$(params.RELEASE_NAME)"
             script: |
               #!/usr/bin/env bash
               set -uo pipefail
@@ -377,45 +409,6 @@ spec:
               if [[ -z "${WEBHOOK_URL:-}" ]]; then
                 echo "WARN: slack-cnv-ci-release secret not found — skipping notification"
                 exit 0
-              fi
-
-              APPLICATION="unknown"
-              COMPONENT="unknown"
-              RELEASE_NAME="unknown"
-
-              SNAPSHOT_NS=$(echo "$SNAPSHOT" | awk -F'/' '{print $1}')
-              SNAPSHOT_ID=$(echo "$SNAPSHOT" | awk -F'/' '{print $2}')
-              if [[ -z "$SNAPSHOT_ID" || "$SNAPSHOT_NS" == "$SNAPSHOT_ID" ]]; then
-                SNAPSHOT_ID="$SNAPSHOT_NS"
-                SNAPSHOT_NS="$PIPELINERUN_NS"
-              fi
-
-              if [[ -n "$SNAPSHOT_ID" ]]; then
-                if ! SNAP_JSON=$(kubectl get snapshot "$SNAPSHOT_ID" -n "$SNAPSHOT_NS" --request-timeout=30s -o json 2>/tmp/snapshot-err); then
-                  echo "WARN: snapshot lookup failed for $SNAPSHOT_NS/$SNAPSHOT_ID: $(cat /tmp/snapshot-err)"
-                else
-                  APPLICATION=$(echo "$SNAP_JSON" | jq -r '.spec.application // "unknown"')
-                  COMPONENT=$(echo "$SNAP_JSON" | jq -r '.spec.components[0].name // "unknown"')
-                fi
-
-                if ! RELEASE_JSON=$(kubectl get release -n "$SNAPSHOT_NS" --request-timeout=30s -o json 2>/tmp/release-err); then
-                  echo "WARN: release lookup failed in $SNAPSHOT_NS: $(cat /tmp/release-err)"
-                else
-                  RELEASE_NAME=$(echo "$RELEASE_JSON" \
-                    | jq -r --arg snap "$SNAPSHOT_ID" --arg rp "$RELEASEPLAN_ID" \
-                    '[.items[] | select(.spec.snapshot == $snap and .spec.releasePlan == $rp)] | sort_by(.metadata.creationTimestamp) | last | .metadata.name // "unknown"')
-                  [[ -z "$RELEASE_NAME" || "$RELEASE_NAME" == "null" ]] && RELEASE_NAME="unknown"
-                fi
-              fi
-
-              if [[ "$APPLICATION" == "unknown" || "$COMPONENT" == "unknown" || "$RELEASE_NAME" == "unknown" ]]; then
-                if PR_JSON=$(kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=30s -o json 2>/tmp/pipelinerun-err); then
-                  [[ "$APPLICATION" == "unknown" ]] && APPLICATION=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/application"] // "unknown"')
-                  [[ "$COMPONENT" == "unknown" ]] && COMPONENT=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/component"] // "unknown"')
-                  [[ "$RELEASE_NAME" == "unknown" ]] && RELEASE_NAME=$(echo "$PR_JSON" | jq -r '.metadata.labels["release.appstudio.openshift.io/name"] // "unknown"')
-                else
-                  echo "WARN: pipelinerun label fallback lookup failed for $PIPELINERUN_NS/$PIPELINERUN_NAME: $(cat /tmp/pipelinerun-err)"
-                fi
               fi
 
               PAYLOAD=$(jq -n \

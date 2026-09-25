@@ -411,6 +411,16 @@ spec:
                 exit 0
               fi
 
+              KONFLUX_UI_BASE="https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
+              if [[ "$APPLICATION" != "unknown" ]]; then
+                KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/applications/${APPLICATION}/pipelineruns/${PIPELINERUN_NAME}"
+                if [[ "$RELEASE_NAME" != "unknown" ]]; then
+                  KONFLUX_URL="${KONFLUX_URL}?releaseName=${RELEASE_NAME}"
+                fi
+              else
+                KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/pipelineruns"
+              fi
+
               PAYLOAD=$(jq -n \
                 --arg pipeline "$PIPELINE_NAME" \
                 --arg run "$PIPELINERUN_NAME" \
@@ -421,6 +431,7 @@ spec:
                 --arg app "$APPLICATION" \
                 --arg comp "$COMPONENT" \
                 --arg rel "$RELEASE_NAME" \
+                --arg url "$KONFLUX_URL" \
                 '{text: (":x: *" + $pipeline + "* failed!\n"
                   + "*Application:* " + $app + "\n"
                   + "*Component:* " + $comp + "\n"
@@ -429,7 +440,8 @@ spec:
                   + "*Namespace:* " + $ns + "\n"
                   + "*CNV Version:* " + $version + "\n"
                   + "*Environment:* " + $env + "\n"
-                  + "*Snapshot:* " + $snap)}')
+                  + "*Snapshot:* " + $snap + "\n"
+                  + "*Konflux UI:* <" + $url + "|View pipeline run>")}')
 
               MAX_RETRIES=3
               for attempt in $(seq 1 $MAX_RETRIES); do

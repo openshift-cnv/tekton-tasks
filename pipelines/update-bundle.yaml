@@ -865,7 +865,6 @@ spec:
               fi
 
               APPLICATION="unknown"
-              COMPONENT="unknown"
               RELEASE_NAME="unknown"
 
               SNAPSHOT_NS=$(echo "$SNAPSHOT" | awk -F'/' '{print $1}')
@@ -880,7 +879,6 @@ spec:
                   echo "WARN: snapshot lookup failed for $SNAPSHOT_NS/$SNAPSHOT_ID: $(cat /tmp/snapshot-err)"
                 else
                   APPLICATION=$(echo "$SNAP_JSON" | jq -r '.spec.application // "unknown"')
-                  COMPONENT=$(echo "$SNAP_JSON" | jq -r '.spec.components[0].name // "unknown"')
                 fi
               fi
 
@@ -906,12 +904,10 @@ spec:
                 --arg ns "$PIPELINERUN_NS" \
                 --arg snap "$SNAPSHOT" \
                 --arg app "$APPLICATION" \
-                --arg comp "$COMPONENT" \
                 --arg release "$RELEASE_NAME" \
                 --arg url "$KONFLUX_URL" \
                 '{text: (":x: *" + $pipeline + "* failed!\n"
                   + "*Application:* " + $app + "\n"
-                  + "*Component:* " + $comp + "\n"
                   + "*Release:* " + $release + "\n"
                   + "*PipelineRun:* " + $run + "\n"
                   + "*Namespace:* " + $ns + "\n"

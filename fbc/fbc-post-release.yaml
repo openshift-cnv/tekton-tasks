@@ -408,6 +408,16 @@ spec:
                 fi
               fi
 
+              if [[ "$APPLICATION" == "unknown" || "$COMPONENT" == "unknown" || "$RELEASE_NAME" == "unknown" ]]; then
+                if PR_JSON=$(kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=30s -o json 2>/tmp/pipelinerun-err); then
+                  [[ "$APPLICATION" == "unknown" ]] && APPLICATION=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/application"] // "unknown"')
+                  [[ "$COMPONENT" == "unknown" ]] && COMPONENT=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/component"] // "unknown"')
+                  [[ "$RELEASE_NAME" == "unknown" ]] && RELEASE_NAME=$(echo "$PR_JSON" | jq -r '.metadata.labels["release.appstudio.openshift.io/name"] // "unknown"')
+                else
+                  echo "WARN: pipelinerun label fallback lookup failed for $PIPELINERUN_NS/$PIPELINERUN_NAME: $(cat /tmp/pipelinerun-err)"
+                fi
+              fi
+
               PAYLOAD=$(jq -n \
                 --arg pipeline "$PIPELINE_NAME" \
                 --arg run "$PIPELINERUN_NAME" \

@@ -39,8 +39,6 @@ spec:
             description: NVR of the bundle
           - name: application
             description: Snapshot application name
-          - name: release-name
-            description: Release name from the PipelineRun's own label
         volumes:
           - name: quay-creds
             secret:
@@ -155,7 +153,6 @@ spec:
               set -eo pipefail
 
               printf 'unknown' > /tekton/results/application
-              printf 'unknown' > /tekton/results/release-name
 
               echo "=== PHASE 1: Fetching snapshot data ==="
 
@@ -199,15 +196,6 @@ spec:
               echo "│ Version: $VERSION"
 
               printf '%s' "${APPLICATION:-unknown}" > /tekton/results/application
-
-              RELEASE_NAME="unknown"
-              if PR_JSON=$(kubectl get pipelinerun "$(context.pipelineRun.name)" -n "$(context.pipelineRun.namespace)" --request-timeout=30s -o json 2>/tmp/pipelinerun-err); then
-                RELEASE_NAME=$(echo "$PR_JSON" | jq -r '.metadata.labels["release.appstudio.openshift.io/name"] // "unknown"')
-              else
-                echo "WARN: pipelinerun label lookup failed (non-fatal): $(cat /tmp/pipelinerun-err)"
-              fi
-              printf '%s' "$RELEASE_NAME" > /tekton/results/release-name
-              echo "│ Release: $RELEASE_NAME"
 
               echo "=== PHASE 2: Cloning hco-bundle-registry ==="
 
@@ -857,13 +845,9 @@ spec:
       params:
         - name: APPLICATION
           value: "$(tasks.update-bundle.results.application)"
-        - name: RELEASE_NAME
-          value: "$(tasks.update-bundle.results.release-name)"
       taskSpec:
         params:
           - name: APPLICATION
-            type: string
-          - name: RELEASE_NAME
             type: string
         steps:
           - name: send-notification
@@ -885,8 +869,6 @@ spec:
                 value: "$(params.snapshot)"
               - name: APPLICATION
                 value: "$(params.APPLICATION)"
-              - name: RELEASE_NAME
-                value: "$(params.RELEASE_NAME)"
             script: |
               #!/usr/bin/env bash
               set -uo pipefail
@@ -897,16 +879,12 @@ spec:
               fi
 
               [[ -z "$APPLICATION" ]] && APPLICATION="unknown"
-              [[ -z "$RELEASE_NAME" ]] && RELEASE_NAME="unknown"
 
               KONFLUX_UI_BASE="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
               if [[ "$APPLICATION" != "unknown" ]]; then
                 KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/applications/${APPLICATION}/pipelineruns/${PIPELINERUN_NAME}"
-                if [[ "$RELEASE_NAME" != "unknown" ]]; then
-                  KONFLUX_URL="${KONFLUX_URL}?releaseName=${RELEASE_NAME}"
-                fi
               else
-                KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/pipelineruns"
+                KONFLUX_URL="${KONFLUX_UI_BASE}/ns/${PIPELINERUN_NS}/pipelineruns/${PIPELINERUN_NAME}"
               fi
 
               PAYLOAD=$(jq -n \
@@ -915,11 +893,9 @@ spec:
                 --arg ns "$PIPELINERUN_NS" \
                 --arg snap "$SNAPSHOT" \
                 --arg app "$APPLICATION" \
-                --arg release "$RELEASE_NAME" \
                 --arg url "$KONFLUX_URL" \
                 '{text: (":x: *" + $pipeline + "* failed!\n"
                   + "*Application:* " + $app + "\n"
-                  + "*Release:* " + $release + "\n"
                   + "*PipelineRun:* " + $run + "\n"
                   + "*Namespace:* " + $ns + "\n"
                   + "*Snapshot:* " + $snap + "\n"

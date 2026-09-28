@@ -883,6 +883,9 @@ spec:
               fi
 
               if PR_JSON=$(kubectl get pipelinerun "$PIPELINERUN_NAME" -n "$PIPELINERUN_NS" --request-timeout=30s -o json 2>/tmp/pipelinerun-err); then
+                if [[ "$APPLICATION" == "unknown" ]]; then
+                  APPLICATION=$(echo "$PR_JSON" | jq -r '.metadata.labels["appstudio.openshift.io/application"] // "unknown"')
+                fi
                 RELEASE_NAME=$(echo "$PR_JSON" | jq -r '.metadata.labels["release.appstudio.openshift.io/name"] // "unknown"')
               else
                 echo "WARN: pipelinerun label lookup failed for $PIPELINERUN_NS/$PIPELINERUN_NAME: $(cat /tmp/pipelinerun-err)"

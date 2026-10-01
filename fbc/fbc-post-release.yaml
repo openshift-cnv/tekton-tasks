@@ -67,6 +67,11 @@ spec:
               jq -r --arg snapshot "${snapshot_id}" --arg releaseplan "$(params.RELEASEPLAN_ID)" \
               '.items[] | select(.spec.snapshot == $snapshot and .spec.releasePlan == $releaseplan) | .metadata.name' | tail -n 1)
 
+              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
+              echo "${snapshot_data}" | yq '.spec.application' | tr -d '\n' > /tekton/results/application
+              echo "${snapshot_data}" | yq '.spec.components[0].name' | tr -d '\n' > /tekton/results/component
+              printf '%s' "${release_id}" > /tekton/results/release-name
+
               released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
               if [ "$released_status" != "True" ]; then
                 echo "Release failed. Not continuing with post-release."
@@ -74,12 +79,7 @@ spec:
               fi
 
               cnv_version="$(params.CNV_VERSION)"
-              snapshot_data=$(kubectl get snapshot "${snapshot_id}" -oyaml)
               fbc_fragment=$(echo "${snapshot_data}" | yq '.spec.components[0].containerImage')
-
-              echo "${snapshot_data}" | yq '.spec.application' | tr -d '\n' > /tekton/results/application
-              echo "${snapshot_data}" | yq '.spec.components[0].name' | tr -d '\n' > /tekton/results/component
-              printf '%s' "${release_id}" > /tekton/results/release-name
               index_image=$(kubectl get release "${release_id}" -oyaml | yq ".status.artifacts.index_image.\"${cnv_version}\".index_image")
               from_index="registry-proxy.engineering.redhat.com/rh-osbs/iib-pub-pending:${cnv_version}"
 

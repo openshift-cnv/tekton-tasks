@@ -1,0 +1,10 @@
+[project]
+name = "run-cnv-smoke-tests"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gsutil>=5.35",
+    "pyyaml>=6.0.3",
+]

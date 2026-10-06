@@ -55,7 +55,7 @@ spec:
           - name: release-name
             description: Release CR name
           - name: release-failed
-            description: '"true" when ManagedPipelineProcessed != True; used by the finally block to suppress the Slack alert (the release pipeline reports release status).'
+            description: '"release-failed" when ManagedPipelineProcessed != True; used by the finally block to suppress the Slack alert (the release pipeline reports release status).'
         steps:
           - name: get-info
             image: quay.io/konflux-ci/release-service-utils:105474114b10c0bd52eda96bc67490447131b784
@@ -69,7 +69,7 @@ spec:
               printf 'unknown' > /tekton/results/application
               printf 'unknown' > /tekton/results/component
               printf 'unknown' > /tekton/results/release-name
-              printf 'false' > /tekton/results/release-failed
+              printf 'release-not-failed' > /tekton/results/release-failed
 
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
               release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
@@ -84,7 +84,7 @@ spec:
               released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
               if [ "$released_status" != "True" ]; then
                 echo "Release failed. Not continuing with post-release."
-                printf 'true' > /tekton/results/release-failed
+                printf 'release-failed' > /tekton/results/release-failed
                 exit 1
               fi
 
@@ -371,7 +371,7 @@ spec:
           values: ["Failed"]
         - input: $(tasks.get-info.results.release-failed)
           operator: notin
-          values: ["true"]
+          values: ["release-failed"]
       params:
         - name: APPLICATION
           value: "$(tasks.get-info.results.application)"

@@ -1,3 +1,9 @@
+# @ai-rules:
+# 1. [Pattern]: Task results written to /tekton/results/* must be emitted before any `exit 1` in a step's
+#    script to survive into the `finally` block -- see get-info's results, which are defaulted up front and
+#    overwritten on each success/failure path (e.g. release-failed, application, component, release-name).
+# 2. [Gotcha]: Multiple `when` entries under the same task are AND-ed, not OR-ed.
+# 3. [Constraint]: Task results have a ~4KB size limit (Tekton default).
 ---
 apiVersion: tekton.dev/v1
 kind: Pipeline
@@ -48,6 +54,8 @@ spec:
             description: Snapshot component name
           - name: release-name
             description: Release CR name
+          - name: release-failed
+            description: '"release-failed" when ManagedPipelineProcessed != True; used by the finally block to suppress the Slack alert (the release pipeline reports release status).'
         steps:
           - name: get-info
             image: quay.io/konflux-ci/release-service-utils:105474114b10c0bd52eda96bc67490447131b784
@@ -61,6 +69,7 @@ spec:
               printf 'unknown' > /tekton/results/application
               printf 'unknown' > /tekton/results/component
               printf 'unknown' > /tekton/results/release-name
+              printf 'release-not-failed' > /tekton/results/release-failed
 
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
               release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
@@ -75,6 +84,7 @@ spec:
               released_status=$(kubectl get release "${release_id}" -oyaml | yq '.status.conditions[] | select(.type == "ManagedPipelineProcessed") | .status')
               if [ "$released_status" != "True" ]; then
                 echo "Release failed. Not continuing with post-release."
+                printf 'release-failed' > /tekton/results/release-failed
                 exit 1
               fi
 
@@ -359,6 +369,9 @@ spec:
         - input: $(tasks.status)
           operator: in
           values: ["Failed"]
+        - input: $(tasks.get-info.results.release-failed)
+          operator: notin
+          values: ["release-failed"]
       params:
         - name: APPLICATION
           value: "$(tasks.get-info.results.application)"

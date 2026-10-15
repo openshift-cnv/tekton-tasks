@@ -335,14 +335,44 @@ spec:
                 git commit -m "Update HCO bundle registry with new images"
                 ACTION_LOG+=("OK|Commit changes|exit=0|0s")
                 
-                if ! exec_action "Pull with rebase" 60 "git pull --rebase origin main"; then
-                  echo "ERROR: Failed to pull with rebase"
-                  FINAL_EXIT_CODE=1
-                  exit 1
-                fi
+                MAX_PUSH_RETRIES=3
+                push_succeeded=false
+                for attempt in $(seq 1 $MAX_PUSH_RETRIES); do
+                  if ! exec_action "Pull with rebase (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git pull --rebase origin main"; then
+                    echo "│ WARN: Rebase conflict on attempt ${attempt}/${MAX_PUSH_RETRIES}"
+                    exec_action "Abort failed rebase" 30 "git rebase --abort" || true
+                    
+                    if ! exec_action "Reset to origin/main (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git fetch origin main && git reset --hard origin/main"; then
+                      echo "ERROR: Failed to reset to origin/main"
+                      FINAL_EXIT_CODE=1
+                      exit 1
+                    fi
+                    
+                    if ! exec_action "Re-apply image updates (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "update_images_snapshots"; then
+                      echo "ERROR: Failed to re-apply image updates"
+                      FINAL_EXIT_CODE=1
+                      exit 1
+                    fi
+                    
+                    git add .
+                    git commit -m "Update HCO bundle registry with new images"
+                    ACTION_LOG+=("OK|Re-commit after conflict resolution (attempt ${attempt}/${MAX_PUSH_RETRIES})|exit=0|0s")
+                  fi
+                  
+                  if exec_action "Push to origin (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git push origin main"; then
+                    push_succeeded=true
+                    break
+                  fi
+                  
+                  if [[ $attempt -lt $MAX_PUSH_RETRIES ]]; then
+                    echo "│ WARN: Push failed (attempt ${attempt}/${MAX_PUSH_RETRIES}), retrying..."
+                    ACTION_LOG+=("WARN|Push retry scheduled|attempt=${attempt}|0s")
+                    sleep 2
+                  fi
+                done
                 
-                if ! exec_action "Push to origin" 60 "git push origin main"; then
-                  echo "ERROR: Failed to push to origin"
+                if [[ "$push_succeeded" != "true" ]]; then
+                  echo "ERROR: Failed to push to origin after ${MAX_PUSH_RETRIES} attempts"
                   FINAL_EXIT_CODE=1
                   exit 1
                 fi

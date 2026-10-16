@@ -279,15 +279,6 @@ spec:
 
               rm -f /tmp/snapshot.json
 
-              # Save Snapshot object for GC resilience (stripped, with velero label)
-              if [[ "$APPLICATION" != *"-test-"* ]]; then
-                snapshot_objects_dir="components/hco-bundle-registry/snapshot-objects"
-                mkdir -p "$snapshot_objects_dir"
-                if ! exec_action "Save Snapshot object for ${APPLICATION}" 30 "set -o pipefail; kubectl get snapshot '$SNAPSHOT_ID' -oyaml | yq 'del(.metadata.ownerReferences) | .metadata.labels[\"velero.io/restore-name\"] = \"snapshot-persistence\"' > '${snapshot_objects_dir}/${APPLICATION}.yaml'"; then
-                  echo "WARN: Failed to save Snapshot object for ${APPLICATION} (non-fatal)"
-                fi
-              fi
-
               # Define snapshots_file outside function so it's available in main script
               snapshots_file="components/hco-bundle-registry/snapshots.json"
 
@@ -319,53 +310,69 @@ spec:
                 fi
               }
 
-              echo "=== PHASE 4: Updating image references ==="
-              # Export function AND variables needed by function when run in subshell via exec_action
+              echo "=== PHASE 4+5: Update, commit, and push (with retry) ==="
               export -f update_images_snapshots
               export IMAGES APPLICATION SNAPSHOT_ID snapshots_file
-              if ! exec_action "Update image references" 60 "update_images_snapshots"; then
-                echo "ERROR: Failed to update image references"
-                FINAL_EXIT_CODE=1
-                exit 1
-              fi
 
-              echo "=== PHASE 5: Committing and pushing changes ==="
-              if [[ -n "$(git status --porcelain)" ]]; then
-                git add .
-                git commit -m "Update HCO bundle registry with new images"
-                ACTION_LOG+=("OK|Commit changes|exit=0|0s")
-                
-                MAX_PUSH_RETRIES=3
-                push_succeeded=false
-                for attempt in $(seq 1 $MAX_PUSH_RETRIES); do
-                  if ! exec_action "Pull with rebase (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git pull --rebase origin main"; then
-                    echo "ERROR: Failed to pull with rebase"
+              MAX_PUSH_RETRIES=3
+              push_succeeded=false
+              for attempt in $(seq 1 $MAX_PUSH_RETRIES); do
+                # On retry, reset working tree to latest remote state
+                if [[ $attempt -gt 1 ]]; then
+                  if ! exec_action "Reset to origin/main (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git fetch origin main && git reset --hard origin/main"; then
+                    echo "ERROR: Failed to reset to origin/main"
                     FINAL_EXIT_CODE=1
                     exit 1
                   fi
-                  
-                  if exec_action "Push to origin (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git push origin main"; then
-                    push_succeeded=true
-                    break
-                  fi
-                  
-                  if [[ $attempt -lt $MAX_PUSH_RETRIES ]]; then
-                    echo "│ WARN: Push failed (attempt ${attempt}/${MAX_PUSH_RETRIES}), retrying after rebase..."
-                    ACTION_LOG+=("WARN|Push retry scheduled|attempt=${attempt}|0s")
-                    sleep 2
-                  fi
-                done
-                
-                if [[ "$push_succeeded" != "true" ]]; then
-                  echo "ERROR: Failed to push to origin after ${MAX_PUSH_RETRIES} attempts"
+                  sleep $((RANDOM % 5 + 2))
+                fi
+
+                if ! exec_action "Update image references (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "update_images_snapshots"; then
+                  echo "ERROR: Failed to update image references"
                   FINAL_EXIT_CODE=1
                   exit 1
                 fi
-                echo "│ OK: Changes pushed to GitLab"
-              else
-                ACTION_LOG+=("OK|Skip - No changes detected|exit=0|0s")
-                echo "│ SKIP: No changes detected in the bundle registry"
+
+                # Save Snapshot object for GC resilience (stripped, with velero label)
+                if [[ "$APPLICATION" != *"-test-"* ]]; then
+                  snapshot_objects_dir="components/hco-bundle-registry/snapshot-objects"
+                  mkdir -p "$snapshot_objects_dir"
+                  exec_action "Save Snapshot object for ${APPLICATION} (attempt ${attempt}/${MAX_PUSH_RETRIES})" 30 \
+                    "set -o pipefail; kubectl get snapshot '$SNAPSHOT_ID' -oyaml | yq 'del(.metadata.ownerReferences) | .metadata.labels[\"velero.io/restore-name\"] = \"snapshot-persistence\"' > '${snapshot_objects_dir}/${APPLICATION}.yaml'" \
+                    || echo "│ WARN: Failed to save Snapshot object (non-fatal)"
+                fi
+
+                if [[ -z "$(git status --porcelain)" ]]; then
+                  echo "│ SKIP: No changes detected (remote already current)"
+                  ACTION_LOG+=("OK|Skip - No changes detected|exit=0|0s")
+                  push_succeeded=true
+                  break
+                fi
+
+                git add .
+                if ! exec_action "Commit changes (attempt ${attempt}/${MAX_PUSH_RETRIES})" 30 "git commit -m 'Update HCO bundle registry with new images'"; then
+                  echo "ERROR: Failed to commit changes"
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+
+                if exec_action "Push to origin (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git push origin main"; then
+                  push_succeeded=true
+                  break
+                fi
+
+                if [[ $attempt -lt $MAX_PUSH_RETRIES ]]; then
+                  echo "│ WARN: Push failed (attempt ${attempt}/${MAX_PUSH_RETRIES}), retrying..."
+                  ACTION_LOG+=("WARN|Push retry scheduled|attempt=${attempt}|0s")
+                fi
+              done
+
+              if [[ "$push_succeeded" != "true" ]]; then
+                echo "ERROR: Failed to push to origin after ${MAX_PUSH_RETRIES} attempts"
+                FINAL_EXIT_CODE=1
+                exit 1
               fi
+              echo "│ OK: Changes pushed to GitLab"
 
               # Copy Snapshot objects to shared volume for push-release-chart step
               mkdir -p /var/shared/snapshot-objects

@@ -339,9 +339,47 @@ spec:
                 push_succeeded=false
                 for attempt in $(seq 1 $MAX_PUSH_RETRIES); do
                   if ! exec_action "Pull with rebase (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git pull --rebase origin main"; then
-                    echo "ERROR: Failed to pull with rebase"
-                    FINAL_EXIT_CODE=1
-                    exit 1
+                    # Only abort rebase if one is actually in progress
+                    if [[ -d .git/rebase-merge || -d .git/rebase-apply ]]; then
+                      echo "│ WARN: Rebase conflict on attempt ${attempt}/${MAX_PUSH_RETRIES}"
+                      exec_action "Abort failed rebase" 30 "git rebase --abort" || true
+                    else
+                      echo "│ WARN: Pull failed (non-conflict) on attempt ${attempt}/${MAX_PUSH_RETRIES}"
+                    fi
+                    
+                    if ! exec_action "Reset to origin/main (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git fetch origin main && git reset --hard origin/main"; then
+                      echo "ERROR: Failed to reset to origin/main"
+                      FINAL_EXIT_CODE=1
+                      exit 1
+                    fi
+                    
+                    if ! exec_action "Re-apply image updates (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "update_images_snapshots"; then
+                      echo "ERROR: Failed to re-apply image updates"
+                      FINAL_EXIT_CODE=1
+                      exit 1
+                    fi
+                    
+                    # Re-save Snapshot object lost by git reset --hard
+                    if [[ "$APPLICATION" != *"-test-"* ]]; then
+                      snapshot_objects_dir="components/hco-bundle-registry/snapshot-objects"
+                      mkdir -p "$snapshot_objects_dir"
+                      exec_action "Re-save Snapshot object for ${APPLICATION} (attempt ${attempt}/${MAX_PUSH_RETRIES})" 30 \
+                        "set -o pipefail; kubectl get snapshot '$SNAPSHOT_ID' -oyaml | yq 'del(.metadata.ownerReferences) | .metadata.labels[\"velero.io/restore-name\"] = \"snapshot-persistence\"' > '${snapshot_objects_dir}/${APPLICATION}.yaml'" \
+                        || echo "│ WARN: Failed to re-save Snapshot object (non-fatal)"
+                    fi
+                    
+                    if [[ -z "$(git status --porcelain)" ]]; then
+                      echo "│ WARN: No changes after re-apply on attempt ${attempt}/${MAX_PUSH_RETRIES} — remote already has our updates"
+                      ACTION_LOG+=("OK|Skip push - remote already current (attempt ${attempt}/${MAX_PUSH_RETRIES})|exit=0|0s")
+                      push_succeeded=true
+                      break
+                    fi
+                    
+                    if ! exec_action "Re-commit changes (attempt ${attempt}/${MAX_PUSH_RETRIES})" 30 "git add . && git commit -m 'Update HCO bundle registry with new images'"; then
+                      echo "ERROR: Failed to commit after conflict resolution"
+                      FINAL_EXIT_CODE=1
+                      exit 1
+                    fi
                   fi
                   
                   if exec_action "Push to origin (attempt ${attempt}/${MAX_PUSH_RETRIES})" 60 "git push origin main"; then
@@ -350,9 +388,9 @@ spec:
                   fi
                   
                   if [[ $attempt -lt $MAX_PUSH_RETRIES ]]; then
-                    echo "│ WARN: Push failed (attempt ${attempt}/${MAX_PUSH_RETRIES}), retrying after rebase..."
+                    echo "│ WARN: Push failed (attempt ${attempt}/${MAX_PUSH_RETRIES}), retrying..."
                     ACTION_LOG+=("WARN|Push retry scheduled|attempt=${attempt}|0s")
-                    sleep 2
+                    sleep $((RANDOM % 5 + 2))
                   fi
                 done
                 

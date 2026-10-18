@@ -117,6 +117,169 @@ spec:
               exit 1
 
   finally:
+    - name: notify-datadog
+      params:
+        - name: test-status
+          value: $(tasks.run-smoke-tests.status)
+        - name: prow-job
+          value: $(params.prow-job)
+        - name: git-url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+        - name: path-context
+          value: $(params.path-context)
+        - name: debug
+          value: $(params.debug)
+      taskSpec:
+        params:
+          - name: test-status
+          - name: prow-job
+          - name: git-url
+          - name: revision
+          - name: path-context
+          - name: debug
+        steps:
+          - name: send-pac-incoming-webhook
+            image: quay.io/cnv-qe-devops/gangway:latest
+            env:
+              - name: TEST_STATUS
+                value: $(params.test-status)
+              - name: PROW_JOB
+                value: $(params.prow-job)
+              - name: GIT_REPOSITORY
+                value: $(params.git-url)
+              - name: GIT_REVISION
+                value: $(params.revision)
+              - name: PATH_CONTEXT
+                value: $(params.path-context)
+              - name: PAC_INCOMING_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: pac-incoming-credentials
+                    key: url
+              - name: PAC_INCOMING_SECRET
+                valueFrom:
+                  secretKeyRef:
+                    name: pac-incoming-credentials
+                    key: secret
+            script: |
+              #!/usr/bin/env bash
+
+              # ============================================================
+              # EXECUTION LAYER
+              # ============================================================
+              SCRIPT_START=$(date +%s)
+              declare -a ACTION_LOG=()
+              FINAL_EXIT_CODE=0
+
+              if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+              execution_summary() {
+                local script_exit_code=$?
+                local script_end=$(date +%s)
+                local total_duration=$((script_end - SCRIPT_START))
+                echo ""
+                echo "╔═════════════════════════════════════════════════════════════"
+                echo "║ EXECUTION SUMMARY - notify-datadog"
+                echo "║ Total Duration: ${total_duration}s"
+                echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+                echo "╠═════════════════════════════════════════════════════════════"
+                for entry in "${ACTION_LOG[@]}"; do
+                  local status=$(echo "$entry" | cut -d'|' -f1)
+                  local action=$(echo "$entry" | cut -d'|' -f2)
+                  local details=$(echo "$entry" | cut -d'|' -f3-)
+                  case "$status" in
+                    OK) echo "║ ✓ $action ($details)" ;;
+                    FAILED) echo "║ ✗ $action ($details)" ;;
+                    TIMEOUT) echo "║ ⏱ $action ($details)" ;;
+                  esac
+                done
+                echo "╚═════════════════════════════════════════════════════════════"
+                exit ${FINAL_EXIT_CODE:-$script_exit_code}
+              }
+              trap execution_summary EXIT
+
+              # ============================================================
+              # RUN LOGIC
+              # ============================================================
+              set -eo pipefail
+
+              # Map test status to build_status
+              if [[ "${TEST_STATUS}" == "Succeeded" ]]; then
+                BUILD_STATUS="Succeeded"
+              else
+                BUILD_STATUS="Failed"
+              fi
+
+              echo "Test Status:   ${TEST_STATUS}"
+              echo "Build Status:  ${BUILD_STATUS}"
+              echo "Prow Job:      ${PROW_JOB}"
+              echo "Git Revision:  ${GIT_REVISION}"
+              echo "Repository:    ${GIT_REPOSITORY}"
+
+              # Build JSON-encoded source_url (all params packed into the only
+              # declared incoming param on the Repository CR)
+              SOURCE_URL_JSON=$(jq -n \
+                --arg build_status "${BUILD_STATUS}" \
+                --arg pipeline_name "run-cnv-smoke-tests" \
+                --arg git_revision "${GIT_REVISION}" \
+                --arg repo_url "${GIT_REPOSITORY}" \
+                --arg prow_job "${PROW_JOB}" \
+                -c '{
+                  build_status: $build_status,
+                  pipeline_name: $pipeline_name,
+                  git_revision: $git_revision,
+                  repo_url: $repo_url,
+                  prow_job: $prow_job
+                }')
+
+              # Build the PaC incoming webhook payload
+              PAYLOAD=$(jq -n \
+                --arg repository "gitlab-cee-redhat-com-alraj-altest" \
+                --arg namespace "alraj-tenant" \
+                --arg branch "main" \
+                --arg pipelinerun "send-dd-notify-on-incoming-" \
+                --arg secret "${PAC_INCOMING_SECRET}" \
+                --arg source_url "${SOURCE_URL_JSON}" \
+                '{
+                  repository: $repository,
+                  namespace: $namespace,
+                  branch: $branch,
+                  pipelinerun: $pipelinerun,
+                  secret: $secret,
+                  params: {
+                    source_url: $source_url
+                  }
+                }')
+
+              echo ""
+              echo "PaC incoming webhook payload:"
+              echo "${PAYLOAD}" | jq 'del(.secret)'
+              ACTION_LOG+=("OK|Build webhook payload|exit=0|0s")
+
+              # POST to PaC incoming webhook
+              HTTP_CODE=$(curl --fail-with-body --max-time 30 -s \
+                -o /tmp/pac-response.json -w '%{http_code}' \
+                -X POST "${PAC_INCOMING_URL}/incoming" \
+                -H "Content-Type: application/json" \
+                -d "${PAYLOAD}")
+
+              if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
+                echo ""
+                echo "PaC incoming webhook accepted (HTTP ${HTTP_CODE})"
+                echo "Response: $(cat /tmp/pac-response.json 2>/dev/null)"
+                ACTION_LOG+=("OK|POST to PaC /incoming|exit=0|0s")
+              else
+                echo ""
+                echo "ERROR: PaC incoming webhook failed (HTTP ${HTTP_CODE})"
+                echo "Response: $(cat /tmp/pac-response.json 2>/dev/null || echo 'no response')"
+                ACTION_LOG+=("FAILED|POST to PaC /incoming|exit=1|0s")
+              fi
+
+              # Non-fatal: notification failure should not fail the pipeline
+              FINAL_EXIT_CODE=0
+
     - name: manage-pull-request
       params:
         - name: test-status

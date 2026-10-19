@@ -113,7 +113,7 @@ spec:
         DD_SITE="${DD_SITE:-datadoghq.eu}"
 
         # --- Validate required params ---
-        if [[ -z "${DD_API_KEY:-}" ]]; then
+        if [[ -z "${DD_API_KEY:+set}" ]]; then
           echo "WARNING: DD_API_KEY not set (datadog-credentials Secret missing or empty), skipping Datadog event"
           ACTION_LOG+=("OK|Skip - DD_API_KEY not set|exit=0|0s")
           FINAL_EXIT_CODE=0
@@ -214,11 +214,10 @@ spec:
           echo "Datadog event sent successfully (HTTP ${HTTP_CODE})"
           echo "Response: $(cat /tmp/dd-response.json 2>/dev/null)"
           ACTION_LOG+=("OK|POST to Datadog|exit=0|0s")
+          FINAL_EXIT_CODE=0
         else
           echo "ERROR: Datadog event failed (HTTP ${HTTP_CODE})"
           echo "Response: $(cat /tmp/dd-response.json 2>/dev/null || echo 'no response')"
           ACTION_LOG+=("FAILED|POST to Datadog|exit=1|0s")
+          FINAL_EXIT_CODE=1
         fi
-
-        # Non-fatal: notification failure should not fail the calling pipeline
-        FINAL_EXIT_CODE=0

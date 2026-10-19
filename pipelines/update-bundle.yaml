@@ -153,6 +153,7 @@ spec:
               set -eo pipefail
 
               printf 'unknown' > /tekton/results/application
+              printf 'n/a' > /tekton/results/bundle-version
 
               echo "=== PHASE 1: Fetching snapshot data ==="
 
@@ -861,6 +862,7 @@ spec:
               FINAL_EXIT_CODE=0
   finally:
     - name: notify-datadog
+      timeout: "2m"
       params:
         - name: type
           value: $(tasks.update-bundle.status)

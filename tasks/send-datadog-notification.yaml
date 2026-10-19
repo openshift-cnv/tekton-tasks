@@ -124,9 +124,9 @@ spec:
 
         # --- Map type to Datadog alert_type (matches datadogNotifier.ts) ---
         case "${NOTIF_TYPE,,}" in
-          error|failure) ALERT_TYPE="error" ;;
+          error|failure|failed) ALERT_TYPE="error" ;;
           warning)       ALERT_TYPE="warning" ;;
-          success)       ALERT_TYPE="success" ;;
+          success|succeeded) ALERT_TYPE="success" ;;
           *)             ALERT_TYPE="info" ;;
         esac
 

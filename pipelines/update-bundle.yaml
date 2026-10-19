@@ -867,7 +867,7 @@ spec:
         - name: type
           value: $(tasks.update-bundle.status)
         - name: message
-          value: "[UPDATE-BUNDLE] $(tasks.update-bundle.status) | App: $(tasks.update-bundle.results.application) | Bundle: $(tasks.update-bundle.results.bundle-version) | Snapshot: $(params.snapshot) | Konflux: https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com/ns/$(context.pipelineRun.namespace)/applications/$(tasks.update-bundle.results.application)/pipelineruns/$(context.pipelineRun.name)"
+          value: "[UPDATE-BUNDLE] $(tasks.update-bundle.status) | App: $(tasks.update-bundle.results.application) | Bundle: $(tasks.update-bundle.results.bundle-version) | Snapshot: $(params.snapshot) | Konflux: https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com/ns/$(context.pipelineRun.namespace)/pipelineruns/$(context.pipelineRun.name)"
         - name: pipeline-name
           value: "update-bundle"
         - name: build-status

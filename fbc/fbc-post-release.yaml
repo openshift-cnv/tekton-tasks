@@ -69,6 +69,8 @@ spec:
               printf 'unknown' > /tekton/results/application
               printf 'unknown' > /tekton/results/component
               printf 'unknown' > /tekton/results/release-name
+              printf 'unknown' > /tekton/results/channel
+              printf 'unknown' > /tekton/results/hco-bundle-version
               printf 'release-not-failed' > /tekton/results/release-failed
 
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
@@ -104,6 +106,10 @@ spec:
               channel=$(yq '.channel' ${cnv_version}/updated_image.yaml)
               hco_bundle_version=$(yq '.hco-bundle-version' ${cnv_version}/updated_image.yaml)
               hco_bundle_url=$(yq '.hco-bundle-url' ${cnv_version}/updated_image.yaml)
+
+              # Write results early so finally block has real values even if later steps fail
+              printf '%s' "${channel}" > /tekton/results/channel
+              printf '%s' "${hco_bundle_version}" > /tekton/results/hco-bundle-version
 
               if [[ $hco_bundle_version == v4.99* ]]; then
                 cnv_version="v4.99"
@@ -363,6 +369,31 @@ spec:
               echo "║ Column:   ${CHANNEL^} Prod = true"
               echo "╚═════════════════════════════════════════"
   finally:
+    - name: notify-datadog
+      timeout: "2m"
+      params:
+        - name: type
+          value: $(tasks.get-info.status)
+        - name: message
+          value: "[FBC-POST-RELEASE] $(tasks.get-info.status) | App: $(tasks.get-info.results.application) | Component: $(tasks.get-info.results.component) | Bundle: $(tasks.get-info.results.hco-bundle-version) | CNV: $(params.cnv_version) | Env: $(params.environment) | Channel: $(tasks.get-info.results.channel) | Release: $(tasks.get-info.results.release-name) | Konflux: https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/$(context.pipelineRun.namespace)/applications/$(tasks.get-info.results.application)/pipelineruns/$(context.pipelineRun.name)?releaseName=$(tasks.get-info.results.release-name)"
+        - name: pipeline-name
+          value: "fbc-post-release"
+        - name: build-status
+          value: $(tasks.get-info.status)
+        - name: tags
+          value: "pipeline:fbc-post-release,hco_bundle_version:$(tasks.get-info.results.hco-bundle-version),application:$(tasks.get-info.results.application),component:$(tasks.get-info.results.component),cnv_version:$(params.cnv_version),environment:$(params.environment),channel:$(tasks.get-info.results.channel),release_name:$(tasks.get-info.results.release-name),release_failed:$(tasks.get-info.results.release-failed),snapshot:$(params.snapshot),pipelinerun:$(context.pipelineRun.name),namespace:$(context.pipelineRun.namespace)"
+        - name: debug
+          value: "false"
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: "https://github.com/openshift-cnv/tekton-tasks.git"
+          - name: revision
+            value: fbc-postrelease
+          - name: pathInRepo
+            value: datadog/send-datadog-notification.yaml
+
     - name: slack-webhook-notification
       timeout: "1m"
       when:

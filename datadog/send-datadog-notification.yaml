@@ -1,0 +1,223 @@
+# datadog/send-datadog-notification.yaml
+# @ai-rules:
+# 1. [Purpose]: Reusable Task that sends a notification event to Datadog Events API.
+# 2. [Pattern]: Follows datadogNotifier.ts payload format exactly (title, text, tags, alert_type).
+# 3. [Gotcha]: datadog-credentials Secret is optional — Task exits 0 if missing.
+# 4. [Constraint]: Non-fatal by design — notification failure must not fail the calling pipeline.
+# 5. [Gotcha]: set -x is suppressed around curl to avoid leaking DD_API_KEY in logs.
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: send-datadog-notification
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.50.0"
+    tekton.dev/displayName: "Send Datadog Notification"
+    tekton.dev/categories: Notification
+spec:
+  description: |
+    Sends a structured event to the Datadog Events API.
+    Payload format matches the internal notification-manager datadogNotifier.ts.
+    Can be referenced by any pipeline via taskRef with git resolver.
+  params:
+    - name: type
+      type: string
+      description: "Notification type: info, warning, error, success, failure"
+    - name: message
+      type: string
+      description: "Notification message text (free-form)"
+    - name: pipeline-name
+      type: string
+      description: "Name of the calling pipeline"
+    - name: build-status
+      type: string
+      description: "Pipeline outcome: Succeeded or Failed"
+    - name: tags
+      type: string
+      default: ""
+      description: "Comma-separated extra Datadog tags (e.g., hco_bundle_version:4.19.0,channel:stable-4.19)"
+    - name: debug
+      type: string
+      default: "false"
+      description: "Enable verbose output (set -x)"
+  steps:
+    - name: send-event
+      onError: continue
+      image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
+      env:
+        - name: NOTIF_TYPE
+          value: $(params.type)
+        - name: NOTIF_MESSAGE
+          value: $(params.message)
+        - name: PIPELINE_NAME
+          value: $(params.pipeline-name)
+        - name: BUILD_STATUS
+          value: $(params.build-status)
+        - name: EXTRA_TAGS
+          value: $(params.tags)
+        - name: DD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: datadog-credentials
+              key: api-key
+              optional: true
+        - name: DD_SITE
+          valueFrom:
+            secretKeyRef:
+              name: datadog-credentials
+              key: site
+              optional: true
+      script: |
+        #!/usr/bin/env bash
+
+        # ============================================================
+        # EXECUTION LAYER
+        # ============================================================
+        SCRIPT_START=$(date +%s)
+        declare -a ACTION_LOG=()
+        FINAL_EXIT_CODE=0
+
+        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+        execution_summary() {
+          local script_exit_code=$?
+          local script_end=$(date +%s)
+          local total_duration=$((script_end - SCRIPT_START))
+          echo ""
+          echo "╔═════════════════════════════════════════════════════════════"
+          echo "║ EXECUTION SUMMARY - send-datadog-notification"
+          echo "║ Total Duration: ${total_duration}s"
+          echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+          echo "╠═════════════════════════════════════════════════════════════"
+          for entry in "${ACTION_LOG[@]}"; do
+            local status=$(echo "$entry" | cut -d'|' -f1)
+            local action=$(echo "$entry" | cut -d'|' -f2)
+            local details=$(echo "$entry" | cut -d'|' -f3-)
+            case "$status" in
+              OK) echo "║ ✓ $action ($details)" ;;
+              FAILED) echo "║ ✗ $action ($details)" ;;
+              TIMEOUT) echo "║ ⏱ $action ($details)" ;;
+            esac
+          done
+          echo "╚═════════════════════════════════════════════════════════════"
+          exit ${FINAL_EXIT_CODE:-$script_exit_code}
+        }
+        trap execution_summary EXIT
+
+        # ============================================================
+        # RUN LOGIC
+        # ============================================================
+
+        # Default DD_SITE if Secret is missing
+        DD_SITE="${DD_SITE:-datadoghq.eu}"
+
+        # --- Validate required params ---
+        if [[ -z "${DD_API_KEY:+set}" ]]; then
+          echo "WARNING: DD_API_KEY not set (datadog-credentials Secret missing or empty), skipping Datadog event"
+          ACTION_LOG+=("OK|Skip - DD_API_KEY not set|exit=0|0s")
+          FINAL_EXIT_CODE=0
+          exit 0
+        fi
+
+        if [[ -z "${NOTIF_TYPE}" || -z "${NOTIF_MESSAGE}" ]]; then
+          echo "ERROR: type and message params are required"
+          ACTION_LOG+=("FAILED|Validate params|exit=1|0s")
+          FINAL_EXIT_CODE=0
+          exit 0
+        fi
+        ACTION_LOG+=("OK|Validate params|exit=0|0s")
+
+        # --- Normalize type to notification-manager format ---
+        case "${NOTIF_TYPE,,}" in
+          error|failure|failed) ALERT_TYPE="error"; NORM_TYPE="failure" ;;
+          warning)              ALERT_TYPE="warning"; NORM_TYPE="warning" ;;
+          success|succeeded)    ALERT_TYPE="success"; NORM_TYPE="success" ;;
+          *)                    ALERT_TYPE="info"; NORM_TYPE="info" ;;
+        esac
+
+        # --- Generate notification ID ---
+        NOTIFICATION_ID="ext-$(date +%s)-${RANDOM}"
+
+        # --- Build tags array using jq (safe handling of commas and quotes) ---
+        if [[ -n "${EXTRA_TAGS}" ]]; then
+          TAGS_JSON=$(jq -n \
+            --arg type "${NORM_TYPE}" \
+            --arg state "new" \
+            --arg notif_id "${NOTIFICATION_ID}" \
+            --arg pipeline "${PIPELINE_NAME}" \
+            --arg build_status "${BUILD_STATUS}" \
+            --arg extra "${EXTRA_TAGS}" \
+            '([
+              "service:konflux-notification-manager",
+              ("notification_type:" + $type),
+              ("state:" + $state),
+              ("notification_id:" + $notif_id),
+              ("pipeline:" + $pipeline),
+              ("build_status:" + $build_status),
+              "source:konflux-external"
+            ] + ($extra | split(",") | map(gsub("^\\s+|\\s+$"; ""))) | map(select(length > 0)))')
+        else
+          TAGS_JSON=$(jq -n \
+            --arg type "${NORM_TYPE}" \
+            --arg state "new" \
+            --arg notif_id "${NOTIFICATION_ID}" \
+            --arg pipeline "${PIPELINE_NAME}" \
+            --arg build_status "${BUILD_STATUS}" \
+            '[
+              "service:konflux-notification-manager",
+              ("notification_type:" + $type),
+              ("state:" + $state),
+              ("notification_id:" + $notif_id),
+              ("pipeline:" + $pipeline),
+              ("build_status:" + $build_status),
+              "source:konflux-external"
+            ]')
+        fi
+
+        # --- Build Datadog event payload (matches datadogNotifier.ts format) ---
+        DD_PAYLOAD=$(jq -n \
+          --arg title "[notification-manager] ${NORM_TYPE}" \
+          --arg text "${NOTIF_MESSAGE}" \
+          --arg alert_type "${ALERT_TYPE}" \
+          --argjson tags "${TAGS_JSON}" \
+          '{
+            title: $title,
+            text: $text,
+            tags: $tags,
+            alert_type: $alert_type
+          }')
+
+        echo "Datadog event payload:"
+        echo "${DD_PAYLOAD}" | jq .
+        echo ""
+        echo "Notification ID: ${NOTIFICATION_ID}"
+        echo "Alert Type:      ${ALERT_TYPE}"
+        echo "DD Site:         ${DD_SITE}"
+        ACTION_LOG+=("OK|Build payload|exit=0|0s")
+
+        # --- POST to Datadog Events API ---
+        # Suppress set -x to avoid leaking DD_API_KEY in logs
+        { set +x; } 2>/dev/null
+
+        HTTP_CODE=$(curl --max-time 10 --retry 2 --retry-all-errors -s \
+          -o /tmp/dd-response.json -w '%{http_code}' \
+          -X POST "https://api.${DD_SITE}/api/v1/events" \
+          -H "DD-API-KEY: ${DD_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "${DD_PAYLOAD}") || HTTP_CODE="000"
+
+        # Restore set -x if debug is enabled
+        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+        if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
+          echo "Datadog event sent successfully (HTTP ${HTTP_CODE})"
+          echo "Response: $(cat /tmp/dd-response.json 2>/dev/null)"
+          ACTION_LOG+=("OK|POST to Datadog|exit=0|0s")
+          FINAL_EXIT_CODE=0
+        else
+          echo "ERROR: Datadog event failed (HTTP ${HTTP_CODE})"
+          echo "Response: $(cat /tmp/dd-response.json 2>/dev/null || echo 'no response')"
+          ACTION_LOG+=("FAILED|POST to Datadog|exit=1|0s")
+          FINAL_EXIT_CODE=1
+        fi

@@ -153,6 +153,7 @@ spec:
               set -eo pipefail
 
               printf 'unknown' > /tekton/results/application
+              printf 'n/a' > /tekton/results/bundle-version
 
               echo "=== PHASE 1: Fetching snapshot data ==="
 
@@ -860,6 +861,31 @@ spec:
               echo "│ Published ${HYDRATED_CHART_NAME}:${CHART_VERSION} to oci://${TARGET_REGISTRY} (file: ${PACKAGE_FILE})"
               FINAL_EXIT_CODE=0
   finally:
+    - name: notify-datadog
+      timeout: "2m"
+      params:
+        - name: type
+          value: $(tasks.update-bundle.status)
+        - name: message
+          value: "[UPDATE-BUNDLE] $(tasks.update-bundle.status) | App: $(tasks.update-bundle.results.application) | Bundle: $(tasks.update-bundle.results.bundle-version) | Snapshot: $(params.snapshot) | Konflux: https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com/ns/$(context.pipelineRun.namespace)/pipelineruns/$(context.pipelineRun.name)"
+        - name: pipeline-name
+          value: "update-bundle"
+        - name: build-status
+          value: $(tasks.update-bundle.status)
+        - name: tags
+          value: "bundle_version:$(tasks.update-bundle.results.bundle-version),application:$(tasks.update-bundle.results.application),snapshot:$(params.snapshot),pipelinerun:$(context.pipelineRun.name),namespace:$(context.pipelineRun.namespace)"
+        - name: debug
+          value: $(params.debug)
+      taskRef:
+        resolver: git
+        params:
+          - name: url
+            value: "https://github.com/openshift-cnv/tekton-tasks.git"
+          - name: revision
+            value: fbc-postrelease
+          - name: pathInRepo
+            value: datadog/send-datadog-notification.yaml
+
     - name: slack-webhook-notification
       timeout: "1m"
       when:

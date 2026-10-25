@@ -1,42 +1,51 @@
 # datadog/send-datadog-notification.yaml
 # @ai-rules:
-# 1. [Purpose]: Reusable Task that sends a notification event to Datadog Events API.
-# 2. [Pattern]: Follows datadogNotifier.ts payload format exactly (title, text, tags, alert_type).
-# 3. [Gotcha]: datadog-credentials Secret is optional — Task exits 0 if missing.
-# 4. [Constraint]: Non-fatal by design — notification failure must not fail the calling pipeline.
+# 1. [Purpose]: Universal Datadog notification Task for all CNV Tekton pipelines.
+# 2. [Pattern]: Auto-discovers context from PipelineRun/TaskRun objects via kubectl.
+#    Callers pass only 4 required params + optional extra tags.
+# 3. [Constraint]: Non-fatal by design — onError: continue + FINAL_EXIT_CODE=0 on any failure.
+# 4. [Gotcha]: datadog-credentials Secret is optional — Task exits 0 if missing.
 # 5. [Gotcha]: set -x is suppressed around curl to avoid leaking DD_API_KEY in logs.
+# 6. [Gotcha]: kubectl introspection is conditional (only on failure) and wrapped in
+#    error handling — RBAC or API failures fall back to "unknown", never block.
+# 7. [Pattern]: Resilient Execution Layer (ACTION_LOG, trap, execution_summary).
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
   name: send-datadog-notification
   labels:
-    app.kubernetes.io/version: "0.2"
+    app.kubernetes.io/version: "1.0"
   annotations:
     tekton.dev/pipelines.minVersion: "0.50.0"
     tekton.dev/displayName: "Send Datadog Notification"
     tekton.dev/categories: Notification
 spec:
   description: |
-    Sends a structured event to the Datadog Events API.
-    Payload format matches the internal notification-manager datadogNotifier.ts.
-    Can be referenced by any pipeline via taskRef with git resolver.
+    Universal Datadog notification task for all CNV Tekton pipelines.
+    Auto-discovers rich context (application, component, version, failed task/step,
+    log snippet, git URL, PR number, pipeline URL) from PipelineRun and TaskRun
+    objects via kubectl. Callers pass only pipeline-name, pipeline-status,
+    pipelinerun-name, and namespace. Domain-specific extras (channel, bundle
+    version, release checklist epic) go in the optional tags param.
+    Requires a datadog-credentials Secret (keys: api-key, site).
+    Exits 0 gracefully if the Secret is missing or on any failure.
   params:
-    - name: type
-      type: string
-      description: "Notification type: info, warning, error, success, failure"
-    - name: message
-      type: string
-      description: "Notification message text (free-form)"
     - name: pipeline-name
       type: string
-      description: "Name of the calling pipeline"
-    - name: build-status
+      description: "Human-readable pipeline name (e.g. build-container, fbc-post-release, apply-releases)"
+    - name: pipeline-status
       type: string
-      description: "Pipeline outcome: Succeeded or Failed"
+      description: "Aggregate pipeline status — pass $(tasks.status)"
+    - name: pipelinerun-name
+      type: string
+      description: "PipelineRun name — pass $(context.pipelineRun.name)"
+    - name: namespace
+      type: string
+      description: "Namespace — pass $(context.pipelineRun.namespace)"
     - name: tags
       type: string
       default: ""
-      description: "Comma-separated extra Datadog tags (e.g., hco_bundle_version:4.19.0,channel:stable-4.19)"
+      description: "Comma-separated key:value pairs for domain-specific tags (e.g. channel:stable,epic:CNV-1234)"
     - name: debug
       type: string
       default: "false"
@@ -44,18 +53,8 @@ spec:
   steps:
     - name: send-event
       onError: continue
-      image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
+      image: quay.io/konflux-ci/release-service-utils@sha256:3e3b9f5ce4b4575997573ff2728c95b671b9902847934b64f6bc8f979bf01cde
       env:
-        - name: NOTIF_TYPE
-          value: $(params.type)
-        - name: NOTIF_MESSAGE
-          value: $(params.message)
-        - name: PIPELINE_NAME
-          value: $(params.pipeline-name)
-        - name: BUILD_STATUS
-          value: $(params.build-status)
-        - name: EXTRA_TAGS
-          value: $(params.tags)
         - name: DD_API_KEY
           valueFrom:
             secretKeyRef:
@@ -80,6 +79,21 @@ spec:
 
         if [[ "$(params.debug)" == "true" ]]; then set -x; fi
 
+        exec_action() {
+          local name="$1"; shift
+          local start=$(date +%s)
+          if "$@"; then
+            local dur=$(( $(date +%s) - start ))
+            ACTION_LOG+=("OK|${name}|${dur}s")
+            return 0
+          else
+            local rc=$?
+            local dur=$(( $(date +%s) - start ))
+            ACTION_LOG+=("FAILED|${name}|exit=${rc}|${dur}s")
+            return $rc
+          fi
+        }
+
         execution_summary() {
           local script_exit_code=$?
           local script_end=$(date +%s)
@@ -95,9 +109,8 @@ spec:
             local action=$(echo "$entry" | cut -d'|' -f2)
             local details=$(echo "$entry" | cut -d'|' -f3-)
             case "$status" in
-              OK) echo "║ ✓ $action ($details)" ;;
-              FAILED) echo "║ ✗ $action ($details)" ;;
-              TIMEOUT) echo "║ ⏱ $action ($details)" ;;
+              OK)     echo "║ ✓ ${action} (${details})" ;;
+              FAILED) echo "║ ✗ ${action} (${details})" ;;
             esac
           done
           echo "╚═════════════════════════════════════════════════════════════"
@@ -106,81 +119,265 @@ spec:
         trap execution_summary EXIT
 
         # ============================================================
-        # RUN LOGIC
+        # CONSTANTS
         # ============================================================
-
-        # Default DD_SITE if Secret is missing
+        PIPELINE_NAME="$(params.pipeline-name)"
+        PIPELINE_STATUS="$(params.pipeline-status)"
+        PIPELINERUN_NAME="$(params.pipelinerun-name)"
+        NAMESPACE="$(params.namespace)"
         DD_SITE="${DD_SITE:-datadoghq.eu}"
 
-        # --- Validate required params ---
+        echo "=== Datadog Notification ==="
+        echo "PIPELINE        --> ${PIPELINE_NAME}"
+        echo "PIPELINE_STATUS --> ${PIPELINE_STATUS}"
+        echo "PIPELINERUN     --> ${PIPELINERUN_NAME}"
+        echo "NAMESPACE       --> ${NAMESPACE}"
+
+        # ============================================================
+        # GATE: DD_API_KEY
+        # ============================================================
         if [[ -z "${DD_API_KEY:+set}" ]]; then
-          echo "WARNING: DD_API_KEY not set (datadog-credentials Secret missing or empty), skipping Datadog event"
-          ACTION_LOG+=("OK|Skip - DD_API_KEY not set|exit=0|0s")
+          echo "WARN: DD_API_KEY not set (datadog-credentials Secret missing). Skipping."
+          ACTION_LOG+=("OK|Skip - no DD_API_KEY|0s")
           FINAL_EXIT_CODE=0
           exit 0
         fi
+        ACTION_LOG+=("OK|DD_API_KEY present|0s")
 
-        if [[ -z "${NOTIF_TYPE}" || -z "${NOTIF_MESSAGE}" ]]; then
-          echo "ERROR: type and message params are required"
-          ACTION_LOG+=("FAILED|Validate params|exit=1|0s")
-          FINAL_EXIT_CODE=0
-          exit 0
+        # ============================================================
+        # AUTO-DISCOVER: PipelineRun metadata
+        # ============================================================
+        APPLICATION="unknown"
+        COMPONENT="unknown"
+        EVENT_TYPE="unknown"
+        COMMIT_SHA=""
+        PR_NUMBER=""
+        GIT_URL=""
+        PR_MESSAGE=""
+        VERSION=""
+        ALL_PARAMS_TAGS=""
+
+        discover_pipelinerun_metadata() {
+          local PR_DATA
+          PR_DATA=$(kubectl get pipelinerun "${PIPELINERUN_NAME}" \
+            -n "${NAMESPACE}" -o json 2>/dev/null) || return 1
+
+          APPLICATION=$(echo "${PR_DATA}" | jq -r '
+            .metadata.labels["appstudio.openshift.io/application"] // "unknown"')
+          COMPONENT=$(echo "${PR_DATA}" | jq -r '
+            .metadata.labels["appstudio.openshift.io/component"] // "unknown"')
+          EVENT_TYPE=$(echo "${PR_DATA}" | jq -r '
+            .metadata.labels["pipelinesascode.tekton.dev/event-type"] // "unknown"')
+          COMMIT_SHA=$(echo "${PR_DATA}" | jq -r '
+            .metadata.annotations["build.appstudio.redhat.com/commit_sha"] // ""')
+          PR_NUMBER=$(echo "${PR_DATA}" | jq -r '
+            .metadata.annotations["build.appstudio.redhat.com/pull_request_number"] // ""')
+
+          GIT_URL=$(echo "${PR_DATA}" | jq -r '
+            [.spec.params[]? | select(.name=="git-url" or .name=="repo-url") | .value][0] // ""')
+
+          PR_MESSAGE=$(echo "${PR_DATA}" | jq -r '
+            [.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""')
+
+          ALL_PARAMS_TAGS=$(echo "${PR_DATA}" | jq -r '
+            [.spec.params[]? |
+             select(.value | type == "string") |
+             select(.name | test("secret|token|key|password|auth"; "i") | not) |
+             "param_\(.name):\(.value | if length > 100 then .[:100] + "…" else . end)"] |
+            join(",")')
+
+          echo "APPLICATION     --> ${APPLICATION}"
+          echo "COMPONENT       --> ${COMPONENT}"
+          echo "EVENT_TYPE      --> ${EVENT_TYPE}"
+          echo "COMMIT_SHA      --> ${COMMIT_SHA}"
+          echo "PR_NUMBER       --> ${PR_NUMBER}"
+          echo "GIT_URL         --> ${GIT_URL}"
+        }
+
+        exec_action "Discover PipelineRun" discover_pipelinerun_metadata || true
+
+        # Derive version from namespace (v4-19-openshift-virtualization-tenant → v4.19)
+        VERSION=$(echo "${NAMESPACE}" | grep -oP 'v\d+-\d+' | head -1 | tr '-' '.')
+        echo "VERSION         --> ${VERSION:-unknown}"
+
+        # ============================================================
+        # AUTO-DISCOVER: Failure details (only when Failed)
+        # ============================================================
+        FAILED_TASK="none"
+        FAILED_STEP=""
+        FAILED_EXIT_CODE=""
+        FAILED_REASON=""
+        LOG_SNIPPET=""
+
+        discover_failure_details() {
+          local TASK_DATA
+          TASK_DATA=$(kubectl get taskrun -n "${NAMESPACE}" \
+            -l "tekton.dev/pipelineRun=${PIPELINERUN_NAME}" \
+            -o json 2>/dev/null) || return 1
+
+          local FAILED_DATA
+          FAILED_DATA=$(echo "${TASK_DATA}" | jq '
+            [.items[] |
+             select(.status.conditions[]? |
+               select(.type=="Succeeded" and .status=="False")) |
+             {
+               task: .metadata.labels["tekton.dev/pipelineTask"],
+               message: ([.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""),
+               step: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].name // "unknown"),
+               exit_code: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.exitCode // null),
+               reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown")
+             }]')
+
+          FAILED_TASK=$(echo "${FAILED_DATA}" | jq -r '
+            [.[].task] | map(select(. != null)) | join(",") // "unknown"')
+          FAILED_STEP=$(echo "${FAILED_DATA}" | jq -r '.[0].step // "unknown"')
+          FAILED_EXIT_CODE=$(echo "${FAILED_DATA}" | jq -r '.[0].exit_code // "?"')
+          FAILED_REASON=$(echo "${FAILED_DATA}" | jq -r '.[0].reason // "unknown"')
+
+          LOG_SNIPPET=$(echo "${FAILED_DATA}" | jq -r '.[0].message // ""' | head -c 500)
+
+          echo "FAILED_TASK     --> ${FAILED_TASK}"
+          echo "FAILED_STEP     --> ${FAILED_STEP}"
+          echo "FAILED_EXIT     --> ${FAILED_EXIT_CODE} (${FAILED_REASON})"
+          if [[ -n "${LOG_SNIPPET}" ]]; then
+            echo "LOG_SNIPPET     --> ${LOG_SNIPPET:0:120}..."
+          fi
+        }
+
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          exec_action "Discover failure details" discover_failure_details || true
+          [[ "${FAILED_TASK}" == "" ]] && FAILED_TASK="unknown"
         fi
-        ACTION_LOG+=("OK|Validate params|exit=0|0s")
 
-        # --- Normalize type to notification-manager format ---
-        case "${NOTIF_TYPE,,}" in
-          error|failure|failed) ALERT_TYPE="error"; NORM_TYPE="failure" ;;
-          warning)              ALERT_TYPE="warning"; NORM_TYPE="warning" ;;
-          success|succeeded)    ALERT_TYPE="success"; NORM_TYPE="success" ;;
-          *)                    ALERT_TYPE="info"; NORM_TYPE="info" ;;
+        # ============================================================
+        # CONSTRUCT: URLs
+        # ============================================================
+        PIPELINE_URL=""
+        PR_URL=""
+        COMMIT_URL=""
+
+        KUBE_HOST="${KUBERNETES_SERVICE_HOST:-}"
+        if [[ "${KUBE_HOST}" == *"stone-prod-p02"* ]]; then
+          KONFLUX_UI="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+        elif [[ "${KUBE_HOST}" == *"stone-prd-rh01"* ]]; then
+          KONFLUX_UI="https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
+        else
+          KONFLUX_UI=""
+        fi
+
+        if [[ -n "${KONFLUX_UI}" ]]; then
+          PIPELINE_URL="${KONFLUX_UI}/ns/${NAMESPACE}/pipelineruns/${PIPELINERUN_NAME}"
+        fi
+
+        if [[ -n "${GIT_URL}" ]]; then
+          if [[ "${GIT_URL}" == *"github.com"* ]]; then
+            [[ -n "${COMMIT_SHA}" ]] && COMMIT_URL="${GIT_URL}/commit/${COMMIT_SHA}"
+            [[ -n "${PR_NUMBER}" ]] && PR_URL="${GIT_URL}/pull/${PR_NUMBER}"
+          else
+            [[ -n "${COMMIT_SHA}" ]] && COMMIT_URL="${GIT_URL}/-/commit/${COMMIT_SHA}"
+            [[ -n "${PR_NUMBER}" ]] && PR_URL="${GIT_URL}/-/merge_requests/${PR_NUMBER}"
+          fi
+        fi
+
+        # ============================================================
+        # DETERMINE: Alert type
+        # ============================================================
+        case "${PIPELINE_STATUS}" in
+          Succeeded|Completed) ALERT_TYPE="success" ;;
+          Failed)              ALERT_TYPE="error" ;;
+          *)                   ALERT_TYPE="warning" ;;
         esac
 
-        # --- Generate notification ID ---
-        NOTIFICATION_ID="ext-$(date +%s)-${RANDOM}"
+        # ============================================================
+        # BUILD: Message body (rich, auto-generated)
+        # ============================================================
+        MSG_LINES=()
+        MSG_LINES+=("**Pipeline:** ${PIPELINE_NAME}")
+        MSG_LINES+=("**Status:** ${PIPELINE_STATUS}")
+        MSG_LINES+=("**Namespace:** ${NAMESPACE}")
+        MSG_LINES+=("**PipelineRun:** ${PIPELINERUN_NAME}")
+        [[ "${APPLICATION}" != "unknown" ]] && MSG_LINES+=("**Application:** ${APPLICATION}")
+        [[ "${COMPONENT}" != "unknown" ]] && MSG_LINES+=("**Component:** ${COMPONENT}")
+        [[ -n "${VERSION}" ]] && MSG_LINES+=("**Version:** ${VERSION}")
+        [[ "${EVENT_TYPE}" != "unknown" ]] && MSG_LINES+=("**Event:** ${EVENT_TYPE}")
+        [[ -n "${COMMIT_SHA}" ]] && MSG_LINES+=("**Commit:** ${COMMIT_SHA:0:12}")
 
-        # --- Build tags array using jq (safe handling of commas and quotes) ---
-        if [[ -n "${EXTRA_TAGS}" ]]; then
-          TAGS_JSON=$(jq -n \
-            --arg type "${NORM_TYPE}" \
-            --arg state "new" \
-            --arg notif_id "${NOTIFICATION_ID}" \
-            --arg pipeline "${PIPELINE_NAME}" \
-            --arg build_status "${BUILD_STATUS}" \
-            --arg extra "${EXTRA_TAGS}" \
-            '([
-              "service:konflux-notification-manager",
-              ("notification_type:" + $type),
-              ("state:" + $state),
-              ("notification_id:" + $notif_id),
-              ("pipeline:" + $pipeline),
-              ("build_status:" + $build_status),
-              "source:konflux-external"
-            ] + ($extra | split(",") | map(gsub("^\\s+|\\s+$"; ""))) | map(select(length > 0)))')
-        else
-          TAGS_JSON=$(jq -n \
-            --arg type "${NORM_TYPE}" \
-            --arg state "new" \
-            --arg notif_id "${NOTIFICATION_ID}" \
-            --arg pipeline "${PIPELINE_NAME}" \
-            --arg build_status "${BUILD_STATUS}" \
-            '[
-              "service:konflux-notification-manager",
-              ("notification_type:" + $type),
-              ("state:" + $state),
-              ("notification_id:" + $notif_id),
-              ("pipeline:" + $pipeline),
-              ("build_status:" + $build_status),
-              "source:konflux-external"
-            ]')
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          MSG_LINES+=("")
+          MSG_LINES+=("---")
+          MSG_LINES+=("**Failed Task:** ${FAILED_TASK}")
+          [[ -n "${FAILED_STEP}" && "${FAILED_STEP}" != "unknown" ]] && \
+            MSG_LINES+=("**Failed Step:** ${FAILED_STEP} (exit ${FAILED_EXIT_CODE}, ${FAILED_REASON})")
+          [[ -n "${LOG_SNIPPET}" ]] && MSG_LINES+=("**Log:** ${LOG_SNIPPET:0:300}")
+          [[ -n "${PR_MESSAGE}" ]] && MSG_LINES+=("**Summary:** ${PR_MESSAGE:0:300}")
         fi
 
-        # --- Build Datadog event payload (matches datadogNotifier.ts format) ---
+        MSG_LINES+=("")
+        [[ -n "${PIPELINE_URL}" ]] && MSG_LINES+=("**Pipeline UI:** ${PIPELINE_URL}")
+        [[ -n "${PR_URL}" ]] && MSG_LINES+=("**PR:** ${PR_URL}")
+        [[ -n "${COMMIT_URL}" ]] && MSG_LINES+=("**Commit URL:** ${COMMIT_URL}")
+
+        MESSAGE=$(printf '%s\n' "${MSG_LINES[@]}")
+
+        # ============================================================
+        # BUILD: Tags array
+        # ============================================================
+        FIXED_TAGS=$(jq -n \
+          --arg pipeline "${PIPELINE_NAME}" \
+          --arg pipeline_status "${PIPELINE_STATUS}" \
+          --arg namespace "${NAMESPACE}" \
+          --arg pipelinerun "${PIPELINERUN_NAME}" \
+          --arg application "${APPLICATION}" \
+          --arg component "${COMPONENT}" \
+          --arg version "${VERSION}" \
+          --arg event_type "${EVENT_TYPE}" \
+          --arg failed_task "${FAILED_TASK}" \
+          --arg failed_step "${FAILED_STEP}" \
+          '[
+            "service:cnv-tekton-pipelines",
+            "source:tekton-task",
+            ("pipeline:" + $pipeline),
+            ("pipeline_status:" + $pipeline_status),
+            ("namespace:" + $namespace),
+            ("pipelinerun:" + $pipelinerun),
+            ("application:" + $application),
+            ("component:" + $component),
+            ("version:" + $version),
+            ("event_type:" + $event_type),
+            ("failed_task:" + $failed_task),
+            ("failed_step:" + $failed_step)
+          ] | map(select(. != null and endswith(":") | not))')
+
+        # Merge pipeline params as tags (auto-discovered)
+        PARAM_TAGS_JSON="[]"
+        if [[ -n "${ALL_PARAMS_TAGS}" ]]; then
+          PARAM_TAGS_JSON=$(echo "${ALL_PARAMS_TAGS}" | jq -R '
+            split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+        fi
+
+        # Merge caller-provided extra tags
+        EXTRA_TAGS_JSON="[]"
+        if [[ -n "$(params.tags)" ]]; then
+          EXTRA_TAGS_JSON=$(echo "$(params.tags)" | jq -R '
+            split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+        fi
+
+        ALL_TAGS=$(jq -n \
+          --argjson fixed "$FIXED_TAGS" \
+          --argjson params "$PARAM_TAGS_JSON" \
+          --argjson extra "$EXTRA_TAGS_JSON" \
+          '$fixed + $params + $extra | unique')
+
+        ACTION_LOG+=("OK|Build tags ($(echo "${ALL_TAGS}" | jq length) total)|0s")
+
+        # ============================================================
+        # BUILD: Datadog event payload
+        # ============================================================
         DD_PAYLOAD=$(jq -n \
-          --arg title "[notification-manager] ${NORM_TYPE}" \
-          --arg text "${NOTIF_MESSAGE}" \
+          --arg title "[${PIPELINE_NAME}] ${PIPELINE_STATUS}" \
+          --arg text "${MESSAGE}" \
           --arg alert_type "${ALERT_TYPE}" \
-          --argjson tags "${TAGS_JSON}" \
+          --argjson tags "${ALL_TAGS}" \
           '{
             title: $title,
             text: $text,
@@ -188,36 +385,35 @@ spec:
             alert_type: $alert_type
           }')
 
+        echo ""
         echo "Datadog event payload:"
         echo "${DD_PAYLOAD}" | jq .
         echo ""
-        echo "Notification ID: ${NOTIFICATION_ID}"
-        echo "Alert Type:      ${ALERT_TYPE}"
-        echo "DD Site:         ${DD_SITE}"
-        ACTION_LOG+=("OK|Build payload|exit=0|0s")
+        echo "DD Site: ${DD_SITE}"
+        ACTION_LOG+=("OK|Build payload|0s")
 
-        # --- POST to Datadog Events API ---
-        # Suppress set -x to avoid leaking DD_API_KEY in logs
+        # ============================================================
+        # POST: Datadog Events API
+        # ============================================================
         { set +x; } 2>/dev/null
 
-        HTTP_CODE=$(curl --max-time 10 --retry 2 --retry-all-errors -s \
+        HTTP_CODE=$(curl -s --connect-timeout 5 --max-time 10 --retry 2 --retry-all-errors \
           -o /tmp/dd-response.json -w '%{http_code}' \
           -X POST "https://api.${DD_SITE}/api/v1/events" \
           -H "DD-API-KEY: ${DD_API_KEY}" \
           -H "Content-Type: application/json" \
           -d "${DD_PAYLOAD}") || HTTP_CODE="000"
 
-        # Restore set -x if debug is enabled
         if [[ "$(params.debug)" == "true" ]]; then set -x; fi
 
         if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
-          echo "Datadog event sent successfully (HTTP ${HTTP_CODE})"
+          echo "Datadog event sent (HTTP ${HTTP_CODE})"
           echo "Response: $(cat /tmp/dd-response.json 2>/dev/null)"
-          ACTION_LOG+=("OK|POST to Datadog|exit=0|0s")
+          ACTION_LOG+=("OK|POST to Datadog|HTTP ${HTTP_CODE}")
           FINAL_EXIT_CODE=0
         else
-          echo "ERROR: Datadog event failed (HTTP ${HTTP_CODE})"
+          echo "WARN: Datadog event failed (HTTP ${HTTP_CODE}). Non-blocking."
           echo "Response: $(cat /tmp/dd-response.json 2>/dev/null || echo 'no response')"
-          ACTION_LOG+=("FAILED|POST to Datadog|exit=1|0s")
-          FINAL_EXIT_CODE=1
+          ACTION_LOG+=("FAILED|POST to Datadog|HTTP ${HTTP_CODE}")
+          FINAL_EXIT_CODE=0
         fi

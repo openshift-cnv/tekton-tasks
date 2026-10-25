@@ -9,6 +9,8 @@
 # 6. [Gotcha]: kubectl introspection is conditional (only on failure) and wrapped in
 #    error handling — RBAC or API failures fall back to "unknown", never block.
 # 7. [Pattern]: Resilient Execution Layer (ACTION_LOG, trap, execution_summary).
+# 8. [Security]: ALL params passed via env: bindings — never via Tekton textual
+#    substitution in script: — to prevent shell injection from untrusted values.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -55,6 +57,18 @@ spec:
       onError: continue
       image: quay.io/konflux-ci/release-service-utils@sha256:3e3b9f5ce4b4575997573ff2728c95b671b9902847934b64f6bc8f979bf01cde
       env:
+        - name: PIPELINE_NAME
+          value: $(params.pipeline-name)
+        - name: PIPELINE_STATUS
+          value: $(params.pipeline-status)
+        - name: PIPELINERUN_NAME
+          value: $(params.pipelinerun-name)
+        - name: NAMESPACE
+          value: $(params.namespace)
+        - name: EXTRA_TAGS
+          value: $(params.tags)
+        - name: DEBUG
+          value: $(params.debug)
         - name: DD_API_KEY
           valueFrom:
             secretKeyRef:
@@ -77,7 +91,7 @@ spec:
         declare -a ACTION_LOG=()
         FINAL_EXIT_CODE=0
 
-        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+        if [[ "${DEBUG}" == "true" ]]; then set -x; fi
 
         exec_action() {
           local name="$1"; shift
@@ -119,12 +133,8 @@ spec:
         trap execution_summary EXIT
 
         # ============================================================
-        # CONSTANTS
+        # CONSTANTS (all from env: bindings, never Tekton substitution)
         # ============================================================
-        PIPELINE_NAME="$(params.pipeline-name)"
-        PIPELINE_STATUS="$(params.pipeline-status)"
-        PIPELINERUN_NAME="$(params.pipelinerun-name)"
-        NAMESPACE="$(params.namespace)"
         DD_SITE="${DD_SITE:-datadoghq.eu}"
 
         echo "=== Datadog Notification ==="
@@ -132,17 +142,6 @@ spec:
         echo "PIPELINE_STATUS --> ${PIPELINE_STATUS}"
         echo "PIPELINERUN     --> ${PIPELINERUN_NAME}"
         echo "NAMESPACE       --> ${NAMESPACE}"
-
-        # ============================================================
-        # GATE: DD_API_KEY
-        # ============================================================
-        if [[ -z "${DD_API_KEY:+set}" ]]; then
-          echo "WARN: DD_API_KEY not set (datadog-credentials Secret missing). Skipping."
-          ACTION_LOG+=("OK|Skip - no DD_API_KEY|0s")
-          FINAL_EXIT_CODE=0
-          exit 0
-        fi
-        ACTION_LOG+=("OK|DD_API_KEY present|0s")
 
         # ============================================================
         # AUTO-DISCOVER: PipelineRun metadata
@@ -357,8 +356,8 @@ spec:
 
         # Merge caller-provided extra tags
         EXTRA_TAGS_JSON="[]"
-        if [[ -n "$(params.tags)" ]]; then
-          EXTRA_TAGS_JSON=$(echo "$(params.tags)" | jq -R '
+        if [[ -n "${EXTRA_TAGS}" ]]; then
+          EXTRA_TAGS_JSON=$(echo "${EXTRA_TAGS}" | jq -R '
             split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
         fi
 
@@ -393,8 +392,15 @@ spec:
         ACTION_LOG+=("OK|Build payload|0s")
 
         # ============================================================
-        # POST: Datadog Events API
+        # POST: Datadog Events API (gate on DD_API_KEY here, not earlier)
         # ============================================================
+        if [[ -z "${DD_API_KEY:+set}" ]]; then
+          echo "WARN: DD_API_KEY not set (datadog-credentials Secret missing). Skipping POST."
+          ACTION_LOG+=("OK|Skip POST - no DD_API_KEY|0s")
+          FINAL_EXIT_CODE=0
+          exit 0
+        fi
+
         { set +x; } 2>/dev/null
 
         HTTP_CODE=$(curl -s --connect-timeout 5 --max-time 10 --retry 2 --retry-all-errors \
@@ -404,7 +410,7 @@ spec:
           -H "Content-Type: application/json" \
           -d "${DD_PAYLOAD}") || HTTP_CODE="000"
 
-        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+        if [[ "${DEBUG}" == "true" ]]; then set -x; fi
 
         if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
           echo "Datadog event sent (HTTP ${HTTP_CODE})"

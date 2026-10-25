@@ -2,7 +2,7 @@
 # @ai-rules:
 # 1. [Purpose]: Universal Datadog notification Task for all CNV Tekton pipelines.
 # 2. [Pattern]: Auto-discovers context from PipelineRun/TaskRun objects via kubectl.
-#    Callers pass only 4 required params + optional extra tags.
+#    Callers pass only 4 required params + optional extras (tags, UI URL, debug).
 # 3. [Constraint]: Non-fatal by design — onError: continue + FINAL_EXIT_CODE=0 on any failure.
 # 4. [Gotcha]: datadog-credentials Secret is optional — Task exits 0 if missing.
 # 5. [Gotcha]: set -x is suppressed around curl to avoid leaking DD_API_KEY in logs.
@@ -48,6 +48,10 @@ spec:
       type: string
       default: ""
       description: "Comma-separated key:value pairs for domain-specific tags (e.g. channel:stable,epic:CNV-1234)"
+    - name: konflux-ui-url
+      type: string
+      default: ""
+      description: "Konflux UI base URL override (e.g. https://konflux-ui.apps.stone-prod-p02...). Auto-detected from namespace when empty."
     - name: debug
       type: string
       default: "false"
@@ -67,6 +71,8 @@ spec:
           value: $(params.namespace)
         - name: EXTRA_TAGS
           value: $(params.tags)
+        - name: KONFLUX_UI_OVERRIDE
+          value: $(params.konflux-ui-url)
         - name: DEBUG
           value: $(params.debug)
         - name: DD_API_KEY
@@ -267,13 +273,15 @@ spec:
         PR_URL=""
         COMMIT_URL=""
 
-        # M3: KUBERNETES_SERVICE_HOST is ClusterIP (172.30.0.1), not the API hostname.
-        # Derive Konflux UI from namespace naming convention instead.
-        KONFLUX_UI=""
-        if [[ "${NAMESPACE}" == *"-openshift-virtualization-tenant" ]]; then
-          KONFLUX_UI="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
-        elif [[ "${NAMESPACE}" == "cnv-fbc-tenant" || "${NAMESPACE}" == *"cnv-fbc"* ]]; then
-          KONFLUX_UI="https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
+        # Konflux UI: explicit override > namespace-pattern fallback
+        KONFLUX_UI="${KONFLUX_UI_OVERRIDE:-}"
+        if [[ -z "${KONFLUX_UI}" ]]; then
+          # Fallback: derive from namespace naming convention
+          if [[ "${NAMESPACE}" == *"-openshift-virtualization-tenant" ]]; then
+            KONFLUX_UI="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+          elif [[ "${NAMESPACE}" == "cnv-fbc-tenant" || "${NAMESPACE}" == *"cnv-fbc"* ]]; then
+            KONFLUX_UI="https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
+          fi
         fi
 
         if [[ -n "${KONFLUX_UI}" ]]; then

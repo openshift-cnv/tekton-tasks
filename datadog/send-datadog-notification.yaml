@@ -154,12 +154,16 @@ spec:
         GIT_URL=""
         PR_MESSAGE=""
         VERSION=""
-        ALL_PARAMS_TAGS=""
+        PARAM_TAGS_JSON="[]"
 
         discover_pipelinerun_metadata() {
+          # M5: suppress set -x around JSON-heavy kubectl to avoid 34K-line log dumps
+          { local _xtrace; [[ $- == *x* ]] && _xtrace=1 || _xtrace=0; set +x; } 2>/dev/null
+
           local PR_DATA
+          # M2: add --request-timeout to prevent indefinite hangs
           PR_DATA=$(kubectl get pipelinerun "${PIPELINERUN_NAME}" \
-            -n "${NAMESPACE}" -o json 2>/dev/null) || return 1
+            -n "${NAMESPACE}" --request-timeout=15s -o json 2>/dev/null) || { [[ $_xtrace == 1 ]] && set -x; return 1; }
 
           APPLICATION=$(echo "${PR_DATA}" | jq -r '
             .metadata.labels["appstudio.openshift.io/application"] // "unknown"')
@@ -178,12 +182,15 @@ spec:
           PR_MESSAGE=$(echo "${PR_DATA}" | jq -r '
             [.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""')
 
-          ALL_PARAMS_TAGS=$(echo "${PR_DATA}" | jq -r '
+          # M4: emit JSON array directly — avoids comma-in-value corruption
+          # M5: expanded denylist (credentials, pat, dockerconfig)
+          PARAM_TAGS_JSON=$(echo "${PR_DATA}" | jq -c '
             [.spec.params[]? |
              select(.value | type == "string") |
-             select(.name | test("secret|token|key|password|auth"; "i") | not) |
-             "param_\(.name):\(.value | if length > 100 then .[:100] + "…" else . end)"] |
-            join(",")')
+             select(.name | test("secret|token|key|password|auth|credentials|pat|dockerconfig"; "i") | not) |
+             "param_\(.name):\(.value | gsub("[\\n\\r,]"; "_") | if length > 100 then .[:100] + "…" else . end)"]')
+
+          [[ $_xtrace == 1 ]] && set -x
 
           echo "APPLICATION     --> ${APPLICATION}"
           echo "COMPONENT       --> ${COMPONENT}"
@@ -209,10 +216,12 @@ spec:
         LOG_SNIPPET=""
 
         discover_failure_details() {
+          { local _xtrace; [[ $- == *x* ]] && _xtrace=1 || _xtrace=0; set +x; } 2>/dev/null
+
           local TASK_DATA
           TASK_DATA=$(kubectl get taskrun -n "${NAMESPACE}" \
             -l "tekton.dev/pipelineRun=${PIPELINERUN_NAME}" \
-            -o json 2>/dev/null) || return 1
+            --request-timeout=15s -o json 2>/dev/null) || { [[ $_xtrace == 1 ]] && set -x; return 1; }
 
           local FAILED_DATA
           FAILED_DATA=$(echo "${TASK_DATA}" | jq '
@@ -227,13 +236,16 @@ spec:
                reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown")
              }]')
 
+          # L2: deduplicate matrix tasks (apply-release,apply-release → apply-release)
           FAILED_TASK=$(echo "${FAILED_DATA}" | jq -r '
-            [.[].task] | map(select(. != null)) | join(",") // "unknown"')
+            [.[].task] | map(select(. != null)) | unique | join(",") // "unknown"')
           FAILED_STEP=$(echo "${FAILED_DATA}" | jq -r '.[0].step // "unknown"')
           FAILED_EXIT_CODE=$(echo "${FAILED_DATA}" | jq -r '.[0].exit_code // "?"')
           FAILED_REASON=$(echo "${FAILED_DATA}" | jq -r '.[0].reason // "unknown"')
 
           LOG_SNIPPET=$(echo "${FAILED_DATA}" | jq -r '.[0].message // ""' | head -c 500)
+
+          [[ $_xtrace == 1 ]] && set -x
 
           echo "FAILED_TASK     --> ${FAILED_TASK}"
           echo "FAILED_STEP     --> ${FAILED_STEP}"
@@ -255,13 +267,13 @@ spec:
         PR_URL=""
         COMMIT_URL=""
 
-        KUBE_HOST="${KUBERNETES_SERVICE_HOST:-}"
-        if [[ "${KUBE_HOST}" == *"stone-prod-p02"* ]]; then
+        # M3: KUBERNETES_SERVICE_HOST is ClusterIP (172.30.0.1), not the API hostname.
+        # Derive Konflux UI from namespace naming convention instead.
+        KONFLUX_UI=""
+        if [[ "${NAMESPACE}" == *"-openshift-virtualization-tenant" ]]; then
           KONFLUX_UI="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
-        elif [[ "${KUBE_HOST}" == *"stone-prd-rh01"* ]]; then
+        elif [[ "${NAMESPACE}" == "cnv-fbc-tenant" || "${NAMESPACE}" == *"cnv-fbc"* ]]; then
           KONFLUX_UI="https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
-        else
-          KONFLUX_UI=""
         fi
 
         if [[ -n "${KONFLUX_UI}" ]]; then
@@ -347,12 +359,8 @@ spec:
             ("failed_step:" + $failed_step)
           ] | map(select(. != null and endswith(":") | not))')
 
-        # Merge pipeline params as tags (auto-discovered)
-        PARAM_TAGS_JSON="[]"
-        if [[ -n "${ALL_PARAMS_TAGS}" ]]; then
-          PARAM_TAGS_JSON=$(echo "${ALL_PARAMS_TAGS}" | jq -R '
-            split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
-        fi
+        # PARAM_TAGS_JSON is set as a JSON array in discover_pipelinerun_metadata()
+        # (no comma split/join — M4 fix for values containing commas)
 
         # Merge caller-provided extra tags
         EXTRA_TAGS_JSON="[]"

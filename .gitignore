@@ -1,3 +1,2 @@
-.cursor/plans/*pipelines/run-cnv-smoke-tests/pipeline.yaml.bak
-pipelines/run-cnv-smoke-tests/pipeline.yaml.new-changes-bak
+.cursor/plans/*
 *.bak

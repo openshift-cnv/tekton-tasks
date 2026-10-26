@@ -264,8 +264,8 @@ spec:
           fi
         fi
 
-        if [[ -n "${KONFLUX_UI}" ]]; then
-          PIPELINE_URL="${KONFLUX_UI}/ns/${NAMESPACE}/pipelineruns/${PIPELINERUN_NAME}"
+        if [[ -n "${KONFLUX_UI}" && "${APPLICATION}" != "unknown" ]]; then
+          PIPELINE_URL="${KONFLUX_UI}/ns/${NAMESPACE}/applications/${APPLICATION}/pipelineruns/${PIPELINERUN_NAME}"
         fi
 
         if [[ -n "${GIT_URL}" ]]; then

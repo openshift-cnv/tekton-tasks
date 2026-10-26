@@ -166,6 +166,15 @@ spec:
           # M5: suppress set -x around JSON-heavy kubectl to avoid log dumps
           { local _xtrace; [[ $- == *x* ]] && _xtrace=1 || _xtrace=0; set +x; } 2>/dev/null
 
+          # Diagnostic: verify in-cluster config is available
+          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-<unset>}"
+          echo "KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-<unset>}"
+          if [[ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]]; then
+            echo "SA token: present ($(wc -c < /var/run/secrets/kubernetes.io/serviceaccount/token) bytes)"
+          else
+            echo "SA token: MISSING — kubectl will fall back to localhost:8080"
+          fi
+
           local PR_DATA
           # M2: add --request-timeout to prevent indefinite hangs
           PR_DATA=$(kubectl get pipelinerun "${PIPELINERUN_NAME}" \

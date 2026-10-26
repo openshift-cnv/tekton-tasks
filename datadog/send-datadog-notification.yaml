@@ -163,13 +163,16 @@ spec:
         PARAM_TAGS_JSON="[]"
 
         discover_pipelinerun_metadata() {
-          # M5: suppress set -x around JSON-heavy kubectl to avoid 34K-line log dumps
+          # M5: suppress set -x around JSON-heavy kubectl to avoid log dumps
           { local _xtrace; [[ $- == *x* ]] && _xtrace=1 || _xtrace=0; set +x; } 2>/dev/null
 
           local PR_DATA
           # M2: add --request-timeout to prevent indefinite hangs
           PR_DATA=$(kubectl get pipelinerun "${PIPELINERUN_NAME}" \
-            -n "${NAMESPACE}" --request-timeout=15s -o json 2>/dev/null) || { [[ $_xtrace == 1 ]] && set -x; return 1; }
+            -n "${NAMESPACE}" --request-timeout=15s -o json 2>/tmp/kubectl-pr-err.log) || {
+            echo "WARN: kubectl get pipelinerun failed (exit $?): $(cat /tmp/kubectl-pr-err.log 2>/dev/null)"
+            [[ $_xtrace == 1 ]] && set -x; return 1
+          }
 
           APPLICATION=$(echo "${PR_DATA}" | jq -r '
             .metadata.labels["appstudio.openshift.io/application"] // "unknown"')
@@ -227,7 +230,10 @@ spec:
           local TASK_DATA
           TASK_DATA=$(kubectl get taskrun -n "${NAMESPACE}" \
             -l "tekton.dev/pipelineRun=${PIPELINERUN_NAME}" \
-            --request-timeout=15s -o json 2>/dev/null) || { [[ $_xtrace == 1 ]] && set -x; return 1; }
+            --request-timeout=15s -o json 2>/tmp/kubectl-tr-err.log) || {
+            echo "WARN: kubectl get taskrun failed (exit $?): $(cat /tmp/kubectl-tr-err.log 2>/dev/null)"
+            [[ $_xtrace == 1 ]] && set -x; return 1
+          }
 
           local FAILED_DATA
           FAILED_DATA=$(echo "${TASK_DATA}" | jq '

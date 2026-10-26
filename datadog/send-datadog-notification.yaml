@@ -2,16 +2,13 @@
 # @ai-rules:
 # 1. [Purpose]: Universal Datadog notification Task for all CNV Tekton pipelines.
 # 2. [Pattern]: Auto-discovers context from PipelineRun/TaskRun objects via kubectl.
-#    Callers pass only 4 required params + optional extras (tags, UI URL, debug).
+#    Callers pass only 4 required params + optional extra tags.
 # 3. [Constraint]: Non-fatal by design — onError: continue + FINAL_EXIT_CODE=0 on any failure.
 # 4. [Gotcha]: datadog-credentials Secret is optional — Task exits 0 if missing.
 # 5. [Gotcha]: set -x is suppressed around curl to avoid leaking DD_API_KEY in logs.
 # 6. [Gotcha]: kubectl introspection is conditional (only on failure) and wrapped in
 #    error handling — RBAC or API failures fall back to "unknown", never block.
 # 7. [Pattern]: Resilient Execution Layer (ACTION_LOG, trap, execution_summary).
-# 8. [Safety]: Param values are Tekton-generated or hardcoded in pipeline defs
-#    ($(tasks.status), $(context.pipelineRun.name), etc.) — all trusted sources.
-#    Secrets (DD_API_KEY, DD_SITE) use env: secretKeyRef to avoid script exposure.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -52,7 +49,7 @@ spec:
     - name: konflux-ui-url
       type: string
       default: ""
-      description: "Konflux UI base URL override (e.g. https://konflux-ui.apps.stone-prod-p02...). Auto-detected from namespace when empty."
+      description: "Konflux UI base URL override. Auto-detected from namespace when empty."
     - name: debug
       type: string
       default: "false"
@@ -83,6 +80,8 @@ spec:
         SCRIPT_START=$(date +%s)
         declare -a ACTION_LOG=()
         FINAL_EXIT_CODE=0
+
+        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
 
         exec_action() {
           local name="$1"; shift
@@ -124,20 +123,14 @@ spec:
         trap execution_summary EXIT
 
         # ============================================================
-        # CONSTANTS — Tekton substitutes param refs before bash runs.
-        # All values are trusted: Tekton-generated or hardcoded in pipeline defs.
-        # DD_API_KEY and DD_SITE come from env: secretKeyRef (cannot be in script).
+        # CONSTANTS
         # ============================================================
         PIPELINE_NAME="$(params.pipeline-name)"
         PIPELINE_STATUS="$(params.pipeline-status)"
         PIPELINERUN_NAME="$(params.pipelinerun-name)"
         NAMESPACE="$(params.namespace)"
-        EXTRA_TAGS="$(params.tags)"
         KONFLUX_UI_OVERRIDE="$(params.konflux-ui-url)"
-        DEBUG="$(params.debug)"
         DD_SITE="${DD_SITE:-datadoghq.eu}"
-
-        if [[ "${DEBUG}" == "true" ]]; then set -x; fi
 
         echo "=== Datadog Notification ==="
         echo "PIPELINE        --> ${PIPELINE_NAME}"
@@ -156,28 +149,12 @@ spec:
         GIT_URL=""
         PR_MESSAGE=""
         VERSION=""
-        PARAM_TAGS_JSON="[]"
+        ALL_PARAMS_TAGS=""
 
         discover_pipelinerun_metadata() {
-          # M5: suppress set -x around JSON-heavy kubectl to avoid log dumps
-          { local _xtrace; [[ $- == *x* ]] && _xtrace=1 || _xtrace=0; set +x; } 2>/dev/null
-
-          # Diagnostic: verify in-cluster config is available
-          echo "KUBERNETES_SERVICE_HOST=${KUBERNETES_SERVICE_HOST:-<unset>}"
-          echo "KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-<unset>}"
-          if [[ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]]; then
-            echo "SA token: present ($(wc -c < /var/run/secrets/kubernetes.io/serviceaccount/token) bytes)"
-          else
-            echo "SA token: MISSING — kubectl will fall back to localhost:8080"
-          fi
-
           local PR_DATA
-          # M2: add --request-timeout to prevent indefinite hangs
           PR_DATA=$(kubectl get pipelinerun "${PIPELINERUN_NAME}" \
-            -n "${NAMESPACE}" --request-timeout=15s -o json 2>/tmp/kubectl-pr-err.log) || {
-            echo "WARN: kubectl get pipelinerun failed (exit $?): $(cat /tmp/kubectl-pr-err.log 2>/dev/null)"
-            [[ $_xtrace == 1 ]] && set -x; return 1
-          }
+            -n "${NAMESPACE}" -o json 2>/dev/null) || return 1
 
           APPLICATION=$(echo "${PR_DATA}" | jq -r '
             .metadata.labels["appstudio.openshift.io/application"] // "unknown"')
@@ -196,15 +173,12 @@ spec:
           PR_MESSAGE=$(echo "${PR_DATA}" | jq -r '
             [.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""')
 
-          # M4: emit JSON array directly — avoids comma-in-value corruption
-          # M5: expanded denylist (credentials, pat, dockerconfig)
-          PARAM_TAGS_JSON=$(echo "${PR_DATA}" | jq -c '
+          ALL_PARAMS_TAGS=$(echo "${PR_DATA}" | jq -r '
             [.spec.params[]? |
              select(.value | type == "string") |
-             select(.name | test("secret|token|key|password|auth|credentials|pat|dockerconfig"; "i") | not) |
-             "param_\(.name):\(.value | gsub("[\\n\\r,]"; "_") | if length > 100 then .[:100] + "…" else . end)"]')
-
-          [[ $_xtrace == 1 ]] && set -x
+             select(.name | test("secret|token|key|password|auth"; "i") | not) |
+             "param_\(.name):\(.value | if length > 100 then .[:100] + "…" else . end)"] |
+            join(",")')
 
           echo "APPLICATION     --> ${APPLICATION}"
           echo "COMPONENT       --> ${COMPONENT}"
@@ -230,15 +204,10 @@ spec:
         LOG_SNIPPET=""
 
         discover_failure_details() {
-          { local _xtrace; [[ $- == *x* ]] && _xtrace=1 || _xtrace=0; set +x; } 2>/dev/null
-
           local TASK_DATA
           TASK_DATA=$(kubectl get taskrun -n "${NAMESPACE}" \
             -l "tekton.dev/pipelineRun=${PIPELINERUN_NAME}" \
-            --request-timeout=15s -o json 2>/tmp/kubectl-tr-err.log) || {
-            echo "WARN: kubectl get taskrun failed (exit $?): $(cat /tmp/kubectl-tr-err.log 2>/dev/null)"
-            [[ $_xtrace == 1 ]] && set -x; return 1
-          }
+            -o json 2>/dev/null) || return 1
 
           local FAILED_DATA
           FAILED_DATA=$(echo "${TASK_DATA}" | jq '
@@ -253,16 +222,13 @@ spec:
                reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown")
              }]')
 
-          # L2: deduplicate matrix tasks (apply-release,apply-release → apply-release)
           FAILED_TASK=$(echo "${FAILED_DATA}" | jq -r '
-            [.[].task] | map(select(. != null)) | unique | join(",") // "unknown"')
+            [.[].task] | map(select(. != null)) | join(",") // "unknown"')
           FAILED_STEP=$(echo "${FAILED_DATA}" | jq -r '.[0].step // "unknown"')
           FAILED_EXIT_CODE=$(echo "${FAILED_DATA}" | jq -r '.[0].exit_code // "?"')
           FAILED_REASON=$(echo "${FAILED_DATA}" | jq -r '.[0].reason // "unknown"')
 
           LOG_SNIPPET=$(echo "${FAILED_DATA}" | jq -r '.[0].message // ""' | head -c 500)
-
-          [[ $_xtrace == 1 ]] && set -x
 
           echo "FAILED_TASK     --> ${FAILED_TASK}"
           echo "FAILED_STEP     --> ${FAILED_STEP}"
@@ -284,10 +250,8 @@ spec:
         PR_URL=""
         COMMIT_URL=""
 
-        # Konflux UI: explicit override > namespace-pattern fallback
         KONFLUX_UI="${KONFLUX_UI_OVERRIDE:-}"
         if [[ -z "${KONFLUX_UI}" ]]; then
-          # Fallback: derive from namespace naming convention
           if [[ "${NAMESPACE}" == *"-openshift-virtualization-tenant" ]]; then
             KONFLUX_UI="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
           elif [[ "${NAMESPACE}" == "cnv-fbc-tenant" || "${NAMESPACE}" == *"cnv-fbc"* ]]; then
@@ -378,13 +342,17 @@ spec:
             ("failed_step:" + $failed_step)
           ] | map(select(. != null and endswith(":") | not))')
 
-        # PARAM_TAGS_JSON is set as a JSON array in discover_pipelinerun_metadata()
-        # (no comma split/join — M4 fix for values containing commas)
+        # Merge pipeline params as tags (auto-discovered)
+        PARAM_TAGS_JSON="[]"
+        if [[ -n "${ALL_PARAMS_TAGS}" ]]; then
+          PARAM_TAGS_JSON=$(echo "${ALL_PARAMS_TAGS}" | jq -R '
+            split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+        fi
 
         # Merge caller-provided extra tags
         EXTRA_TAGS_JSON="[]"
-        if [[ -n "${EXTRA_TAGS}" ]]; then
-          EXTRA_TAGS_JSON=$(echo "${EXTRA_TAGS}" | jq -R '
+        if [[ -n "$(params.tags)" ]]; then
+          EXTRA_TAGS_JSON=$(echo "$(params.tags)" | jq -R '
             split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
         fi
 
@@ -419,7 +387,7 @@ spec:
         ACTION_LOG+=("OK|Build payload|0s")
 
         # ============================================================
-        # POST: Datadog Events API (gate on DD_API_KEY here, not earlier)
+        # POST: Datadog Events API
         # ============================================================
         if [[ -z "${DD_API_KEY:+set}" ]]; then
           echo "WARN: DD_API_KEY not set (datadog-credentials Secret missing). Skipping POST."

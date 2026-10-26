@@ -370,20 +370,18 @@ spec:
               echo "╚═════════════════════════════════════════"
   finally:
     - name: notify-datadog
-      timeout: "2m"
+      timeout: "5m"
       params:
-        - name: type
-          value: $(tasks.get-info.status)
-        - name: message
-          value: "[FBC-POST-RELEASE] $(tasks.get-info.status) | App: $(tasks.get-info.results.application) | Component: $(tasks.get-info.results.component) | Bundle: $(tasks.get-info.results.hco-bundle-version) | CNV: $(params.cnv_version) | Env: $(params.environment) | Channel: $(tasks.get-info.results.channel) | Release: $(tasks.get-info.results.release-name) | Konflux: https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com/ns/$(context.pipelineRun.namespace)/applications/$(tasks.get-info.results.application)/pipelineruns/$(context.pipelineRun.name)?releaseName=$(tasks.get-info.results.release-name)"
         - name: pipeline-name
           value: "fbc-post-release"
-        - name: build-status
-          value: $(tasks.get-info.status)
+        - name: pipeline-status
+          value: $(tasks.status)
+        - name: pipelinerun-name
+          value: $(context.pipelineRun.name)
+        - name: namespace
+          value: $(context.pipelineRun.namespace)
         - name: tags
-          value: "pipeline:fbc-post-release,hco_bundle_version:$(tasks.get-info.results.hco-bundle-version),application:$(tasks.get-info.results.application),component:$(tasks.get-info.results.component),cnv_version:$(params.cnv_version),environment:$(params.environment),channel:$(tasks.get-info.results.channel),release_name:$(tasks.get-info.results.release-name),release_failed:$(tasks.get-info.results.release-failed),snapshot:$(params.snapshot),pipelinerun:$(context.pipelineRun.name),namespace:$(context.pipelineRun.namespace)"
-        - name: debug
-          value: "false"
+          value: "application:$(tasks.get-info.results.application),component:$(tasks.get-info.results.component),hco_bundle_version:$(tasks.get-info.results.hco-bundle-version),cnv_version:$(params.cnv_version),environment:$(params.environment),channel:$(tasks.get-info.results.channel),release_name:$(tasks.get-info.results.release-name),release_failed:$(tasks.get-info.results.release-failed),snapshot:$(params.snapshot)"
       taskRef:
         resolver: git
         params:

@@ -862,18 +862,18 @@ spec:
               FINAL_EXIT_CODE=0
   finally:
     - name: notify-datadog
-      timeout: "2m"
+      timeout: "5m"
       params:
-        - name: type
-          value: $(tasks.update-bundle.status)
-        - name: message
-          value: "[UPDATE-BUNDLE] $(tasks.update-bundle.status) | App: $(tasks.update-bundle.results.application) | Bundle: $(tasks.update-bundle.results.bundle-version) | Snapshot: $(params.snapshot) | Konflux: https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com/ns/$(context.pipelineRun.namespace)/pipelineruns/$(context.pipelineRun.name)"
         - name: pipeline-name
           value: "update-bundle"
-        - name: build-status
-          value: $(tasks.update-bundle.status)
+        - name: pipeline-status
+          value: $(tasks.status)
+        - name: pipelinerun-name
+          value: $(context.pipelineRun.name)
+        - name: namespace
+          value: $(context.pipelineRun.namespace)
         - name: tags
-          value: "bundle_version:$(tasks.update-bundle.results.bundle-version),application:$(tasks.update-bundle.results.application),snapshot:$(params.snapshot),pipelinerun:$(context.pipelineRun.name),namespace:$(context.pipelineRun.namespace)"
+          value: "application:$(tasks.update-bundle.results.application),component:hco-bundle-registry,bundle_version:$(tasks.update-bundle.results.bundle-version),snapshot:$(params.snapshot)"
         - name: debug
           value: $(params.debug)
       taskRef:

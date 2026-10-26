@@ -124,7 +124,7 @@ spec:
         trap execution_summary EXIT
 
         # ============================================================
-        # CONSTANTS — Tekton substitutes $(params.*) before bash runs.
+        # CONSTANTS — Tekton substitutes param refs before bash runs.
         # All values are trusted: Tekton-generated or hardcoded in pipeline defs.
         # DD_API_KEY and DD_SITE come from env: secretKeyRef (cannot be in script).
         # ============================================================

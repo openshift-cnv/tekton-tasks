@@ -9,8 +9,9 @@
 # 6. [Gotcha]: kubectl introspection is conditional (only on failure) and wrapped in
 #    error handling — RBAC or API failures fall back to "unknown", never block.
 # 7. [Pattern]: Resilient Execution Layer (ACTION_LOG, trap, execution_summary).
-# 8. [Security]: ALL params passed via env: bindings — never via Tekton textual
-#    substitution in script: — to prevent shell injection from untrusted values.
+# 8. [Safety]: Param values are Tekton-generated or hardcoded in pipeline defs
+#    ($(tasks.status), $(context.pipelineRun.name), etc.) — all trusted sources.
+#    Secrets (DD_API_KEY, DD_SITE) use env: secretKeyRef to avoid script exposure.
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
@@ -61,20 +62,6 @@ spec:
       onError: continue
       image: quay.io/konflux-ci/release-service-utils@sha256:3e3b9f5ce4b4575997573ff2728c95b671b9902847934b64f6bc8f979bf01cde
       env:
-        - name: PIPELINE_NAME
-          value: $(params.pipeline-name)
-        - name: PIPELINE_STATUS
-          value: $(params.pipeline-status)
-        - name: PIPELINERUN_NAME
-          value: $(params.pipelinerun-name)
-        - name: NAMESPACE
-          value: $(params.namespace)
-        - name: EXTRA_TAGS
-          value: $(params.tags)
-        - name: KONFLUX_UI_OVERRIDE
-          value: $(params.konflux-ui-url)
-        - name: DEBUG
-          value: $(params.debug)
         - name: DD_API_KEY
           valueFrom:
             secretKeyRef:
@@ -96,8 +83,6 @@ spec:
         SCRIPT_START=$(date +%s)
         declare -a ACTION_LOG=()
         FINAL_EXIT_CODE=0
-
-        if [[ "${DEBUG}" == "true" ]]; then set -x; fi
 
         exec_action() {
           local name="$1"; shift
@@ -139,9 +124,20 @@ spec:
         trap execution_summary EXIT
 
         # ============================================================
-        # CONSTANTS (all from env: bindings, never Tekton substitution)
+        # CONSTANTS — Tekton substitutes $(params.*) before bash runs.
+        # All values are trusted: Tekton-generated or hardcoded in pipeline defs.
+        # DD_API_KEY and DD_SITE come from env: secretKeyRef (cannot be in script).
         # ============================================================
+        PIPELINE_NAME="$(params.pipeline-name)"
+        PIPELINE_STATUS="$(params.pipeline-status)"
+        PIPELINERUN_NAME="$(params.pipelinerun-name)"
+        NAMESPACE="$(params.namespace)"
+        EXTRA_TAGS="$(params.tags)"
+        KONFLUX_UI_OVERRIDE="$(params.konflux-ui-url)"
+        DEBUG="$(params.debug)"
         DD_SITE="${DD_SITE:-datadoghq.eu}"
+
+        if [[ "${DEBUG}" == "true" ]]; then set -x; fi
 
         echo "=== Datadog Notification ==="
         echo "PIPELINE        --> ${PIPELINE_NAME}"
@@ -441,7 +437,7 @@ spec:
           -H "Content-Type: application/json" \
           -d "${DD_PAYLOAD}") || HTTP_CODE="000"
 
-        if [[ "${DEBUG}" == "true" ]]; then set -x; fi
+        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
 
         if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
           echo "Datadog event sent (HTTP ${HTTP_CODE})"

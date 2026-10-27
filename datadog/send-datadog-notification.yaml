@@ -258,6 +258,16 @@ spec:
           fi
         }
 
+        # Explicit API server config for kubectl — some namespaces omit
+        # KUBERNETES_SERVICE_HOST/PORT env vars (enableServiceLinks: false).
+        # Same pattern as comment-pr-failure task.
+        kctl() {
+          kubectl --server="https://kubernetes.default.svc" \
+            --certificate-authority="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" \
+            --token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)" \
+            "$@"
+        }
+
         # Best-effort log fetch from the failed step's pod/container
         fetch_failure_logs() {
           if [[ -z "${FAILED_POD}" ]]; then
@@ -271,24 +281,32 @@ spec:
 
           echo "LOG_FETCH       --> pod=${FAILED_POD} container=${FAILED_CONTAINER}"
 
-          local LOG_OUTPUT=""
+          local LOG_OUTPUT="" LOG_ERR=""
           # Try step-<name> (Tekton container naming convention)
-          LOG_OUTPUT=$(kubectl logs "${FAILED_POD}" -n "${NAMESPACE}" \
-            -c "${FAILED_CONTAINER}" --tail=50 --request-timeout=10s 2>/dev/null || true)
+          LOG_ERR=$(kctl logs "${FAILED_POD}" -n "${NAMESPACE}" \
+            -c "${FAILED_CONTAINER}" --tail=50 --request-timeout=10s \
+            2>&1 >/tmp/kctl-logs.out || true)
+          LOG_OUTPUT=$(cat /tmp/kctl-logs.out 2>/dev/null)
 
-          # Fallback: try raw step name without prefix
           if [[ -z "${LOG_OUTPUT}" ]]; then
+            [[ -n "${LOG_ERR}" ]] && echo "LOG_FETCH       --> step-build err: ${LOG_ERR:0:200}"
+            # Fallback: try raw step name without prefix
             echo "LOG_FETCH       --> fallback to container=${FAILED_STEP}"
-            LOG_OUTPUT=$(kubectl logs "${FAILED_POD}" -n "${NAMESPACE}" \
-              -c "${FAILED_STEP}" --tail=50 --request-timeout=10s 2>/dev/null || true)
+            LOG_ERR=$(kctl logs "${FAILED_POD}" -n "${NAMESPACE}" \
+              -c "${FAILED_STEP}" --tail=50 --request-timeout=10s \
+              2>&1 >/tmp/kctl-logs.out || true)
+            LOG_OUTPUT=$(cat /tmp/kctl-logs.out 2>/dev/null)
+            [[ -z "${LOG_OUTPUT}" && -n "${LOG_ERR}" ]] && \
+              echo "LOG_FETCH       --> fallback err: ${LOG_ERR:0:200}"
           fi
 
           if [[ -n "${LOG_OUTPUT}" ]]; then
             FAILURE_LOGS=$(printf '%s' "${LOG_OUTPUT}" | tail -c 1500)
             echo "FAILURE_LOGS    --> fetched $(printf '%s' "${FAILURE_LOGS}" | wc -c) bytes"
           else
-            echo "FAILURE_LOGS    --> unavailable (pod may be GC'd or logs empty)"
+            echo "FAILURE_LOGS    --> unavailable"
           fi
+          rm -f /tmp/kctl-logs.out
         }
 
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then

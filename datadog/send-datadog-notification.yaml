@@ -235,14 +235,7 @@ spec:
                step: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].name // "unknown"),
                exit_code: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.exitCode // null),
                reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown"),
-               pod: (.status.podName // ""),
-               container: (
-                 ([.status.steps[]? | select(.terminated.exitCode != 0)][0].name // "") as $step |
-                 if $step != "" then $step else
-                   (([.status.conditions[]? | select(.type=="Succeeded") | .message // ""] | first // "")
-                    | gsub("\\\\"; "") | capture("\"(?<c>[^\"]+)\"")? // {} | .c // "")
-                 end
-               )
+               pod: (.status.podName // "")
              }]')
 
           FAILED_TASK=$(echo "${FAILED_DATA}" | jq -r '
@@ -251,7 +244,7 @@ spec:
           FAILED_EXIT_CODE=$(echo "${FAILED_DATA}" | jq -r '.[0].exit_code // "?"')
           FAILED_REASON=$(echo "${FAILED_DATA}" | jq -r '.[0].reason // "unknown"')
           FAILED_POD=$(echo "${FAILED_DATA}" | jq -r '.[0].pod // ""')
-          FAILED_CONTAINER=$(echo "${FAILED_DATA}" | jq -r '.[0].container // ""')
+          FAILED_CONTAINER="step-${FAILED_STEP}"
 
           LOG_SNIPPET=$(echo "${FAILED_DATA}" | jq -r '.[0].message // ""' | head -c 500)
 
@@ -267,26 +260,34 @@ spec:
 
         # Best-effort log fetch from the failed step's pod/container
         fetch_failure_logs() {
-          if [[ -z "${FAILED_POD}" || -z "${FAILED_CONTAINER}" ]]; then
-            echo "WARN: No pod/container for log fetch"
+          if [[ -z "${FAILED_POD}" ]]; then
+            echo "WARN: No pod name for log fetch"
+            return 0
+          fi
+          if [[ "${FAILED_STEP}" == "unknown" ]]; then
+            echo "WARN: No step name for log fetch"
             return 0
           fi
 
+          echo "LOG_FETCH       --> pod=${FAILED_POD} container=${FAILED_CONTAINER}"
+
           local LOG_OUTPUT=""
+          # Try step-<name> (Tekton container naming convention)
           LOG_OUTPUT=$(kubectl logs "${FAILED_POD}" -n "${NAMESPACE}" \
             -c "${FAILED_CONTAINER}" --tail=50 --request-timeout=10s 2>/dev/null || true)
 
-          # Fallback: try step-<name> prefix if direct name failed
-          if [[ -z "${LOG_OUTPUT}" && "${FAILED_CONTAINER}" != step-* ]]; then
+          # Fallback: try raw step name without prefix
+          if [[ -z "${LOG_OUTPUT}" ]]; then
+            echo "LOG_FETCH       --> fallback to container=${FAILED_STEP}"
             LOG_OUTPUT=$(kubectl logs "${FAILED_POD}" -n "${NAMESPACE}" \
-              -c "step-${FAILED_CONTAINER}" --tail=50 --request-timeout=10s 2>/dev/null || true)
+              -c "${FAILED_STEP}" --tail=50 --request-timeout=10s 2>/dev/null || true)
           fi
 
           if [[ -n "${LOG_OUTPUT}" ]]; then
             FAILURE_LOGS=$(printf '%s' "${LOG_OUTPUT}" | tail -c 1500)
             echo "FAILURE_LOGS    --> fetched $(printf '%s' "${FAILURE_LOGS}" | wc -c) bytes"
           else
-            echo "FAILURE_LOGS    --> unavailable"
+            echo "FAILURE_LOGS    --> unavailable (pod may be GC'd or logs empty)"
           fi
         }
 

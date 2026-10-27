@@ -388,7 +388,7 @@ spec:
           - name: url
             value: "https://github.com/openshift-cnv/tekton-tasks.git"
           - name: revision
-            value: 7892c4fe1bf2a91c8900a7023a7b60f7cd3fa9b4
+            value: 4570fc6bdd4d0c3d9f872d94a22ba0bd92cf75ec
           - name: pathInRepo
             value: datadog/send-datadog-notification.yaml
 

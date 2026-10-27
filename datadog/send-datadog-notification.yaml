@@ -1,0 +1,665 @@
+# datadog/send-datadog-notification.yaml
+# @ai-rules:
+# 1. [Purpose]: Universal Datadog notification Task for all CNV Tekton pipelines.
+# 2. [Pattern]: Auto-discovers context from PipelineRun/TaskRun objects via kubectl.
+#    Callers pass only 4 required params + optional extra tags.
+# 3. [Constraint]: Non-fatal by design — onError: continue + FINAL_EXIT_CODE=0 on any failure.
+# 4. [Gotcha]: datadog-credentials Secret is optional — Task exits 0 if missing.
+# 5. [Gotcha]: set -x is suppressed around curl to avoid leaking DD_API_KEY in logs.
+# 6. [Gotcha]: kubectl introspection is conditional (only on failure) and wrapped in
+#    error handling — RBAC or API failures fall back to "unknown", never block.
+# 7. [Pattern]: Resilient Execution Layer (ACTION_LOG, trap, execution_summary).
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: send-datadog-notification
+  labels:
+    app.kubernetes.io/version: "1.0"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.50.0"
+    tekton.dev/displayName: "Send Datadog Notification"
+    tekton.dev/categories: Notification
+spec:
+  description: |
+    Universal Datadog notification task for all CNV Tekton pipelines.
+    Auto-discovers rich context (application, component, version, failed task/step,
+    log snippet, git URL, PR number, pipeline URL) from PipelineRun and TaskRun
+    objects via kubectl. Callers pass only pipeline-name, pipeline-status,
+    pipelinerun-name, and namespace. Domain-specific extras (channel, bundle
+    version, release checklist epic) go in the optional tags param.
+    Requires a datadog-credentials Secret (keys: api-key, site).
+    Exits 0 gracefully if the Secret is missing or on any failure.
+  params:
+    - name: pipeline-name
+      type: string
+      description: "Human-readable pipeline name (e.g. build-container, fbc-post-release, apply-releases)"
+    - name: pipeline-status
+      type: string
+      description: "Aggregate pipeline status — pass $(tasks.status)"
+    - name: pipelinerun-name
+      type: string
+      description: "PipelineRun name — pass $(context.pipelineRun.name)"
+    - name: namespace
+      type: string
+      description: "Namespace — pass $(context.pipelineRun.namespace)"
+    - name: tags
+      type: string
+      default: ""
+      description: "Comma-separated key:value pairs for domain-specific tags (e.g. channel:stable,epic:CNV-1234)"
+    - name: konflux-ui-url
+      type: string
+      default: ""
+      description: "Konflux UI base URL override. Auto-detected from namespace when empty."
+    - name: debug
+      type: string
+      default: "false"
+      description: "Enable verbose output (set -x)"
+  steps:
+    - name: send-event
+      onError: continue
+      image: quay.io/konflux-ci/release-service-utils@sha256:3e3b9f5ce4b4575997573ff2728c95b671b9902847934b64f6bc8f979bf01cde
+      env:
+        - name: DD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: datadog-credentials
+              key: api-key
+              optional: true
+        - name: DD_SITE
+          valueFrom:
+            secretKeyRef:
+              name: datadog-credentials
+              key: site
+              optional: true
+      script: |
+        #!/usr/bin/env bash
+
+        # ============================================================
+        # EXECUTION LAYER
+        # ============================================================
+        SCRIPT_START=$(date +%s)
+        declare -a ACTION_LOG=()
+        FINAL_EXIT_CODE=0
+
+        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+        exec_action() {
+          local name="$1"; shift
+          local start=$(date +%s)
+          if "$@"; then
+            local dur=$(( $(date +%s) - start ))
+            ACTION_LOG+=("OK|${name}|${dur}s")
+            return 0
+          else
+            local rc=$?
+            local dur=$(( $(date +%s) - start ))
+            ACTION_LOG+=("FAILED|${name}|exit=${rc}|${dur}s")
+            return $rc
+          fi
+        }
+
+        execution_summary() {
+          local script_exit_code=$?
+          local script_end=$(date +%s)
+          local total_duration=$((script_end - SCRIPT_START))
+          echo ""
+          echo "╔═════════════════════════════════════════════════════════════"
+          echo "║ EXECUTION SUMMARY - send-datadog-notification"
+          echo "║ Total Duration: ${total_duration}s"
+          echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+          echo "╠═════════════════════════════════════════════════════════════"
+          for entry in "${ACTION_LOG[@]}"; do
+            local status=$(echo "$entry" | cut -d'|' -f1)
+            local action=$(echo "$entry" | cut -d'|' -f2)
+            local details=$(echo "$entry" | cut -d'|' -f3-)
+            case "$status" in
+              OK)     echo "║ ✓ ${action} (${details})" ;;
+              FAILED) echo "║ ✗ ${action} (${details})" ;;
+            esac
+          done
+          echo "╚═════════════════════════════════════════════════════════════"
+          exit ${FINAL_EXIT_CODE:-$script_exit_code}
+        }
+        trap execution_summary EXIT
+
+        # ============================================================
+        # CONSTANTS
+        # ============================================================
+        PIPELINE_NAME="$(params.pipeline-name)"
+        PIPELINE_STATUS="$(params.pipeline-status)"
+        PIPELINERUN_NAME="$(params.pipelinerun-name)"
+        NAMESPACE="$(params.namespace)"
+        KONFLUX_UI_OVERRIDE="$(params.konflux-ui-url)"
+        DD_SITE="${DD_SITE:-datadoghq.eu}"
+
+        echo "=== Datadog Notification ==="
+        echo "PIPELINE        --> ${PIPELINE_NAME}"
+        echo "PIPELINE_STATUS --> ${PIPELINE_STATUS}"
+        echo "PIPELINERUN     --> ${PIPELINERUN_NAME}"
+        echo "NAMESPACE       --> ${NAMESPACE}"
+
+        # ============================================================
+        # AUTO-DISCOVER: PipelineRun metadata
+        # ============================================================
+        APPLICATION="unknown"
+        COMPONENT="unknown"
+        EVENT_TYPE="unknown"
+        COMMIT_SHA=""
+        PR_NUMBER=""
+        GIT_URL=""
+        PR_MESSAGE=""
+        VERSION=""
+        PARAM_TAGS_JSON="[]"
+
+        discover_pipelinerun_metadata() {
+          local PR_DATA
+          PR_DATA=$(kubectl get pipelinerun "${PIPELINERUN_NAME}" \
+            -n "${NAMESPACE}" -o json 2>/tmp/kubectl-pr-err.log) || {
+            echo "WARN: kubectl get pipelinerun failed (exit $?): $(cat /tmp/kubectl-pr-err.log 2>/dev/null)"
+            return 1
+          }
+
+          APPLICATION=$(echo "${PR_DATA}" | jq -r '
+            .metadata.labels["appstudio.openshift.io/application"] // "unknown"')
+          COMPONENT=$(echo "${PR_DATA}" | jq -r '
+            .metadata.labels["appstudio.openshift.io/component"] // "unknown"')
+          EVENT_TYPE=$(echo "${PR_DATA}" | jq -r '
+            .metadata.labels["pipelinesascode.tekton.dev/event-type"] // "unknown"')
+          COMMIT_SHA=$(echo "${PR_DATA}" | jq -r '
+            .metadata.annotations["build.appstudio.redhat.com/commit_sha"] // ""')
+          PR_NUMBER=$(echo "${PR_DATA}" | jq -r '
+            .metadata.annotations["build.appstudio.redhat.com/pull_request_number"] // ""')
+
+          GIT_URL=$(echo "${PR_DATA}" | jq -r '
+            [.spec.params[]? | select(.name=="git-url" or .name=="repo-url") | .value][0] // ""')
+
+          PR_MESSAGE=$(echo "${PR_DATA}" | jq -r '
+            [.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""')
+
+          PARAM_TAGS_JSON=$(echo "${PR_DATA}" | jq -c '
+            [.spec.params[]? |
+             select(.value | type == "string") |
+             select(.name | test("secret|token|key|password|auth|credentials|pat|dockerconfig"; "i") | not) |
+             "param_\(.name):\(.value | gsub("[\\n\\r,]"; "_") | if length > 100 then .[:100] + "…" else . end)"]')
+
+          # Detect cancellation from PipelineRun condition reason
+          PR_REASON=$(echo "${PR_DATA}" | jq -r '
+            [.status.conditions[]? | select(.type=="Succeeded") | .reason][0] // ""')
+
+          echo "APPLICATION     --> ${APPLICATION}"
+          echo "COMPONENT       --> ${COMPONENT}"
+          echo "EVENT_TYPE      --> ${EVENT_TYPE}"
+          echo "COMMIT_SHA      --> ${COMMIT_SHA}"
+          echo "PR_NUMBER       --> ${PR_NUMBER}"
+          echo "GIT_URL         --> ${GIT_URL}"
+          echo "PR_REASON       --> ${PR_REASON}"
+        }
+
+        PR_REASON=""
+        exec_action "Discover PipelineRun" discover_pipelinerun_metadata || true
+        [[ -z "${PARAM_TAGS_JSON}" || "${PARAM_TAGS_JSON}" == "null" ]] && PARAM_TAGS_JSON="[]"
+
+        # Derive version from namespace (v4-19-openshift-virtualization-tenant → v4.19)
+        VERSION=$(echo "${NAMESPACE}" | grep -oP 'v\d+-\d+' | head -1 | tr '-' '.')
+        echo "VERSION         --> ${VERSION:-unknown}"
+
+        # ============================================================
+        # AUTO-DISCOVER: Failure details (only when Failed)
+        # ============================================================
+        FAILED_TASK="none"
+        FAILED_STEP=""
+        FAILED_EXIT_CODE=""
+        FAILED_REASON=""
+        LOG_SNIPPET=""
+        FAILED_COUNT=0
+
+        # FAILED_DATA_FILE holds the JSON array of all failed TaskRuns
+        FAILED_DATA_FILE="/tmp/failed-data.json"
+        echo '[]' > "${FAILED_DATA_FILE}"
+
+        discover_failure_details() {
+          local TASK_DATA
+          TASK_DATA=$(kubectl get taskrun -n "${NAMESPACE}" \
+            -l "tekton.dev/pipelineRun=${PIPELINERUN_NAME}" \
+            -o json 2>/tmp/kubectl-tr-err.log) || {
+            echo "WARN: kubectl get taskrun failed (exit $?): $(cat /tmp/kubectl-tr-err.log 2>/dev/null)"
+            return 1
+          }
+
+          jq '
+            [.items[] |
+             select(.status.conditions[]? |
+               select(.type=="Succeeded" and .status=="False")) |
+             {
+               task: .metadata.labels["tekton.dev/pipelineTask"],
+               message: ([.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""),
+               step: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].name // "unknown"),
+               exit_code: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.exitCode // null),
+               reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown"),
+               pod: (.status.podName // "")
+             }]' <<< "${TASK_DATA}" > "${FAILED_DATA_FILE}"
+
+          FAILED_COUNT=$(jq 'length' "${FAILED_DATA_FILE}")
+          FAILED_TASK=$(jq -r '[.[].task] | map(select(. != null)) | unique | join(",") // "unknown"' "${FAILED_DATA_FILE}")
+          FAILED_STEP=$(jq -r '.[0].step // "unknown"' "${FAILED_DATA_FILE}")
+          FAILED_EXIT_CODE=$(jq -r '.[0].exit_code // "?"' "${FAILED_DATA_FILE}")
+          FAILED_REASON=$(jq -r '.[0].reason // "unknown"' "${FAILED_DATA_FILE}")
+          LOG_SNIPPET=$(jq -r '.[0].message // ""' "${FAILED_DATA_FILE}" | head -c 500)
+
+          echo "FAILED_COUNT    --> ${FAILED_COUNT}"
+          echo "FAILED_TASK     --> ${FAILED_TASK}"
+          echo "FAILED_STEP     --> ${FAILED_STEP}"
+          echo "FAILED_EXIT     --> ${FAILED_EXIT_CODE} (${FAILED_REASON})"
+          if [[ -n "${LOG_SNIPPET}" ]]; then
+            echo "LOG_SNIPPET     --> ${LOG_SNIPPET:0:120}..."
+          fi
+        }
+
+        # Explicit API server config for kubectl — some namespaces omit
+        # KUBERNETES_SERVICE_HOST/PORT env vars (enableServiceLinks: false).
+        kctl() {
+          kubectl --server="https://kubernetes.default.svc" \
+            --certificate-authority="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" \
+            --token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)" \
+            "$@"
+        }
+
+        # Best-effort log fetch for a single pod/container
+        # Args: $1=pod $2=step_name $3=tail_lines $4=max_bytes
+        fetch_one_log() {
+          local pod="$1" step="$2" tail_n="$3" max_bytes="$4"
+          local container="step-${step}" log_out="" log_err=""
+
+          log_err=$(kctl logs "${pod}" -n "${NAMESPACE}" \
+            -c "${container}" --tail="${tail_n}" --request-timeout=10s \
+            2>&1 >/tmp/kctl-logs.out || true)
+          log_out=$(cat /tmp/kctl-logs.out 2>/dev/null)
+
+          # Fallback: try raw step name
+          if [[ -z "${log_out}" ]]; then
+            log_err=$(kctl logs "${pod}" -n "${NAMESPACE}" \
+              -c "${step}" --tail="${tail_n}" --request-timeout=10s \
+              2>&1 >/tmp/kctl-logs.out || true)
+            log_out=$(cat /tmp/kctl-logs.out 2>/dev/null)
+          fi
+
+          rm -f /tmp/kctl-logs.out
+          if [[ -n "${log_out}" ]]; then
+            printf '%s' "${log_out}" | tail -c "${max_bytes}"
+          fi
+        }
+
+        # Fetch logs for ALL failed tasks, store in FAILURE_LOGS_FILE
+        FAILURE_LOGS_FILE="/tmp/failure-logs.txt"
+        : > "${FAILURE_LOGS_FILE}"
+
+        fetch_all_failure_logs() {
+          local count="${FAILED_COUNT}"
+          if [[ "${count}" -eq 0 ]]; then return 0; fi
+
+          # Cap log fetching to first 3 failed tasks
+          local MAX_LOG_TASKS=3
+          local fetch_count="${count}"
+          if [[ "${fetch_count}" -gt "${MAX_LOG_TASKS}" ]]; then
+            fetch_count="${MAX_LOG_TASKS}"
+          fi
+
+          # Dynamic budget per task (based on tasks we'll actually fetch)
+          local tail_n=50 max_bytes=1500
+          if [[ "${fetch_count}" -ge 3 ]]; then
+            tail_n=20; max_bytes=750
+          elif [[ "${fetch_count}" -ge 2 ]]; then
+            tail_n=30; max_bytes=1000
+          fi
+
+          echo "LOG_BUDGET      --> ${count} failed, fetching ${fetch_count}, ${tail_n} lines, ${max_bytes} bytes each"
+
+          local i=0 fetched=0
+          while IFS= read -r entry; do
+            if [[ "${fetched}" -ge "${MAX_LOG_TASKS}" ]]; then
+              echo "LOG_FETCH[${i}]  --> skipped (max ${MAX_LOG_TASKS} logs reached)"
+              i=$((i+1))
+              continue
+            fi
+
+            local t_task=$(echo "${entry}" | jq -r '.task // "unknown"')
+            local t_step=$(echo "${entry}" | jq -r '.step // "unknown"')
+            local t_pod=$(echo "${entry}" | jq -r '.pod // ""')
+
+            if [[ -z "${t_pod}" || "${t_step}" == "unknown" ]]; then
+              echo "LOG_FETCH[${i}]  --> skip ${t_task} (no pod/step)"
+              i=$((i+1))
+              continue
+            fi
+
+            echo "LOG_FETCH[${i}]  --> ${t_task}: pod=${t_pod} step=${t_step}"
+            local logs=$(fetch_one_log "${t_pod}" "${t_step}" "${tail_n}" "${max_bytes}")
+
+            if [[ -n "${logs}" ]]; then
+              echo "\`${t_task}\` — \`step-${t_step}\`" >> "${FAILURE_LOGS_FILE}"
+              echo '```' >> "${FAILURE_LOGS_FILE}"
+              echo "${logs}" >> "${FAILURE_LOGS_FILE}"
+              echo '```' >> "${FAILURE_LOGS_FILE}"
+              echo "" >> "${FAILURE_LOGS_FILE}"
+              echo "LOG_FETCH[${i}]  --> fetched $(printf '%s' "${logs}" | wc -c) bytes"
+              fetched=$((fetched+1))
+            else
+              echo "LOG_FETCH[${i}]  --> unavailable"
+            fi
+            i=$((i+1))
+          done < <(jq -c '.[]' "${FAILED_DATA_FILE}")
+
+          # Note remaining tasks in the log file
+          local remaining=$((count - fetched))
+          if [[ "${remaining}" -gt 0 ]]; then
+            echo "*+${remaining} more failed task(s) — see Pipeline UI for full logs.*" >> "${FAILURE_LOGS_FILE}"
+          fi
+        }
+
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          exec_action "Discover failure details" discover_failure_details || true
+          [[ "${FAILED_TASK}" == "" ]] && FAILED_TASK="unknown"
+          exec_action "Fetch failure logs" fetch_all_failure_logs || true
+        fi
+
+        # Detect cancellation: PipelineRun reason OR TaskRun reason
+        if [[ "${PR_REASON}" =~ (PipelineRunCancelled|CancelledRunFinally|StoppedRunFinally|Cancelled) ]] || \
+           [[ "${FAILED_REASON}" == "TaskRunCancelled" ]]; then
+          echo "Cancellation detected (PR_REASON=${PR_REASON}, FAILED_REASON=${FAILED_REASON})"
+          PIPELINE_STATUS="Cancelled"
+        fi
+
+        # ============================================================
+        # CONSTRUCT: URLs
+        # ============================================================
+        PIPELINE_URL=""
+        PR_URL=""
+        COMMIT_URL=""
+
+        KONFLUX_UI="${KONFLUX_UI_OVERRIDE:-}"
+        if [[ -z "${KONFLUX_UI}" ]]; then
+          if [[ "${NAMESPACE}" == *"-openshift-virtualization-tenant" ]]; then
+            KONFLUX_UI="https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+          elif [[ "${NAMESPACE}" == "cnv-fbc-tenant" || "${NAMESPACE}" == *"cnv-fbc"* ]]; then
+            KONFLUX_UI="https://konflux-ui.apps.stone-prd-rh01.pg1f.p1.openshiftapps.com"
+          fi
+        fi
+
+        if [[ -n "${KONFLUX_UI}" && "${APPLICATION}" != "unknown" ]]; then
+          PIPELINE_URL="${KONFLUX_UI}/ns/${NAMESPACE}/applications/${APPLICATION}/pipelineruns/${PIPELINERUN_NAME}"
+        fi
+
+        if [[ -n "${GIT_URL}" ]]; then
+          if [[ "${GIT_URL}" == *"github.com"* ]]; then
+            [[ -n "${COMMIT_SHA}" ]] && COMMIT_URL="${GIT_URL}/commit/${COMMIT_SHA}"
+            [[ -n "${PR_NUMBER}" ]] && PR_URL="${GIT_URL}/pull/${PR_NUMBER}"
+          else
+            [[ -n "${COMMIT_SHA}" ]] && COMMIT_URL="${GIT_URL}/-/commit/${COMMIT_SHA}"
+            [[ -n "${PR_NUMBER}" ]] && PR_URL="${GIT_URL}/-/merge_requests/${PR_NUMBER}"
+          fi
+        fi
+
+        # ============================================================
+        # RESOLVE: Tag-based fallbacks (before message + tags build)
+        # final-* PipelineRuns from Release Service lack Konflux labels,
+        # so callers pass application/component/version/release_name in tags.
+        # ============================================================
+        EXTRA_TAGS_JSON="[]"
+        if [[ -n "$(params.tags)" ]]; then
+          EXTRA_TAGS_JSON=$(echo "$(params.tags)" | jq -Rs '
+            rtrimstr("\n") | split(",") | map(gsub("^\\s+|\\s+$"; "")) |
+            map(select(length > 0)) |
+            map(select(test(":n/a$|:N/A$|:$") | not))' 2>/dev/null) || EXTRA_TAGS_JSON="[]"
+        fi
+
+        tag_value() {
+          echo "${EXTRA_TAGS_JSON}" | jq -r --arg k "$1" '
+            map(select(startswith($k + ":"))) | first // "" |
+            sub("^[^:]+:"; "")' 2>/dev/null
+        }
+
+        TAG_APP=$(tag_value "application")
+        TAG_COMPONENT=$(tag_value "component")
+        TAG_VERSION=$(tag_value "cnv_version")
+        TAG_RELEASE_NAME=$(tag_value "release_name")
+
+        [[ "${APPLICATION}" == "unknown" && -n "${TAG_APP}" ]] && APPLICATION="${TAG_APP}"
+        [[ "${COMPONENT}" == "unknown" && -n "${TAG_COMPONENT}" ]] && COMPONENT="${TAG_COMPONENT}"
+        [[ -z "${VERSION}" && -n "${TAG_VERSION}" ]] && VERSION="${TAG_VERSION}"
+
+        # Reconstruct Pipeline URL with resolved APPLICATION
+        if [[ -n "${KONFLUX_UI}" && "${APPLICATION}" != "unknown" && -z "${PIPELINE_URL}" ]]; then
+          PIPELINE_URL="${KONFLUX_UI}/ns/${NAMESPACE}/applications/${APPLICATION}/pipelineruns/${PIPELINERUN_NAME}"
+        fi
+        if [[ -n "${PIPELINE_URL}" && -n "${TAG_RELEASE_NAME}" ]]; then
+          PIPELINE_URL="${PIPELINE_URL}?releaseName=${TAG_RELEASE_NAME}"
+        fi
+
+        echo "APPLICATION     --> ${APPLICATION} (after fallback)"
+        echo "COMPONENT       --> ${COMPONENT} (after fallback)"
+        echo "VERSION         --> ${VERSION} (after fallback)"
+        [[ -n "${PIPELINE_URL}" ]] && echo "PIPELINE_URL    --> ${PIPELINE_URL}"
+
+        # ============================================================
+        # DETERMINE: Alert type
+        # ============================================================
+        case "${PIPELINE_STATUS}" in
+          Succeeded|Completed) ALERT_TYPE="success" ;;
+          Failed)              ALERT_TYPE="error" ;;
+          Cancelled)           ALERT_TYPE="warning" ;;
+          *)                   ALERT_TYPE="warning" ;;
+        esac
+
+        # ============================================================
+        # BUILD: Message body (Datadog markdown inside %%% delimiters)
+        # ============================================================
+
+        # Status description
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          STATUS_WORD="**failed** at task **${FAILED_TASK}**"
+        elif [[ "${PIPELINE_STATUS}" == "Cancelled" ]]; then
+          STATUS_WORD="was **cancelled**"
+        elif [[ "${PIPELINE_STATUS}" == "Succeeded" || "${PIPELINE_STATUS}" == "Completed" ]]; then
+          STATUS_WORD="has **passed** successfully"
+        else
+          STATUS_WORD="finished with status **${PIPELINE_STATUS}**"
+        fi
+
+        # Component label (avoid repeating if same as application)
+        COMP_LABEL=""
+        if [[ "${COMPONENT}" != "unknown" && "${COMPONENT}" != "${APPLICATION}" ]]; then
+          COMP_LABEL=" (component: **${COMPONENT}**)"
+        fi
+
+        MSG_LINES=()
+        MSG_LINES+=("%%%")
+
+        # Description: one sentence with all context
+        MSG_LINES+=("The **${PIPELINE_NAME}** pipeline for application **${APPLICATION}**${COMP_LABEL}")
+        [[ -n "${VERSION}" ]] && MSG_LINES+=("on version **${VERSION}**")
+        MSG_LINES+=("${STATUS_WORD}.")
+        MSG_LINES+=("")
+
+        # Run details table
+        MSG_LINES+=("### Run Details")
+        MSG_LINES+=("| | |")
+        MSG_LINES+=("|-|-|")
+        MSG_LINES+=("| **PipelineRun** | \`${PIPELINERUN_NAME}\` |")
+        MSG_LINES+=("| **Namespace** | \`${NAMESPACE}\` |")
+        [[ "${EVENT_TYPE}" != "unknown" ]] && \
+          MSG_LINES+=("| **Event** | ${EVENT_TYPE} |")
+        [[ -n "${COMMIT_SHA}" ]] && \
+          MSG_LINES+=("| **Commit** | \`${COMMIT_SHA:0:12}\` |")
+        MSG_LINES+=("")
+
+        # Failure details — iterate all failed TaskRuns
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          MSG_LINES+=("### Failure Details")
+          if [[ "${FAILED_COUNT}" -le 1 ]]; then
+            MSG_LINES+=("| | |")
+            MSG_LINES+=("|-|-|")
+            MSG_LINES+=("| **Task** | ${FAILED_TASK} |")
+            [[ -n "${FAILED_STEP}" && "${FAILED_STEP}" != "unknown" ]] && \
+              MSG_LINES+=("| **Step** | ${FAILED_STEP} (exit ${FAILED_EXIT_CODE}, ${FAILED_REASON}) |")
+            [[ -n "${LOG_SNIPPET}" ]] && \
+              MSG_LINES+=("| **Log** | ${LOG_SNIPPET:0:300} |")
+          else
+            MSG_LINES+=("**${FAILED_COUNT} tasks failed:**")
+            MSG_LINES+=("")
+            MSG_LINES+=("| Task | Step | Exit | Reason |")
+            MSG_LINES+=("|-|-|-|-|")
+            while IFS= read -r entry; do
+              f_task=$(echo "${entry}" | jq -r '.task // "unknown"')
+              f_step=$(echo "${entry}" | jq -r '.step // "unknown"')
+              f_exit=$(echo "${entry}" | jq -r '.exit_code // "?"')
+              f_reason=$(echo "${entry}" | jq -r '.reason // "unknown"')
+              MSG_LINES+=("| ${f_task} | ${f_step} | ${f_exit} | ${f_reason} |")
+            done < <(jq -c '.[]' "${FAILED_DATA_FILE}")
+          fi
+          if [[ -n "${PR_MESSAGE}" ]]; then
+            if [[ "${FAILED_COUNT}" -le 1 ]]; then
+              MSG_LINES+=("| **Summary** | ${PR_MESSAGE:0:300} |")
+            else
+              MSG_LINES+=("")
+              MSG_LINES+=("**Summary:** ${PR_MESSAGE:0:300}")
+            fi
+          fi
+          MSG_LINES+=("")
+
+          # Container logs for each failed task
+          LOG_CONTENT=$(cat "${FAILURE_LOGS_FILE}" 2>/dev/null)
+          if [[ -n "${LOG_CONTENT}" ]]; then
+            MSG_LINES+=("### Logs")
+            MSG_LINES+=("${LOG_CONTENT}")
+            if [[ -n "${PIPELINE_URL}" ]]; then
+              MSG_LINES+=("[View full logs in Pipeline UI →](${PIPELINE_URL})")
+            fi
+            MSG_LINES+=("")
+          fi
+        fi
+
+        # Links
+        LINKS=()
+        [[ -n "${PIPELINE_URL}" ]] && LINKS+=("[Pipeline UI](${PIPELINE_URL})")
+        if [[ -n "${PR_URL}" ]]; then
+          PR_LABEL="PR"
+          [[ -n "${PR_NUMBER}" ]] && PR_LABEL="PR #${PR_NUMBER}"
+          LINKS+=("[${PR_LABEL}](${PR_URL})")
+        fi
+        [[ -n "${COMMIT_URL}" ]] && LINKS+=("[Commit ${COMMIT_SHA:0:7}](${COMMIT_URL})")
+
+        if [[ ${#LINKS[@]} -gt 0 ]]; then
+          MSG_LINES+=("---")
+          LINKS_STR=$(IFS=' | '; echo "${LINKS[*]}")
+          MSG_LINES+=("${LINKS_STR}")
+        fi
+
+        MSG_LINES+=("%%%")
+        MESSAGE=$(printf '%s\n' "${MSG_LINES[@]}")
+
+        # ============================================================
+        # BUILD: Tags array (uses resolved APPLICATION/COMPONENT/VERSION)
+        # ============================================================
+        # Only include failure tags when pipeline actually failed
+        FAIL_TAGS=""
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          FAIL_TAGS="yes"
+        fi
+
+        FIXED_TAGS=$(jq -n \
+          --arg pipeline "${PIPELINE_NAME}" \
+          --arg pipeline_status "${PIPELINE_STATUS}" \
+          --arg namespace "${NAMESPACE}" \
+          --arg pipelinerun "${PIPELINERUN_NAME}" \
+          --arg application "${APPLICATION}" \
+          --arg component "${COMPONENT}" \
+          --arg version "${VERSION}" \
+          --arg event_type "${EVENT_TYPE}" \
+          --arg failed_task "${FAILED_TASK}" \
+          --arg failed_step "${FAILED_STEP}" \
+          --arg include_fail "${FAIL_TAGS}" \
+          '[
+            "service:cnv-tekton-pipelines",
+            "source:tekton-task",
+            ("pipeline:" + $pipeline),
+            ("pipeline_status:" + $pipeline_status),
+            ("namespace:" + $namespace),
+            ("pipelinerun:" + $pipelinerun),
+            ("application:" + $application),
+            (if $component != "unknown" then ("component:" + $component) else null end),
+            (if ($version | length) > 0 then ("version:" + $version) else null end),
+            (if $event_type != "unknown" then ("event_type:" + $event_type) else null end)
+          ] + (if $include_fail == "yes" then [
+            ("failed_task:" + $failed_task),
+            ("failed_step:" + $failed_step)
+          ] else [] end) | map(select(. != null and endswith(":") | not))')
+
+        ALL_TAGS=$(jq -n \
+          --argjson fixed "$FIXED_TAGS" \
+          --argjson params "$PARAM_TAGS_JSON" \
+          --argjson extra "$EXTRA_TAGS_JSON" \
+          '$fixed + $params + $extra | unique')
+
+        ACTION_LOG+=("OK|Build tags ($(echo "${ALL_TAGS}" | jq length) total)|0s")
+
+        # ============================================================
+        # BUILD: Datadog event payload
+        # ============================================================
+        DD_PAYLOAD=$(jq -n \
+          --arg title "[${PIPELINE_NAME}] ${PIPELINE_STATUS}" \
+          --arg text "${MESSAGE}" \
+          --arg alert_type "${ALERT_TYPE}" \
+          --argjson tags "${ALL_TAGS}" \
+          '{
+            title: $title,
+            text: $text,
+            tags: $tags,
+            alert_type: $alert_type
+          }')
+
+        if [[ -z "${DD_PAYLOAD}" ]]; then
+          echo "WARN: DD_PAYLOAD is empty (jq assembly failed). Skipping POST."
+          ACTION_LOG+=("FAILED|Build payload|empty")
+          FINAL_EXIT_CODE=0
+          exit 0
+        fi
+
+        echo ""
+        echo "Datadog event payload:"
+        echo "${DD_PAYLOAD}" | jq .
+        echo ""
+        echo "DD Site: ${DD_SITE}"
+        ACTION_LOG+=("OK|Build payload|0s")
+
+        # ============================================================
+        # POST: Datadog Events API
+        # ============================================================
+        if [[ -z "${DD_API_KEY:+set}" ]]; then
+          echo "WARN: DD_API_KEY not set (datadog-credentials Secret missing). Skipping POST."
+          ACTION_LOG+=("OK|Skip POST - no DD_API_KEY|0s")
+          FINAL_EXIT_CODE=0
+          exit 0
+        fi
+
+        { set +x; } 2>/dev/null
+
+        HTTP_CODE=$(curl -s --connect-timeout 5 --max-time 10 --retry 2 --retry-all-errors \
+          -o /tmp/dd-response.json -w '%{http_code}' \
+          -X POST "https://api.${DD_SITE}/api/v1/events" \
+          -H "DD-API-KEY: ${DD_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "${DD_PAYLOAD}") || HTTP_CODE="000"
+
+        if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+        if [[ "${HTTP_CODE}" -ge 200 && "${HTTP_CODE}" -lt 300 ]]; then
+          echo "Datadog event sent (HTTP ${HTTP_CODE})"
+          echo "Response: $(cat /tmp/dd-response.json 2>/dev/null)"
+          ACTION_LOG+=("OK|POST to Datadog|HTTP ${HTTP_CODE}")
+          FINAL_EXIT_CODE=0
+        else
+          echo "WARN: Datadog event failed (HTTP ${HTTP_CODE}). Non-blocking."
+          echo "Response: $(cat /tmp/dd-response.json 2>/dev/null || echo 'no response')"
+          ACTION_LOG+=("FAILED|POST to Datadog|HTTP ${HTTP_CODE}")
+          FINAL_EXIT_CODE=0
+        fi

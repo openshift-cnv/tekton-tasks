@@ -873,7 +873,7 @@ spec:
         - name: namespace
           value: $(context.pipelineRun.namespace)
         - name: tags
-          value: "application:$(tasks.update-bundle.results.application),component:hco-bundle-registry,bundle_version:$(tasks.update-bundle.results.bundle-version),snapshot:$(params.snapshot)"
+          value: "application:$(tasks.update-bundle.results.application),component:hco-bundle-registry,hco_bundle_version:$(tasks.update-bundle.results.bundle-version),snapshot:$(params.snapshot)"
         - name: debug
           value: $(params.debug)
       taskRef:

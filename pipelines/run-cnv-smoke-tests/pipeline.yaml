@@ -205,6 +205,34 @@ spec:
               exit ${exit_code:-0}
 
   finally:
+    - name: send-datadog-notification
+      runAfter:
+      - manage-pull-request
+      timeout: "5m"
+      taskRef:
+        resolver: git
+        params:
+        - name: url
+          value: "https://github.com/openshift-cnv/tekton-tasks.git"
+        - name: revision
+          value: 4570fc6bdd4d0c3d9f872d94a22ba0bd92cf75ec
+        - name: pathInRepo
+          value: "datadog/send-datadog-notification.yaml"
+      params:
+      - name: pipeline-name
+        value: "run-cnv-smoke-tests"
+      - name: pipeline-status
+        value: $(tasks.status)
+      - name: pipelinerun-name
+        value: $(context.pipelineRun.name)
+      - name: namespace
+        value: $(context.pipelineRun.namespace)
+      - name: tags
+        value: "prow_job:$(params.prow-job)"
+      - name: konflux-ui-url
+        value: "https://konflux-ui.apps.kflux-prd-rh02.0fk9.p1.openshiftapps.com"
+      - name: debug
+        value: $(params.debug)
     - name: manage-pull-request
       params:
         - name: test-status

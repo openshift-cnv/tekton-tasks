@@ -450,7 +450,7 @@ spec:
             ("application:" + $application),
             ("component:" + $component),
             ("version:" + $version),
-            ("event_type:" + $event_type)
+            (if $event_type != "unknown" then ("event_type:" + $event_type) else null end)
           ] + (if $include_fail == "yes" then [
             ("failed_task:" + $failed_task),
             ("failed_step:" + $failed_step)

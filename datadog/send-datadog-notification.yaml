@@ -300,7 +300,9 @@ spec:
         EXTRA_TAGS_JSON="[]"
         if [[ -n "$(params.tags)" ]]; then
           EXTRA_TAGS_JSON=$(echo "$(params.tags)" | jq -Rs '
-            rtrimstr("\n") | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))' 2>/dev/null) || EXTRA_TAGS_JSON="[]"
+            rtrimstr("\n") | split(",") | map(gsub("^\\s+|\\s+$"; "")) |
+            map(select(length > 0)) |
+            map(select(test(":n/a$|:N/A$|:$") | not))' 2>/dev/null) || EXTRA_TAGS_JSON="[]"
         fi
 
         tag_value() {

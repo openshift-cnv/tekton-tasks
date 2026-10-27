@@ -344,41 +344,61 @@ spec:
         # ============================================================
         # BUILD: Message body (Datadog markdown inside %%% delimiters)
         # ============================================================
-        COMP_LABEL="${APPLICATION}"
-        [[ "${COMPONENT}" != "unknown" && "${COMPONENT}" != "${APPLICATION}" ]] && \
-          COMP_LABEL="${COMPONENT}"
-        VER_LABEL=""
-        [[ -n "${VERSION}" ]] && VER_LABEL=" (${VERSION})"
 
-        # Description line: what happened
+        # Status description
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
-          DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} has **failed** at task **${FAILED_TASK}**."
+          STATUS_WORD="**failed** at task **${FAILED_TASK}**"
         elif [[ "${PIPELINE_STATUS}" == "Cancelled" ]]; then
-          DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} was **cancelled**."
+          STATUS_WORD="was **cancelled**"
         elif [[ "${PIPELINE_STATUS}" == "Succeeded" || "${PIPELINE_STATUS}" == "Completed" ]]; then
-          DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} has **passed** successfully."
+          STATUS_WORD="has **passed** successfully"
         else
-          DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} finished with status **${PIPELINE_STATUS}**."
+          STATUS_WORD="finished with status **${PIPELINE_STATUS}**"
+        fi
+
+        # Component label (avoid repeating if same as application)
+        COMP_LABEL=""
+        if [[ "${COMPONENT}" != "unknown" && "${COMPONENT}" != "${APPLICATION}" ]]; then
+          COMP_LABEL=" (component: **${COMPONENT}**)"
         fi
 
         MSG_LINES=()
         MSG_LINES+=("%%%")
-        MSG_LINES+=("${DESC}")
+
+        # Description: one sentence with all context
+        MSG_LINES+=("The **${PIPELINE_NAME}** pipeline for application **${APPLICATION}**${COMP_LABEL}")
+        [[ -n "${VERSION}" ]] && MSG_LINES+=("on version **${VERSION}**")
+        MSG_LINES+=("${STATUS_WORD}.")
+        MSG_LINES+=("")
+
+        # Run details table
+        MSG_LINES+=("### Run Details")
+        MSG_LINES+=("| | |")
+        MSG_LINES+=("|-|-|")
+        MSG_LINES+=("| **PipelineRun** | \`${PIPELINERUN_NAME}\` |")
+        MSG_LINES+=("| **Namespace** | \`${NAMESPACE}\` |")
+        [[ "${EVENT_TYPE}" != "unknown" ]] && \
+          MSG_LINES+=("| **Event** | ${EVENT_TYPE} |")
+        [[ -n "${COMMIT_SHA}" ]] && \
+          MSG_LINES+=("| **Commit** | \`${COMMIT_SHA:0:12}\` |")
         MSG_LINES+=("")
 
         # Failure details
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
-          MSG_LINES+=("---")
           MSG_LINES+=("### Failure Details")
-          MSG_LINES+=("- **Task:** ${FAILED_TASK}")
+          MSG_LINES+=("| | |")
+          MSG_LINES+=("|-|-|")
+          MSG_LINES+=("| **Task** | ${FAILED_TASK} |")
           [[ -n "${FAILED_STEP}" && "${FAILED_STEP}" != "unknown" ]] && \
-            MSG_LINES+=("- **Step:** ${FAILED_STEP} (exit ${FAILED_EXIT_CODE}, ${FAILED_REASON})")
-          [[ -n "${LOG_SNIPPET}" ]] && MSG_LINES+=("- **Log:** ${LOG_SNIPPET:0:300}")
-          [[ -n "${PR_MESSAGE}" ]] && MSG_LINES+=("- **Summary:** ${PR_MESSAGE:0:300}")
+            MSG_LINES+=("| **Step** | ${FAILED_STEP} (exit ${FAILED_EXIT_CODE}, ${FAILED_REASON}) |")
+          [[ -n "${LOG_SNIPPET}" ]] && \
+            MSG_LINES+=("| **Log** | ${LOG_SNIPPET:0:300} |")
+          [[ -n "${PR_MESSAGE}" ]] && \
+            MSG_LINES+=("| **Summary** | ${PR_MESSAGE:0:300} |")
           MSG_LINES+=("")
         fi
 
-        # Links section
+        # Links
         LINKS=()
         [[ -n "${PIPELINE_URL}" ]] && LINKS+=("[Pipeline UI](${PIPELINE_URL})")
         if [[ -n "${PR_URL}" ]]; then

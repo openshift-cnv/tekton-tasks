@@ -448,8 +448,8 @@ spec:
             ("namespace:" + $namespace),
             ("pipelinerun:" + $pipelinerun),
             ("application:" + $application),
-            ("component:" + $component),
-            ("version:" + $version),
+            (if $component != "unknown" then ("component:" + $component) else null end),
+            (if ($version | length) > 0 then ("version:" + $version) else null end),
             (if $event_type != "unknown" then ("event_type:" + $event_type) else null end)
           ] + (if $include_fail == "yes" then [
             ("failed_task:" + $failed_task),

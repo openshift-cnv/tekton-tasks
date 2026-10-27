@@ -182,16 +182,28 @@ spec:
              select(.name | test("secret|token|key|password|auth|credentials|pat|dockerconfig"; "i") | not) |
              "param_\(.name):\(.value | gsub("[\\n\\r,]"; "_") | if length > 100 then .[:100] + "…" else . end)"]')
 
+          # Detect cancellation from PipelineRun condition reason
+          PR_REASON=$(echo "${PR_DATA}" | jq -r '
+            [.status.conditions[]? | select(.type=="Succeeded") | .reason][0] // ""')
+
           echo "APPLICATION     --> ${APPLICATION}"
           echo "COMPONENT       --> ${COMPONENT}"
           echo "EVENT_TYPE      --> ${EVENT_TYPE}"
           echo "COMMIT_SHA      --> ${COMMIT_SHA}"
           echo "PR_NUMBER       --> ${PR_NUMBER}"
           echo "GIT_URL         --> ${GIT_URL}"
+          echo "PR_REASON       --> ${PR_REASON}"
         }
 
+        PR_REASON=""
         exec_action "Discover PipelineRun" discover_pipelinerun_metadata || true
         [[ -z "${PARAM_TAGS_JSON}" || "${PARAM_TAGS_JSON}" == "null" ]] && PARAM_TAGS_JSON="[]"
+
+        # Override status if PipelineRun was cancelled
+        if [[ "${PR_REASON}" =~ ^(PipelineRunCancelled|CancelledRunFinally|StoppedRunFinally|Cancelled)$ ]]; then
+          echo "Cancellation detected (reason: ${PR_REASON}), overriding status to Cancelled"
+          PIPELINE_STATUS="Cancelled"
+        fi
 
         # Derive version from namespace (v4-19-openshift-virtualization-tenant → v4.19)
         VERSION=$(echo "${NAMESPACE}" | grep -oP 'v\d+-\d+' | head -1 | tr '-' '.')
@@ -324,6 +336,7 @@ spec:
         case "${PIPELINE_STATUS}" in
           Succeeded|Completed) ALERT_TYPE="success" ;;
           Failed)              ALERT_TYPE="error" ;;
+          Cancelled)           ALERT_TYPE="warning" ;;
           *)                   ALERT_TYPE="warning" ;;
         esac
 
@@ -339,6 +352,8 @@ spec:
         # Description line: what happened
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
           DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} has **failed** at task **${FAILED_TASK}**."
+        elif [[ "${PIPELINE_STATUS}" == "Cancelled" ]]; then
+          DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} was **cancelled**."
         elif [[ "${PIPELINE_STATUS}" == "Succeeded" || "${PIPELINE_STATUS}" == "Completed" ]]; then
           DESC="The **${PIPELINE_NAME}** pipeline for **${COMP_LABEL}**${VER_LABEL} has **passed** successfully."
         else

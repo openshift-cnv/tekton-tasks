@@ -211,9 +211,11 @@ spec:
         FAILED_EXIT_CODE=""
         FAILED_REASON=""
         LOG_SNIPPET=""
-        FAILED_POD=""
-        FAILED_CONTAINER=""
-        FAILURE_LOGS=""
+        FAILED_COUNT=0
+
+        # FAILED_DATA_FILE holds the JSON array of all failed TaskRuns
+        FAILED_DATA_FILE="/tmp/failed-data.json"
+        echo '[]' > "${FAILED_DATA_FILE}"
 
         discover_failure_details() {
           local TASK_DATA
@@ -224,8 +226,7 @@ spec:
             return 1
           }
 
-          local FAILED_DATA
-          FAILED_DATA=$(echo "${TASK_DATA}" | jq '
+          jq '
             [.items[] |
              select(.status.conditions[]? |
                select(.type=="Succeeded" and .status=="False")) |
@@ -236,23 +237,19 @@ spec:
                exit_code: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.exitCode // null),
                reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown"),
                pod: (.status.podName // "")
-             }]')
+             }]' <<< "${TASK_DATA}" > "${FAILED_DATA_FILE}"
 
-          FAILED_TASK=$(echo "${FAILED_DATA}" | jq -r '
-            [.[].task] | map(select(. != null)) | unique | join(",") // "unknown"')
-          FAILED_STEP=$(echo "${FAILED_DATA}" | jq -r '.[0].step // "unknown"')
-          FAILED_EXIT_CODE=$(echo "${FAILED_DATA}" | jq -r '.[0].exit_code // "?"')
-          FAILED_REASON=$(echo "${FAILED_DATA}" | jq -r '.[0].reason // "unknown"')
-          FAILED_POD=$(echo "${FAILED_DATA}" | jq -r '.[0].pod // ""')
-          FAILED_CONTAINER="step-${FAILED_STEP}"
+          FAILED_COUNT=$(jq 'length' "${FAILED_DATA_FILE}")
+          FAILED_TASK=$(jq -r '[.[].task] | map(select(. != null)) | unique | join(",") // "unknown"' "${FAILED_DATA_FILE}")
+          FAILED_STEP=$(jq -r '.[0].step // "unknown"' "${FAILED_DATA_FILE}")
+          FAILED_EXIT_CODE=$(jq -r '.[0].exit_code // "?"' "${FAILED_DATA_FILE}")
+          FAILED_REASON=$(jq -r '.[0].reason // "unknown"' "${FAILED_DATA_FILE}")
+          LOG_SNIPPET=$(jq -r '.[0].message // ""' "${FAILED_DATA_FILE}" | head -c 500)
 
-          LOG_SNIPPET=$(echo "${FAILED_DATA}" | jq -r '.[0].message // ""' | head -c 500)
-
+          echo "FAILED_COUNT    --> ${FAILED_COUNT}"
           echo "FAILED_TASK     --> ${FAILED_TASK}"
           echo "FAILED_STEP     --> ${FAILED_STEP}"
           echo "FAILED_EXIT     --> ${FAILED_EXIT_CODE} (${FAILED_REASON})"
-          echo "FAILED_POD      --> ${FAILED_POD}"
-          echo "FAILED_CONTAINER--> ${FAILED_CONTAINER}"
           if [[ -n "${LOG_SNIPPET}" ]]; then
             echo "LOG_SNIPPET     --> ${LOG_SNIPPET:0:120}..."
           fi
@@ -260,7 +257,6 @@ spec:
 
         # Explicit API server config for kubectl — some namespaces omit
         # KUBERNETES_SERVICE_HOST/PORT env vars (enableServiceLinks: false).
-        # Same pattern as comment-pr-failure task.
         kctl() {
           kubectl --server="https://kubernetes.default.svc" \
             --certificate-authority="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" \
@@ -268,51 +264,84 @@ spec:
             "$@"
         }
 
-        # Best-effort log fetch from the failed step's pod/container
-        fetch_failure_logs() {
-          if [[ -z "${FAILED_POD}" ]]; then
-            echo "WARN: No pod name for log fetch"
-            return 0
-          fi
-          if [[ "${FAILED_STEP}" == "unknown" ]]; then
-            echo "WARN: No step name for log fetch"
-            return 0
-          fi
+        # Best-effort log fetch for a single pod/container
+        # Args: $1=pod $2=step_name $3=tail_lines $4=max_bytes
+        fetch_one_log() {
+          local pod="$1" step="$2" tail_n="$3" max_bytes="$4"
+          local container="step-${step}" log_out="" log_err=""
 
-          echo "LOG_FETCH       --> pod=${FAILED_POD} container=${FAILED_CONTAINER}"
-
-          local LOG_OUTPUT="" LOG_ERR=""
-          # Try step-<name> (Tekton container naming convention)
-          LOG_ERR=$(kctl logs "${FAILED_POD}" -n "${NAMESPACE}" \
-            -c "${FAILED_CONTAINER}" --tail=50 --request-timeout=10s \
+          log_err=$(kctl logs "${pod}" -n "${NAMESPACE}" \
+            -c "${container}" --tail="${tail_n}" --request-timeout=10s \
             2>&1 >/tmp/kctl-logs.out || true)
-          LOG_OUTPUT=$(cat /tmp/kctl-logs.out 2>/dev/null)
+          log_out=$(cat /tmp/kctl-logs.out 2>/dev/null)
 
-          if [[ -z "${LOG_OUTPUT}" ]]; then
-            [[ -n "${LOG_ERR}" ]] && echo "LOG_FETCH       --> step-build err: ${LOG_ERR:0:200}"
-            # Fallback: try raw step name without prefix
-            echo "LOG_FETCH       --> fallback to container=${FAILED_STEP}"
-            LOG_ERR=$(kctl logs "${FAILED_POD}" -n "${NAMESPACE}" \
-              -c "${FAILED_STEP}" --tail=50 --request-timeout=10s \
+          # Fallback: try raw step name
+          if [[ -z "${log_out}" ]]; then
+            log_err=$(kctl logs "${pod}" -n "${NAMESPACE}" \
+              -c "${step}" --tail="${tail_n}" --request-timeout=10s \
               2>&1 >/tmp/kctl-logs.out || true)
-            LOG_OUTPUT=$(cat /tmp/kctl-logs.out 2>/dev/null)
-            [[ -z "${LOG_OUTPUT}" && -n "${LOG_ERR}" ]] && \
-              echo "LOG_FETCH       --> fallback err: ${LOG_ERR:0:200}"
+            log_out=$(cat /tmp/kctl-logs.out 2>/dev/null)
           fi
 
-          if [[ -n "${LOG_OUTPUT}" ]]; then
-            FAILURE_LOGS=$(printf '%s' "${LOG_OUTPUT}" | tail -c 1500)
-            echo "FAILURE_LOGS    --> fetched $(printf '%s' "${FAILURE_LOGS}" | wc -c) bytes"
-          else
-            echo "FAILURE_LOGS    --> unavailable"
-          fi
           rm -f /tmp/kctl-logs.out
+          if [[ -n "${log_out}" ]]; then
+            printf '%s' "${log_out}" | tail -c "${max_bytes}"
+          fi
+        }
+
+        # Fetch logs for ALL failed tasks, store in FAILURE_LOGS_FILE
+        FAILURE_LOGS_FILE="/tmp/failure-logs.txt"
+        : > "${FAILURE_LOGS_FILE}"
+
+        fetch_all_failure_logs() {
+          local count="${FAILED_COUNT}"
+          if [[ "${count}" -eq 0 ]]; then return 0; fi
+
+          # Dynamic budget per task
+          local tail_n=50 max_bytes=1500
+          if [[ "${count}" -ge 4 ]]; then
+            tail_n=10; max_bytes=375
+          elif [[ "${count}" -ge 3 ]]; then
+            tail_n=10; max_bytes=500
+          elif [[ "${count}" -ge 2 ]]; then
+            tail_n=20; max_bytes=750
+          fi
+
+          echo "LOG_BUDGET      --> ${count} tasks, ${tail_n} lines, ${max_bytes} bytes each"
+
+          local i=0
+          while IFS= read -r entry; do
+            local t_task=$(echo "${entry}" | jq -r '.task // "unknown"')
+            local t_step=$(echo "${entry}" | jq -r '.step // "unknown"')
+            local t_pod=$(echo "${entry}" | jq -r '.pod // ""')
+
+            if [[ -z "${t_pod}" || "${t_step}" == "unknown" ]]; then
+              echo "LOG_FETCH[${i}]  --> skip ${t_task} (no pod/step)"
+              i=$((i+1))
+              continue
+            fi
+
+            echo "LOG_FETCH[${i}]  --> ${t_task}: pod=${t_pod} step=${t_step}"
+            local logs=$(fetch_one_log "${t_pod}" "${t_step}" "${tail_n}" "${max_bytes}")
+
+            if [[ -n "${logs}" ]]; then
+              echo "\`${t_task}\` — \`step-${t_step}\`" >> "${FAILURE_LOGS_FILE}"
+              echo '```' >> "${FAILURE_LOGS_FILE}"
+              echo "${logs}" >> "${FAILURE_LOGS_FILE}"
+              echo '```' >> "${FAILURE_LOGS_FILE}"
+              echo "" >> "${FAILURE_LOGS_FILE}"
+              echo "LOG_FETCH[${i}]  --> fetched $(printf '%s' "${logs}" | wc -c) bytes"
+            else
+              echo "LOG_FETCH[${i}]  --> unavailable"
+            fi
+            i=$((i+1))
+          done < <(jq -c '.[]' "${FAILED_DATA_FILE}")
         }
 
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
           exec_action "Discover failure details" discover_failure_details || true
           [[ "${FAILED_TASK}" == "" ]] && FAILED_TASK="unknown"
-          exec_action "Fetch failure logs" fetch_failure_logs || true
+          exec_action "Fetch failure logs" fetch_all_failure_logs || true
         fi
 
         # Detect cancellation: PipelineRun reason OR TaskRun reason
@@ -445,27 +474,48 @@ spec:
           MSG_LINES+=("| **Commit** | \`${COMMIT_SHA:0:12}\` |")
         MSG_LINES+=("")
 
-        # Failure details
+        # Failure details — iterate all failed TaskRuns
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
           MSG_LINES+=("### Failure Details")
-          MSG_LINES+=("| | |")
-          MSG_LINES+=("|-|-|")
-          MSG_LINES+=("| **Task** | ${FAILED_TASK} |")
-          [[ -n "${FAILED_STEP}" && "${FAILED_STEP}" != "unknown" ]] && \
-            MSG_LINES+=("| **Step** | ${FAILED_STEP} (exit ${FAILED_EXIT_CODE}, ${FAILED_REASON}) |")
-          [[ -n "${LOG_SNIPPET}" ]] && \
-            MSG_LINES+=("| **Log** | ${LOG_SNIPPET:0:300} |")
-          [[ -n "${PR_MESSAGE}" ]] && \
-            MSG_LINES+=("| **Summary** | ${PR_MESSAGE:0:300} |")
+          if [[ "${FAILED_COUNT}" -le 1 ]]; then
+            MSG_LINES+=("| | |")
+            MSG_LINES+=("|-|-|")
+            MSG_LINES+=("| **Task** | ${FAILED_TASK} |")
+            [[ -n "${FAILED_STEP}" && "${FAILED_STEP}" != "unknown" ]] && \
+              MSG_LINES+=("| **Step** | ${FAILED_STEP} (exit ${FAILED_EXIT_CODE}, ${FAILED_REASON}) |")
+            [[ -n "${LOG_SNIPPET}" ]] && \
+              MSG_LINES+=("| **Log** | ${LOG_SNIPPET:0:300} |")
+          else
+            MSG_LINES+=("**${FAILED_COUNT} tasks failed:**")
+            MSG_LINES+=("")
+            MSG_LINES+=("| Task | Step | Exit | Reason |")
+            MSG_LINES+=("|-|-|-|-|")
+            while IFS= read -r entry; do
+              f_task=$(echo "${entry}" | jq -r '.task // "unknown"')
+              f_step=$(echo "${entry}" | jq -r '.step // "unknown"')
+              f_exit=$(echo "${entry}" | jq -r '.exit_code // "?"')
+              f_reason=$(echo "${entry}" | jq -r '.reason // "unknown"')
+              MSG_LINES+=("| ${f_task} | ${f_step} | ${f_exit} | ${f_reason} |")
+            done < <(jq -c '.[]' "${FAILED_DATA_FILE}")
+          fi
+          if [[ -n "${PR_MESSAGE}" ]]; then
+            if [[ "${FAILED_COUNT}" -le 1 ]]; then
+              MSG_LINES+=("| **Summary** | ${PR_MESSAGE:0:300} |")
+            else
+              MSG_LINES+=("")
+              MSG_LINES+=("**Summary:** ${PR_MESSAGE:0:300}")
+            fi
+          fi
           MSG_LINES+=("")
 
-          # Container logs from the failed step
-          if [[ -n "${FAILURE_LOGS}" ]]; then
+          # Container logs for each failed task
+          LOG_CONTENT=$(cat "${FAILURE_LOGS_FILE}" 2>/dev/null)
+          if [[ -n "${LOG_CONTENT}" ]]; then
             MSG_LINES+=("### Logs")
-            MSG_LINES+=("\`${FAILED_TASK}\` — \`${FAILED_CONTAINER}\`")
-            MSG_LINES+=('```')
-            MSG_LINES+=("${FAILURE_LOGS}")
-            MSG_LINES+=('```')
+            MSG_LINES+=("${LOG_CONTENT}")
+            if [[ -n "${PIPELINE_URL}" ]]; then
+              MSG_LINES+=("[View full logs in Pipeline UI →](${PIPELINE_URL})")
+            fi
             MSG_LINES+=("")
           fi
         fi

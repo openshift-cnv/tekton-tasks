@@ -297,20 +297,31 @@ spec:
           local count="${FAILED_COUNT}"
           if [[ "${count}" -eq 0 ]]; then return 0; fi
 
-          # Dynamic budget per task
+          # Cap log fetching to first 3 failed tasks
+          local MAX_LOG_TASKS=3
+          local fetch_count="${count}"
+          if [[ "${fetch_count}" -gt "${MAX_LOG_TASKS}" ]]; then
+            fetch_count="${MAX_LOG_TASKS}"
+          fi
+
+          # Dynamic budget per task (based on tasks we'll actually fetch)
           local tail_n=50 max_bytes=1500
-          if [[ "${count}" -ge 4 ]]; then
-            tail_n=10; max_bytes=375
-          elif [[ "${count}" -ge 3 ]]; then
+          if [[ "${fetch_count}" -ge 3 ]]; then
             tail_n=10; max_bytes=500
-          elif [[ "${count}" -ge 2 ]]; then
+          elif [[ "${fetch_count}" -ge 2 ]]; then
             tail_n=20; max_bytes=750
           fi
 
-          echo "LOG_BUDGET      --> ${count} tasks, ${tail_n} lines, ${max_bytes} bytes each"
+          echo "LOG_BUDGET      --> ${count} failed, fetching ${fetch_count}, ${tail_n} lines, ${max_bytes} bytes each"
 
-          local i=0
+          local i=0 fetched=0
           while IFS= read -r entry; do
+            if [[ "${fetched}" -ge "${MAX_LOG_TASKS}" ]]; then
+              echo "LOG_FETCH[${i}]  --> skipped (max ${MAX_LOG_TASKS} logs reached)"
+              i=$((i+1))
+              continue
+            fi
+
             local t_task=$(echo "${entry}" | jq -r '.task // "unknown"')
             local t_step=$(echo "${entry}" | jq -r '.step // "unknown"')
             local t_pod=$(echo "${entry}" | jq -r '.pod // ""')
@@ -331,11 +342,18 @@ spec:
               echo '```' >> "${FAILURE_LOGS_FILE}"
               echo "" >> "${FAILURE_LOGS_FILE}"
               echo "LOG_FETCH[${i}]  --> fetched $(printf '%s' "${logs}" | wc -c) bytes"
+              fetched=$((fetched+1))
             else
               echo "LOG_FETCH[${i}]  --> unavailable"
             fi
             i=$((i+1))
           done < <(jq -c '.[]' "${FAILED_DATA_FILE}")
+
+          # Note remaining tasks in the log file
+          local remaining=$((count - fetched))
+          if [[ "${remaining}" -gt 0 ]]; then
+            echo "*+${remaining} more failed task(s) — see Pipeline UI for full logs.*" >> "${FAILURE_LOGS_FILE}"
+          fi
         }
 
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then

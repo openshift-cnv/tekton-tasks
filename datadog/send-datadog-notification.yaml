@@ -422,6 +422,12 @@ spec:
         # ============================================================
         # BUILD: Tags array (uses resolved APPLICATION/COMPONENT/VERSION)
         # ============================================================
+        # Only include failure tags when pipeline actually failed
+        FAIL_TAGS=""
+        if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
+          FAIL_TAGS="yes"
+        fi
+
         FIXED_TAGS=$(jq -n \
           --arg pipeline "${PIPELINE_NAME}" \
           --arg pipeline_status "${PIPELINE_STATUS}" \
@@ -433,6 +439,7 @@ spec:
           --arg event_type "${EVENT_TYPE}" \
           --arg failed_task "${FAILED_TASK}" \
           --arg failed_step "${FAILED_STEP}" \
+          --arg include_fail "${FAIL_TAGS}" \
           '[
             "service:cnv-tekton-pipelines",
             "source:tekton-task",
@@ -443,10 +450,11 @@ spec:
             ("application:" + $application),
             ("component:" + $component),
             ("version:" + $version),
-            ("event_type:" + $event_type),
+            ("event_type:" + $event_type)
+          ] + (if $include_fail == "yes" then [
             ("failed_task:" + $failed_task),
             ("failed_step:" + $failed_step)
-          ] | map(select(. != null and endswith(":") | not))')
+          ] else [] end) | map(select(. != null and endswith(":") | not))')
 
         ALL_TAGS=$(jq -n \
           --argjson fixed "$FIXED_TAGS" \

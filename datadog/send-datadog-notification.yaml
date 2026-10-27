@@ -307,9 +307,9 @@ spec:
           # Dynamic budget per task (based on tasks we'll actually fetch)
           local tail_n=50 max_bytes=1500
           if [[ "${fetch_count}" -ge 3 ]]; then
-            tail_n=10; max_bytes=500
-          elif [[ "${fetch_count}" -ge 2 ]]; then
             tail_n=20; max_bytes=750
+          elif [[ "${fetch_count}" -ge 2 ]]; then
+            tail_n=30; max_bytes=1000
           fi
 
           echo "LOG_BUDGET      --> ${count} failed, fetching ${fetch_count}, ${tail_n} lines, ${max_bytes} bytes each"

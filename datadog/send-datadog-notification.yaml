@@ -199,12 +199,6 @@ spec:
         exec_action "Discover PipelineRun" discover_pipelinerun_metadata || true
         [[ -z "${PARAM_TAGS_JSON}" || "${PARAM_TAGS_JSON}" == "null" ]] && PARAM_TAGS_JSON="[]"
 
-        # Override status if PipelineRun was cancelled
-        if [[ "${PR_REASON}" =~ ^(PipelineRunCancelled|CancelledRunFinally|StoppedRunFinally|Cancelled)$ ]]; then
-          echo "Cancellation detected (reason: ${PR_REASON}), overriding status to Cancelled"
-          PIPELINE_STATUS="Cancelled"
-        fi
-
         # Derive version from namespace (v4-19-openshift-virtualization-tenant → v4.19)
         VERSION=$(echo "${NAMESPACE}" | grep -oP 'v\d+-\d+' | head -1 | tr '-' '.')
         echo "VERSION         --> ${VERSION:-unknown}"
@@ -259,6 +253,13 @@ spec:
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
           exec_action "Discover failure details" discover_failure_details || true
           [[ "${FAILED_TASK}" == "" ]] && FAILED_TASK="unknown"
+        fi
+
+        # Detect cancellation: PipelineRun reason OR TaskRun reason
+        if [[ "${PR_REASON}" =~ (PipelineRunCancelled|CancelledRunFinally|StoppedRunFinally|Cancelled) ]] || \
+           [[ "${FAILED_REASON}" == "TaskRunCancelled" ]]; then
+          echo "Cancellation detected (PR_REASON=${PR_REASON}, FAILED_REASON=${FAILED_REASON})"
+          PIPELINE_STATUS="Cancelled"
         fi
 
         # ============================================================

@@ -211,6 +211,9 @@ spec:
         FAILED_EXIT_CODE=""
         FAILED_REASON=""
         LOG_SNIPPET=""
+        FAILED_POD=""
+        FAILED_CONTAINER=""
+        FAILURE_LOGS=""
 
         discover_failure_details() {
           local TASK_DATA
@@ -231,7 +234,15 @@ spec:
                message: ([.status.conditions[]? | select(.type=="Succeeded") | .message][0] // ""),
                step: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].name // "unknown"),
                exit_code: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.exitCode // null),
-               reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown")
+               reason: ([.status.steps[]? | select(.terminated.exitCode != 0)][0].terminated.reason // "unknown"),
+               pod: (.status.podName // ""),
+               container: (
+                 ([.status.steps[]? | select(.terminated.exitCode != 0)][0].name // "") as $step |
+                 if $step != "" then $step else
+                   (([.status.conditions[]? | select(.type=="Succeeded") | .message // ""] | first // "")
+                    | gsub("\\\\"; "") | capture("\"(?<c>[^\"]+)\"")? // {} | .c // "")
+                 end
+               )
              }]')
 
           FAILED_TASK=$(echo "${FAILED_DATA}" | jq -r '
@@ -239,20 +250,50 @@ spec:
           FAILED_STEP=$(echo "${FAILED_DATA}" | jq -r '.[0].step // "unknown"')
           FAILED_EXIT_CODE=$(echo "${FAILED_DATA}" | jq -r '.[0].exit_code // "?"')
           FAILED_REASON=$(echo "${FAILED_DATA}" | jq -r '.[0].reason // "unknown"')
+          FAILED_POD=$(echo "${FAILED_DATA}" | jq -r '.[0].pod // ""')
+          FAILED_CONTAINER=$(echo "${FAILED_DATA}" | jq -r '.[0].container // ""')
 
           LOG_SNIPPET=$(echo "${FAILED_DATA}" | jq -r '.[0].message // ""' | head -c 500)
 
           echo "FAILED_TASK     --> ${FAILED_TASK}"
           echo "FAILED_STEP     --> ${FAILED_STEP}"
           echo "FAILED_EXIT     --> ${FAILED_EXIT_CODE} (${FAILED_REASON})"
+          echo "FAILED_POD      --> ${FAILED_POD}"
+          echo "FAILED_CONTAINER--> ${FAILED_CONTAINER}"
           if [[ -n "${LOG_SNIPPET}" ]]; then
             echo "LOG_SNIPPET     --> ${LOG_SNIPPET:0:120}..."
+          fi
+        }
+
+        # Best-effort log fetch from the failed step's pod/container
+        fetch_failure_logs() {
+          if [[ -z "${FAILED_POD}" || -z "${FAILED_CONTAINER}" ]]; then
+            echo "WARN: No pod/container for log fetch"
+            return 0
+          fi
+
+          local LOG_OUTPUT=""
+          LOG_OUTPUT=$(kubectl logs "${FAILED_POD}" -n "${NAMESPACE}" \
+            -c "${FAILED_CONTAINER}" --tail=50 --request-timeout=10s 2>/dev/null || true)
+
+          # Fallback: try step-<name> prefix if direct name failed
+          if [[ -z "${LOG_OUTPUT}" && "${FAILED_CONTAINER}" != step-* ]]; then
+            LOG_OUTPUT=$(kubectl logs "${FAILED_POD}" -n "${NAMESPACE}" \
+              -c "step-${FAILED_CONTAINER}" --tail=50 --request-timeout=10s 2>/dev/null || true)
+          fi
+
+          if [[ -n "${LOG_OUTPUT}" ]]; then
+            FAILURE_LOGS=$(printf '%s' "${LOG_OUTPUT}" | tail -c 1500)
+            echo "FAILURE_LOGS    --> fetched $(printf '%s' "${FAILURE_LOGS}" | wc -c) bytes"
+          else
+            echo "FAILURE_LOGS    --> unavailable"
           fi
         }
 
         if [[ "${PIPELINE_STATUS}" == "Failed" ]]; then
           exec_action "Discover failure details" discover_failure_details || true
           [[ "${FAILED_TASK}" == "" ]] && FAILED_TASK="unknown"
+          exec_action "Fetch failure logs" fetch_failure_logs || true
         fi
 
         # Detect cancellation: PipelineRun reason OR TaskRun reason
@@ -398,6 +439,16 @@ spec:
           [[ -n "${PR_MESSAGE}" ]] && \
             MSG_LINES+=("| **Summary** | ${PR_MESSAGE:0:300} |")
           MSG_LINES+=("")
+
+          # Container logs from the failed step
+          if [[ -n "${FAILURE_LOGS}" ]]; then
+            MSG_LINES+=("### Logs")
+            MSG_LINES+=("\`${FAILED_TASK}\` — \`${FAILED_CONTAINER}\`")
+            MSG_LINES+=('```')
+            MSG_LINES+=("${FAILURE_LOGS}")
+            MSG_LINES+=('```')
+            MSG_LINES+=("")
+          fi
         fi
 
         # Links

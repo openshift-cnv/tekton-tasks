@@ -56,6 +56,8 @@ spec:
             description: Release CR name
           - name: release-failed
             description: '"release-failed" when ManagedPipelineProcessed != True; used by the finally block to suppress the Slack alert (the release pipeline reports release status).'
+          - name: triggered-user
+            description: 'User who triggered the release (from payload.yaml), empty if absent'
         steps:
           - name: get-info
             image: quay.io/konflux-ci/release-service-utils:105474114b10c0bd52eda96bc67490447131b784
@@ -72,6 +74,7 @@ spec:
               printf 'unknown' > /tekton/results/channel
               printf 'unknown' > /tekton/results/hco-bundle-version
               printf 'release-not-failed' > /tekton/results/release-failed
+              printf '' > /tekton/results/triggered-user
 
               snapshot_id=$(echo "$(params.SNAPSHOT)" | awk -F'/' '{print $2}')
               release_id=$(kubectl get release --sort-by=.metadata.creationTimestamp -o json | \
@@ -121,6 +124,15 @@ spec:
               git config --global user.name "${github_username}"
               git config --global user.email "no-reply@redhat.com"
 
+              # Read triggered_user from the source prod payload (if it exists)
+              source_payload="${cnv_version//./-}/lanes/${channel}/prod/payload.yaml"
+              triggered_user=""
+              if [[ -f "${source_payload}" ]]; then
+                triggered_user=$(yq '.triggered_user // ""' "${source_payload}")
+                echo "TRIGGERED_USER --> ${triggered_user}"
+              fi
+              printf '%s' "${triggered_user}" > /tekton/results/triggered-user
+
               case $(params.ENVIRONMENT) in
               "production")
                 NEXT_STAGE="verify-production-release"
@@ -162,6 +174,11 @@ spec:
                 yq -i '.firstRelease = false' ${save_folder}/payload.yaml
               fi
 
+
+              # Preserve triggered_user for downstream stages
+              if [[ -n "${triggered_user}" ]]; then
+                yq e ".triggered_user = \"${triggered_user}\"" -i ${save_folder}/payload.yaml
+              fi
 
               git add .
               git commit -m "Update payload $hco_bundle_version"
@@ -381,7 +398,7 @@ spec:
         - name: namespace
           value: $(context.pipelineRun.namespace)
         - name: tags
-          value: "application:$(tasks.get-info.results.application),component:$(tasks.get-info.results.component),hco_bundle_version:$(tasks.get-info.results.hco-bundle-version),cnv_version:$(params.cnv_version),environment:$(params.environment),channel:$(tasks.get-info.results.channel),release_name:$(tasks.get-info.results.release-name),release_failed:$(tasks.get-info.results.release-failed),snapshot:$(params.snapshot)"
+          value: "application:$(tasks.get-info.results.application),component:$(tasks.get-info.results.component),hco_bundle_version:$(tasks.get-info.results.hco-bundle-version),cnv_version:$(params.cnv_version),environment:$(params.environment),channel:$(tasks.get-info.results.channel),release_name:$(tasks.get-info.results.release-name),release_failed:$(tasks.get-info.results.release-failed),snapshot:$(params.snapshot),triggered_user:$(tasks.get-info.results.triggered-user)"
       taskRef:
         resolver: git
         params:

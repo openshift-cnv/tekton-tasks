@@ -1,0 +1,448 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.appstudio.openshift.io/type: build
+  name: run-cnv-smoke-tests
+spec:
+  description: |
+    TBD
+  params:
+    - description: Source Repository URL
+      name: git-url
+      type: string
+    - description: Revision of the Source Repository
+      default: ""
+      name: revision
+      type: string
+    - description: Path to the source code of an application's component from where to build image.
+      default: .
+      name: path-context
+      type: string
+    - name: prow-job
+      type: string
+    - name: pull-request-number
+      type: string
+      default: ""
+      description: PR number provided by PaC via {{pull_request_number}}
+    - name: debug
+      type: string
+      default: "false"
+      description: Enable debug mode with verbose output (set -x)
+  tasks:
+    - name: run-smoke-tests
+      timeout: 4h0m0s
+      params:
+        - name: git-url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+        - name: path-context
+          value: $(params.path-context)
+        - name: prow-job
+          value: $(params.prow-job)
+      taskSpec:
+        params:
+          - name: git-url
+          - name: revision
+          - name: path-context
+          - name: prow-job
+        results:
+          - name: IMAGE_DIGEST
+            description: Digest of the image just built
+          - name: IMAGE_URL
+            description: Image repository and tag where the built image was pushed
+          - name: IMAGES
+            description: List of all referenced image manifests
+          - name: IMAGE_REF
+            description: Image reference of the built image containing both the repository and the digest
+          - name: SBOM_BLOB_URL
+            description: Reference of SBOM blob digest to enable digest-based verification from provenance
+            type: string
+        volumes:
+          - name: credentials
+            emptyDir: {}
+          - name: github-app-private-key
+            secret:
+              secretName: github-secrets
+              items:
+                - key: GITHUB_APP_PRIVATE_KEY
+                  path: github_app_private_key.pem
+        steps:
+          - name: trigger-prow-job-via-gangway
+            image: quay.io/cnv-qe-devops/gangway:latest
+            env:
+              - name: GIT_REVISION
+                value: $(params.revision)
+              - name: GIT_REPOSITORY
+                value: $(params.git-url)
+              - name: PATH_CONTEXT
+                value: $(params.path-context)
+              - name: PROW_JOB_NAME
+                value: $(params.prow-job)
+              - name: GANGWAY_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GANGWAY_TOKEN
+              - name: GIT_USER_NAME
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GIT_USER_NAME
+              - name: GIT_USER_EMAIL
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GIT_USER_EMAIL
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_APP_ID
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_TOKEN
+            volumeMounts:
+              - name: credentials
+                mountPath: /credentials
+              - name: github-app-private-key
+                mountPath: /credentials/github-app
+                readOnly: true
+            script: |
+              #!/bin/bash
+
+              set -xeuo pipefail
+
+              git clone "${GIT_REPOSITORY}" repo && pushd "repo/${PATH_CONTEXT}" && git checkout "${GIT_REVISION}"
+
+              SOURCE_BRANCH=$(git branch -r --contains HEAD | grep -v '/HEAD' | head -1 | sed 's|.*origin/||' | xargs)
+              echo "Source branch resolved: ${SOURCE_BRANCH}"
+
+              export JOB_INFO_FILE="/tmp/prow.yaml"
+              export CNV_OPERATOR_CHANNEL=$(yq '.channel' payload.yaml)
+              export FREIGHT_NAME=$(yq '.freightName' payload.yaml)
+              export HCO_BUNDLE_REGISTRY_BY_SHA=$(yq '.hco_bundle_registry_by_sha' payload.yaml)
+              export HCO_BUNDLE_REGISTRY_BY_TAG=$(yq '.hco_bundle_registry_by_tag' payload.yaml)
+              export HCO_BUNDLE_VERSION=$(yq '.hco_bundle_version' payload.yaml)
+              export SNAPSHOT_ID=$(yq '.snapshot_id' payload.yaml)
+              export CNV_CATALOG_IMAGE=$(yq '.index_image' payload.yaml)
+              popd
+
+              uv run gangway.py \
+                  --trigger "${PROW_JOB_NAME}" \
+                  --write-job-info-file ${JOB_INFO_FILE} \
+                  -e CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
+                  -e CNV_OPERATOR_CHANNEL=${CNV_OPERATOR_CHANNEL} \
+                  -e HCO_BUNDLE_VERSION=${HCO_BUNDLE_VERSION}
+
+              PROW_JOB_ID=$(yq '.prowJobId' ${JOB_INFO_FILE})
+
+              uv run gangway.py \
+                  --write-job-info-file ${JOB_INFO_FILE} \
+                  --wait-job-id ${PROW_JOB_ID} || exit_code=$?
+
+              export PROW_JOB_STATE=$(yq '.prowJobState' ${JOB_INFO_FILE})
+              export PROW_JOB_URL=$(yq '.prowJobUrl' ${JOB_INFO_FILE})
+              export PROW_JOB_YAML=$(yq '.prowJobYamlUrl' ${JOB_INFO_FILE})
+
+              pushd "repo/${PATH_CONTEXT}"
+
+              yq --null-input \
+                '
+                .bundle        = env(HCO_BUNDLE_VERSION)   |
+                .channel       = env(CNV_OPERATOR_CHANNEL) |
+                .payloadCommit = env(GIT_REVISION)         |
+                .prowJobUrl    = env(PROW_JOB_URL)         |
+                .prowJobYaml   = env(PROW_JOB_YAML)        |
+                .freightName   = env(FREIGHT_NAME)         |
+                .smokeResults  = env(PROW_JOB_STATE)       |
+                .snapshotID    = env(SNAPSHOT_ID)
+                ' | yq 'sort_keys(..)' | tee smokeResults.yaml
+
+              git config user.name "${GIT_USER_NAME}"
+              git config user.email "${GIT_USER_EMAIL}"
+
+              git add smokeResults.yaml
+              git commit -m "Update Smoke Results For ${HCO_BUNDLE_VERSION}"
+
+              git checkout -B "${SOURCE_BRANCH}"
+
+              # Generate GitHub App token for push
+              APP_PEM="/credentials/github-app/github_app_private_key.pem"
+              NOW=$(date +%s)
+              IAT=$((NOW - 60))
+              EXP=$((NOW + 600))
+              JWT_HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT_PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT_SIGNATURE=$(printf '%s.%s' "${JWT_HEADER}" "${JWT_PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT="${JWT_HEADER}.${JWT_PAYLOAD}.${JWT_SIGNATURE}"
+
+              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+              INSTALL_ID=$(curl -s \
+                -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO_SLUG}/installation" \
+                | jq -r '.id')
+              PUSH_TOKEN=$(curl -s -X POST \
+                -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" \
+                | jq -r '.token')
+
+              git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO_SLUG}.git" "${SOURCE_BRANCH}"
+
+              if [[ "${exit_code:-0}" != "0" ]]; then
+                echo ""
+                echo "error: Smoke test failed"
+                echo "  Prow Job State: ${PROW_JOB_STATE}"
+                echo "  Prow Job URL:   ${PROW_JOB_URL}"
+                echo "  Bundle Version: ${HCO_BUNDLE_VERSION}"
+              fi
+
+              exit ${exit_code:-0}
+
+  finally:
+    - name: manage-pull-request
+      params:
+        - name: test-status
+          value: $(tasks.run-smoke-tests.status)
+        - name: pull-request-number
+          value: $(params.pull-request-number)
+        - name: git-url
+          value: $(params.git-url)
+        - name: path-context
+          value: $(params.path-context)
+        - name: debug
+          value: $(params.debug)
+      taskSpec:
+        params:
+          - name: test-status
+          - name: pull-request-number
+          - name: git-url
+          - name: path-context
+          - name: debug
+        volumes:
+          - name: github-app-private-key
+            secret:
+              secretName: github-secrets
+              items:
+                - key: GITHUB_APP_PRIVATE_KEY
+                  path: github_app_private_key.pem
+        steps:
+          - name: merge-or-close-pr
+            image: quay.io/cnv-qe-devops/gangway:latest
+            env:
+              - name: TEST_STATUS
+                value: $(params.test-status)
+              - name: PR_NUMBER
+                value: $(params.pull-request-number)
+              - name: GIT_REPOSITORY
+                value: $(params.git-url)
+              - name: PATH_CONTEXT
+                value: $(params.path-context)
+              - name: GITHUB_APP_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_APP_ID
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: github-secrets
+                    key: GITHUB_TOKEN
+            volumeMounts:
+              - name: github-app-private-key
+                mountPath: /credentials/github-app
+                readOnly: true
+            script: |
+              #!/usr/bin/env bash
+
+              # ============================================================
+              # EXECUTION LAYER
+              # ============================================================
+              SCRIPT_START=$(date +%s)
+              declare -a ACTION_LOG=()
+              FINAL_EXIT_CODE=0
+
+              if [[ "$(params.debug)" == "true" ]]; then set -x; fi
+
+              execution_summary() {
+                local script_exit_code=$?
+                local script_end=$(date +%s)
+                local total_duration=$((script_end - SCRIPT_START))
+                echo ""
+                echo "╔═════════════════════════════════════════════════════════════"
+                echo "║ EXECUTION SUMMARY - manage-pull-request"
+                echo "║ Total Duration: ${total_duration}s"
+                echo "║ Final Exit Code: ${FINAL_EXIT_CODE:-$script_exit_code}"
+                echo "╠═════════════════════════════════════════════════════════════"
+                for entry in "${ACTION_LOG[@]}"; do
+                  local status=$(echo "$entry" | cut -d'|' -f1)
+                  local action=$(echo "$entry" | cut -d'|' -f2)
+                  local details=$(echo "$entry" | cut -d'|' -f3-)
+                  case "$status" in
+                    OK) echo "║ ✓ $action ($details)" ;;
+                    FAILED) echo "║ ✗ $action ($details)" ;;
+                  esac
+                done
+                echo "╚═════════════════════════════════════════════════════════════"
+                exit ${FINAL_EXIT_CODE:-$script_exit_code}
+              }
+              trap execution_summary EXIT
+
+              # ============================================================
+              # RUN LOGIC
+              # ============================================================
+              set -eo pipefail
+
+              # --- Validate PR number ---
+              if [[ -z "${PR_NUMBER}" ]]; then
+                echo "INFO: No pull-request-number provided — skipping PR management"
+                ACTION_LOG+=("OK|Skip - no PR number|exit=0|0s")
+                FINAL_EXIT_CODE=0
+                exit 0
+              fi
+
+              echo "PR Number:    ${PR_NUMBER}"
+              echo "Test Status:  ${TEST_STATUS}"
+              ACTION_LOG+=("OK|PR #${PR_NUMBER} identified|exit=0|0s")
+
+              # --- Generate GitHub App installation token ---
+              REPO_SLUG=$(echo "${GIT_REPOSITORY}" | sed -E 's|.*github\.com[:/]||; s|\.git$||')
+              APP_PEM="/credentials/github-app/github_app_private_key.pem"
+
+              REPO_INFO=$(curl -s "https://api.github.com/repos/${REPO_SLUG}")
+              IS_FORK=$(echo "${REPO_INFO}" | jq -r '.fork // false')
+              if [[ "${IS_FORK}" == "true" ]]; then
+                UPSTREAM_SLUG=$(echo "${REPO_INFO}" | jq -r '.parent.full_name')
+                echo "Fork detected: ${REPO_SLUG} -> upstream: ${UPSTREAM_SLUG}"
+                REPO_SLUG="${UPSTREAM_SLUG}"
+              fi
+              GH_API="https://api.github.com/repos/${REPO_SLUG}"
+
+              NOW=$(date +%s)
+              IAT=$((NOW - 60))
+              EXP=$((NOW + 600))
+              HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "${IAT}" "${EXP}" "${GITHUB_APP_ID}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              SIGNATURE=$(printf '%s.%s' "${HEADER}" "${PAYLOAD}" | openssl dgst -sha256 -sign "${APP_PEM}" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+              JWT="${HEADER}.${PAYLOAD}.${SIGNATURE}"
+
+              INSTALLATION_ID=$(curl -s -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "${GH_API}/installation" | jq -r '.id')
+
+              if [[ -z "${INSTALLATION_ID}" || "${INSTALLATION_ID}" == "null" ]]; then
+                echo "ERROR: Could not find GitHub App installation for ${REPO_SLUG}"
+                ACTION_LOG+=("FAILED|GitHub App auth|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+
+              GITHUB_TOKEN=$(curl -s -X POST \
+                -H "Authorization: Bearer ${JWT}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens" \
+                | jq -r '.token')
+
+              if [[ -z "${GITHUB_TOKEN}" || "${GITHUB_TOKEN}" == "null" ]]; then
+                echo "ERROR: Could not generate installation token"
+                ACTION_LOG+=("FAILED|GitHub App token|exit=1|0s")
+                FINAL_EXIT_CODE=1
+                exit 1
+              fi
+              ACTION_LOG+=("OK|GitHub App auth|exit=0|0s")
+
+              gh_api_call() {
+                local method="$1" endpoint="$2" data="${3:-}"
+                local response http_code
+                if [[ -n "${data}" ]]; then
+                  response=$(curl -s -w "\n%{http_code}" -X "${method}" \
+                    -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "Content-Type: application/json" \
+                    -d "${data}" \
+                    "${GH_API}${endpoint}")
+                else
+                  response=$(curl -s -w "\n%{http_code}" -X "${method}" \
+                    -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "${GH_API}${endpoint}")
+                fi
+                http_code=$(echo "${response}" | tail -1)
+                local body
+                body=$(echo "${response}" | sed '$d')
+                if [[ "${http_code}" -ge 200 && "${http_code}" -lt 300 ]]; then
+                  echo "${body}"
+                  return 0
+                else
+                  echo "HTTP ${http_code}: $(echo "${body}" | jq -r '.message // "unknown error"')"
+                  return 1
+                fi
+              }
+
+              # --- Merge or close PR based on task status ---
+              if [[ "${TEST_STATUS}" == "Succeeded" ]]; then
+                echo ""
+                echo "Smoke tests PASSED — merging PR #${PR_NUMBER}"
+
+                # Update PR branch if behind base (required by branch protection)
+                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/update-branch" '{}' 2>/dev/null; then
+                  echo "INFO: Branch already up to date or update not needed"
+                fi
+                sleep 3
+
+                if ! gh_api_call PUT "/pulls/${PR_NUMBER}/merge" \
+                  "{\"merge_method\":\"merge\",\"commit_message\":\"Merged by smoke-test pipeline\"}"; then
+                  echo "ERROR: Failed to merge PR #${PR_NUMBER}"
+                  ACTION_LOG+=("FAILED|Merge PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Merge PR #${PR_NUMBER}|exit=0|0s")
+              else
+                echo ""
+                echo "Smoke tests FAILED (status: ${TEST_STATUS}) — closing PR #${PR_NUMBER}"
+
+                # Fetch smokeResults.yaml from the PR branch for failure details
+                PR_INFO=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${GH_API}/pulls/${PR_NUMBER}")
+                PR_BRANCH=$(echo "${PR_INFO}" | jq -r '.head.ref // empty')
+                FAILURE_DETAILS=""
+                if [[ -n "${PR_BRANCH}" ]]; then
+                  SMOKE_FILE=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github.raw" \
+                    "${GH_API}/contents/${PATH_CONTEXT}/smokeResults.yaml?ref=${PR_BRANCH}" 2>/dev/null || true)
+                  PROW_URL=$(echo "${SMOKE_FILE}" | yq -r '.prowJobUrl' 2>/dev/null || true)
+                  PROW_STATE=$(echo "${SMOKE_FILE}" | yq -r '.smokeResults' 2>/dev/null || true)
+                  BUNDLE_VER=$(echo "${SMOKE_FILE}" | yq -r '.bundle' 2>/dev/null || true)
+                  if [[ -n "${PROW_URL}" && "${PROW_URL}" != "null" ]]; then
+                    FAILURE_DETAILS="\\n\\n**Details:**\\n- Bundle: ${BUNDLE_VER}\\n- Prow Result: ${PROW_STATE}\\n- [Prow Job Logs](${PROW_URL})"
+                  fi
+                fi
+
+                COMMENT_BODY="Smoke tests failed (task status: ${TEST_STATUS}). Closing PR without merge.${FAILURE_DETAILS}"
+                gh_api_call POST "/issues/${PR_NUMBER}/comments" \
+                  "{\"body\":\"${COMMENT_BODY}\"}" \
+                  && ACTION_LOG+=("OK|Comment on PR #${PR_NUMBER}|exit=0|0s") \
+                  || ACTION_LOG+=("FAILED|Comment on PR #${PR_NUMBER}|exit=1|0s")
+                if ! gh_api_call PATCH "/pulls/${PR_NUMBER}" '{"state":"closed"}'; then
+                  echo "ERROR: Failed to close PR #${PR_NUMBER}"
+                  ACTION_LOG+=("FAILED|Close PR #${PR_NUMBER}|exit=1|0s")
+                  FINAL_EXIT_CODE=1
+                  exit 1
+                fi
+                ACTION_LOG+=("OK|Close PR #${PR_NUMBER}|exit=0|0s")
+              fi
+
+              FINAL_EXIT_CODE=0
+
+  workspaces:
+    - name: git-auth
+      optional: true
+    - name: netrc
+      optional: true

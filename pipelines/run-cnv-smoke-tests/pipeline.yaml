@@ -134,7 +134,7 @@ spec:
               uv run gangway.py \
                   --trigger "${PROW_JOB_NAME}" \
                   --write-job-info-file ${JOB_INFO_FILE} \
-                  -e CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
+                  -e MULTISTAGE_PARAM_OVERRIDE_CNV_CATALOG_IMAGE=${CNV_CATALOG_IMAGE} \
                   -e CNV_OPERATOR_CHANNEL=${CNV_OPERATOR_CHANNEL} \
                   -e HCO_BUNDLE_VERSION=${HCO_BUNDLE_VERSION}
 

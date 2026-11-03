@@ -1,0 +1,407 @@
+# fbc/report-fbc-build-status.yaml
+# @ai-rules:
+# 1. [Pattern]: Resilient Execution Layer — exec_action, execution_summary, trap.
+# 2. [Constraint]: FINAL_EXIT_CODE=0 always — this is a fail-safe task, never fail the build.
+# 3. [Pattern]: Secret is `smartsheets` (keys: token, SheetId), same as fbc-post-release.yaml.
+# 4. [Gotcha]: BundleID in commit message is already in sheet format — no sed transform needed.
+# 5. [Gotcha]: L0 version rows use `v4.21` format (keep `v` prefix).
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: report-fbc-build-status
+  annotations:
+    description: |
+      Reports FBC catalog build status to Smartsheet by updating existing hco-bundle-registry
+      L2 rows with FBC Stage/Prod status, PipelineRun name, and channel.
+      Referenced via git resolver from fbc-pipeline finally block.
+spec:
+  params:
+  - name: git-url
+    type: string
+  - name: revision
+    type: string
+  - name: pipelinerun-name
+    type: string
+  - name: pipelinerun-namespace
+    type: string
+  - name: PIPELINE_AGGREGATE_STATUS
+    type: string
+  - name: DEBUG
+    type: string
+    default: "false"
+  steps:
+  - name: post-fbc-status
+    image: quay.io/konflux-ci/release-service-utils@sha256:dd7fa6a8d8ade6fbc3ad30d974bb72cdefbdf7fd6a9eafa19c09d0146ece67c1
+    env:
+    - name: SMARTSHEET_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: smartsheets
+          key: token
+          optional: true
+    - name: SHEET_ID
+      valueFrom:
+        secretKeyRef:
+          name: smartsheets
+          key: SheetId
+          optional: true
+    script: |
+      #!/usr/bin/env bash
+
+      # ============================================================
+      # EXECUTION LAYER - Resilient wrapper for observability
+      # ============================================================
+      SCRIPT_START=$(date +%s)
+      declare -a ACTION_LOG=()
+      FINAL_EXIT_CODE=0
+
+      if [[ "$(params.DEBUG)" == "true" ]]; then set -x; fi
+
+      exec_action() {
+        local action_name="$1"
+        local timeout_secs="${2:-60}"
+        shift 2
+        local cmd="$*"
+
+        local start_ts=$(date +%s)
+        echo ""
+        echo "┌─────────────────────────────────────────────────────────────"
+        echo "│ ACTION: $action_name"
+        echo "│ TIMEOUT: ${timeout_secs}s"
+        echo "├─────────────────────────────────────────────────────────────"
+
+        local output exit_code
+        output=$(timeout "$timeout_secs" bash -c "$cmd" 2>&1)
+        exit_code=$?
+
+        local end_ts=$(date +%s)
+        local duration=$((end_ts - start_ts))
+
+        if [[ -n "$output" ]]; then
+          echo "$output" | sed 's/^/│ /'
+        fi
+
+        local status
+        if [[ $exit_code -eq 0 ]]; then
+          status="OK"
+        elif [[ $exit_code -eq 124 ]]; then
+          status="TIMEOUT"
+        else
+          status="FAILED"
+        fi
+
+        echo "├─────────────────────────────────────────────────────────────"
+        echo "│ STATUS: $status (exit: $exit_code, duration: ${duration}s)"
+        echo "└─────────────────────────────────────────────────────────────"
+
+        ACTION_LOG+=("$status|$action_name|exit=$exit_code|${duration}s")
+        return $exit_code
+      }
+
+      execution_summary() {
+        local script_end=$(date +%s)
+        local total_duration=$((script_end - SCRIPT_START))
+
+        echo ""
+        echo "╔═════════════════════════════════════════════════════════════"
+        echo "║ EXECUTION SUMMARY - report-fbc-build-status"
+        echo "║ Total Duration: ${total_duration}s"
+        echo "║ Final Exit Code: ${FINAL_EXIT_CODE}"
+        echo "╠═════════════════════════════════════════════════════════════"
+
+        local ok_count=0 fail_count=0 timeout_count=0
+
+        for entry in "${ACTION_LOG[@]}"; do
+          local status=$(echo "$entry" | cut -d'|' -f1)
+          local action=$(echo "$entry" | cut -d'|' -f2)
+          local details=$(echo "$entry" | cut -d'|' -f3-)
+
+          case "$status" in
+            OK) ok_count=$((ok_count + 1)); echo "║ ✓ $action ($details)" ;;
+            FAILED) fail_count=$((fail_count + 1)); echo "║ ✗ $action ($details)" ;;
+            TIMEOUT) timeout_count=$((timeout_count + 1)); echo "║ ⏱ $action ($details)" ;;
+          esac
+        done
+
+        echo "╠═════════════════════════════════════════════════════════════"
+        echo "║ OK: $ok_count | FAILED: $fail_count | TIMEOUT: $timeout_count"
+        echo "╚═════════════════════════════════════════════════════════════"
+
+        exit ${FINAL_EXIT_CODE}
+      }
+
+      trap execution_summary EXIT
+
+      # ============================================================
+      # RUN LOGIC
+      # ============================================================
+      set -uo pipefail
+
+      GIT_URL="$(params.git-url)"
+      REVISION="$(params.revision)"
+      PR_NAME="$(params.pipelinerun-name)"
+      PR_NS="$(params.pipelinerun-namespace)"
+      PIPELINE_STATUS="$(params.PIPELINE_AGGREGATE_STATUS)"
+
+      # ── Read PipelineRun metadata ──
+      PR_JSON=$(kubectl get pipelinerun "$PR_NAME" -n "$PR_NS" -o json 2>/dev/null)
+      if [[ $? -ne 0 || -z "$PR_JSON" ]]; then
+        ACTION_LOG+=("FAILED|Read PipelineRun|exit=1|0s")
+        echo "Could not read PipelineRun $PR_NAME in $PR_NS (RBAC?)"
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Read PipelineRun|exit=0|0s")
+
+      # ── Guard: only push events ──
+      EVENT_TYPE=$(echo "$PR_JSON" | jq -r \
+        '.metadata.labels["pipelinesascode.tekton.dev/event-type"] // empty')
+      if [[ "$EVENT_TYPE" != "push" ]]; then
+        echo "Skipping: event-type is '${EVENT_TYPE:-unknown}', not 'push'"
+        ACTION_LOG+=("OK|Skip non-push event|exit=0|0s")
+        exit 0
+      fi
+
+      # ── Parse application label -> version + environment ──
+      APPLICATION=$(echo "$PR_JSON" | jq -r \
+        '.metadata.labels["appstudio.openshift.io/application"] // empty')
+      if [[ -z "$APPLICATION" ]]; then
+        ACTION_LOG+=("FAILED|Parse application label|exit=1|0s")
+        echo "Missing appstudio.openshift.io/application label"
+        exit 0
+      fi
+
+      APP_SUFFIX="${APPLICATION#cnv-fbc-}"
+      if [[ "$APP_SUFFIX" == *-prod ]]; then
+        ENVIRONMENT="prod"
+        VERSION_RAW="${APP_SUFFIX%-prod}"
+      else
+        ENVIRONMENT="stage"
+        VERSION_RAW="$APP_SUFFIX"
+      fi
+      VERSION="${VERSION_RAW//-/.}"
+      ACTION_LOG+=("OK|Parse labels: version=$VERSION env=$ENVIRONMENT|exit=0|0s")
+
+      echo "┌─────────────────────────────────────"
+      echo "│ FBC Build Status Report"
+      echo "├─────────────────────────────────────"
+      echo "│ Version:     $VERSION"
+      echo "│ Environment: $ENVIRONMENT"
+      echo "│ Status:      $PIPELINE_STATUS"
+      echo "│ Revision:    ${REVISION:0:8}"
+      echo "└─────────────────────────────────────"
+
+      # ── Fetch commit message from GitHub API ──
+      REPO_PATH=$(echo "$GIT_URL" | sed -n 's|.*github\.com[:/]\(.*\)\.git$|\1|p; s|.*github\.com[:/]\(.*\)$|\1|p')
+      if [[ -z "$REPO_PATH" ]]; then
+        ACTION_LOG+=("FAILED|Parse GitHub repo from git-url|exit=1|0s")
+        echo "Could not parse GitHub repo from: $GIT_URL"
+        exit 0
+      fi
+
+      COMMIT_JSON=$(curl -sf --max-time 30 \
+        "https://api.github.com/repos/${REPO_PATH}/commits/${REVISION}" 2>/dev/null)
+      if [[ $? -ne 0 || -z "$COMMIT_JSON" ]]; then
+        ACTION_LOG+=("FAILED|Fetch commit message|exit=1|0s")
+        echo "GitHub API failed for ${REVISION:0:8} — skipping"
+        exit 0
+      fi
+      COMMIT_MSG=$(echo "$COMMIT_JSON" | jq -r '.commit.message' | head -1)
+      ACTION_LOG+=("OK|Fetch commit message|exit=0|0s")
+
+      # ── Extract BundleID and channel ──
+      BUNDLE_ID=$(echo "$COMMIT_MSG" | sed -n 's/.*hco-bundle-registry:\([^ ]*\).*/\1/p')
+      CHANNEL=$(echo "$COMMIT_MSG" | sed -n 's/.*on \(.*\) channel/\1/p')
+
+      if [[ -z "$BUNDLE_ID" ]]; then
+        echo "Not a bundle update commit, skipping"
+        echo "Commit: $COMMIT_MSG"
+        ACTION_LOG+=("OK|Skip non-bundle commit|exit=0|0s")
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Extract BundleID=$BUNDLE_ID channel=${CHANNEL:-unknown}|exit=0|0s")
+
+      # ── Validate secret ──
+      if [[ -z "${SMARTSHEET_TOKEN:-}" || -z "${SHEET_ID:-}" ]]; then
+        ACTION_LOG+=("FAILED|Validate smartsheets secret|exit=1|0s")
+        echo "smartsheets secret not configured (missing token or SheetId)"
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Validate smartsheets secret|exit=0|0s")
+
+      # ── Smartsheet API with retry + exponential backoff ──
+      smartsheet_api_call() {
+        local METHOD="$1" ENDPOINT="$2" DATA="${3:-}"
+        local MAX_RETRIES=3 RETRY_DELAY=2
+
+        for ((i=1; i<=MAX_RETRIES; i++)); do
+          local CURL_ARGS=(-s -w "\n%{http_code}" --max-time 30 -X "$METHOD"
+            "https://api.smartsheet.com/2.0${ENDPOINT}"
+            -H "Authorization: Bearer ${SMARTSHEET_TOKEN}"
+            -H "Content-Type: application/json")
+          [[ -n "$DATA" ]] && CURL_ARGS+=(-d "$DATA")
+
+          RESPONSE=$(curl "${CURL_ARGS[@]}" 2>/dev/null)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          case "$HTTP_CODE" in
+            200|201) echo "$BODY"; return 0 ;;
+            429)
+              echo "WARN: Rate limited, waiting ${RETRY_DELAY}s (attempt $i/$MAX_RETRIES)" >&2
+              sleep "$RETRY_DELAY"; RETRY_DELAY=$((RETRY_DELAY * 2)) ;;
+            401|403)
+              echo "ERROR: Auth failed (HTTP $HTTP_CODE)" >&2; return 1 ;;
+            *)
+              echo "WARN: API error $HTTP_CODE (attempt $i/$MAX_RETRIES)" >&2
+              sleep "$RETRY_DELAY"; RETRY_DELAY=$((RETRY_DELAY * 2)) ;;
+          esac
+        done
+        echo "ERROR: Max retries exceeded" >&2; return 1
+      }
+
+      # ── Discover column IDs ──
+      echo "Discovering Smartsheet columns..."
+      COLUMNS_JSON=$(smartsheet_api_call "GET" "/sheets/${SHEET_ID}/columns" "")
+      if [[ $? -ne 0 || -z "$COLUMNS_JSON" ]]; then
+        ACTION_LOG+=("FAILED|Discover columns|exit=1|0s")
+        echo "Column discovery failed"
+        exit 0
+      fi
+
+      col_id() { echo "$COLUMNS_JSON" | jq -r --arg t "$1" '.data[] | select(.title==$t) | .id'; }
+
+      COL_NAME=$(col_id "Name")
+      COL_BUNDLEID=$(col_id "BundleID")
+      COL_FBC_STAGE=$(col_id "FBC Stage")
+      COL_FBC_STAGE_RUN=$(col_id "FBC Stage Run")
+      COL_FBC_STAGE_CHANNEL=$(col_id "FBC Stage Channel")
+      COL_FBC_PROD=$(col_id "FBC Prod")
+      COL_FBC_PROD_RUN=$(col_id "FBC Prod Run")
+      COL_FBC_PROD_CHANNEL=$(col_id "FBC Prod Channel")
+
+      if [[ -z "$COL_NAME" || "$COL_NAME" == "null" ]]; then
+        ACTION_LOG+=("FAILED|Validate columns|exit=1|0s")
+        echo "Primary column 'Name' not found"
+        exit 0
+      fi
+      if [[ -z "$COL_BUNDLEID" || "$COL_BUNDLEID" == "null" ]]; then
+        ACTION_LOG+=("FAILED|Validate columns|exit=1|0s")
+        echo "Column 'BundleID' not found"
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Discover columns|exit=0|0s")
+
+      # ── Select target columns based on environment ──
+      if [[ "$ENVIRONMENT" == "prod" ]]; then
+        COL_STATUS="$COL_FBC_PROD"
+        COL_RUN="$COL_FBC_PROD_RUN"
+        COL_CHANNEL="$COL_FBC_PROD_CHANNEL"
+      else
+        COL_STATUS="$COL_FBC_STAGE"
+        COL_RUN="$COL_FBC_STAGE_RUN"
+        COL_CHANNEL="$COL_FBC_STAGE_CHANNEL"
+      fi
+
+      if [[ -z "$COL_STATUS" || "$COL_STATUS" == "null" ]]; then
+        ACTION_LOG+=("FAILED|Validate FBC columns|exit=1|0s")
+        echo "FBC columns not found — add them to the Smartsheet first"
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Select ${ENVIRONMENT} columns|exit=0|0s")
+
+      # ── Fetch sheet data and find rows ──
+      SHEET_DATA=$(smartsheet_api_call "GET" "/sheets/${SHEET_ID}" "")
+      if [[ $? -ne 0 || -z "$SHEET_DATA" ]]; then
+        ACTION_LOG+=("FAILED|Fetch sheet data|exit=1|0s")
+        echo "Failed to fetch sheet data"
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Fetch sheet data|exit=0|0s")
+
+      # L0: version row
+      VERSION_ROW_ID=$(echo "$SHEET_DATA" | jq -r --arg v "$VERSION" --argjson c "$COL_NAME" \
+        '[.rows[]? | select(.parentId == null) |
+         select(.cells[]? | select(.columnId == $c and .value == $v))] | first | .id // empty')
+
+      if [[ -z "$VERSION_ROW_ID" || "$VERSION_ROW_ID" == "null" ]]; then
+        ACTION_LOG+=("FAILED|Find L0 version row|exit=1|0s")
+        echo "Version row '$VERSION' not found"
+        exit 0
+      fi
+      echo "Found L0 version row: $VERSION_ROW_ID"
+
+      # L1: hco-bundle-registry application row
+      APP_ROW_ID=$(echo "$SHEET_DATA" | jq -r \
+        --arg app "hco-bundle-registry" --argjson c "$COL_NAME" --argjson pid "$VERSION_ROW_ID" \
+        '[.rows[]? | select(.parentId == $pid) |
+         select(.cells[]? | select(.columnId == $c and .value == $app))] | first | .id // empty')
+
+      if [[ -z "$APP_ROW_ID" || "$APP_ROW_ID" == "null" ]]; then
+        ACTION_LOG+=("FAILED|Find L1 hco-bundle-registry row|exit=1|0s")
+        echo "hco-bundle-registry row not found under '$VERSION'"
+        exit 0
+      fi
+      echo "Found L1 application row: $APP_ROW_ID"
+      ACTION_LOG+=("OK|Find L0=$VERSION_ROW_ID L1=$APP_ROW_ID|exit=0|0s")
+
+      # L2: match by BundleID (last match for duplicates)
+      COMPONENT_ROW_ID=$(echo "$SHEET_DATA" | jq -r \
+        --arg bid "$BUNDLE_ID" --argjson cb "$COL_BUNDLEID" --argjson pid "$APP_ROW_ID" \
+        '[.rows[]? | select(.parentId == $pid) |
+         select(.cells[]? | select(.columnId == $cb and .value == $bid))] | last | .id // empty')
+
+      if [[ -z "$COMPONENT_ROW_ID" || "$COMPONENT_ROW_ID" == "null" ]]; then
+        echo "WARN: No row with BundleID '$BUNDLE_ID' — falling back to latest L2 child"
+        COMPONENT_ROW_ID=$(echo "$SHEET_DATA" | jq -r --argjson pid "$APP_ROW_ID" \
+          '[.rows[]? | select(.parentId == $pid)] | last | .id // empty')
+        if [[ -z "$COMPONENT_ROW_ID" || "$COMPONENT_ROW_ID" == "null" ]]; then
+          ACTION_LOG+=("FAILED|Find L2 component row|exit=1|0s")
+          echo "No L2 rows under hco-bundle-registry for '$VERSION'"
+          exit 0
+        fi
+        echo "Using fallback L2 row: $COMPONENT_ROW_ID"
+      else
+        echo "Found L2 row by BundleID: $COMPONENT_ROW_ID"
+      fi
+      ACTION_LOG+=("OK|Find L2 row=$COMPONENT_ROW_ID|exit=0|0s")
+
+      # ── Map status ──
+      case "$PIPELINE_STATUS" in
+        "Succeeded"|"Completed") DISPLAY_STATUS="Succeeded" ;;
+        "Failed")               DISPLAY_STATUS="Failed" ;;
+        *)                      DISPLAY_STATUS="$PIPELINE_STATUS" ;;
+      esac
+
+      # ── Build cell update payload ──
+      CELLS=$(jq -n \
+        --argjson cs "$COL_STATUS" --arg status "$DISPLAY_STATUS" \
+        --argjson cr "$COL_RUN" --arg run "$PR_NAME" \
+        '[{columnId: $cs, value: $status}, {columnId: $cr, value: $run}]')
+
+      if [[ -n "$COL_CHANNEL" && "$COL_CHANNEL" != "null" && -n "$CHANNEL" ]]; then
+        CELLS=$(echo "$CELLS" | jq --argjson cc "$COL_CHANNEL" --arg ch "$CHANNEL" \
+          '. + [{columnId: $cc, value: $ch}]')
+      fi
+
+      UPDATE_DATA=$(jq -n --argjson rid "$COMPONENT_ROW_ID" --argjson cells "$CELLS" \
+        '[{id: $rid, cells: $cells}]')
+
+      # ── Update row ──
+      smartsheet_api_call "PUT" "/sheets/${SHEET_ID}/rows" "$UPDATE_DATA" >/dev/null
+      if [[ $? -ne 0 ]]; then
+        ACTION_LOG+=("FAILED|Update Smartsheet row|exit=1|0s")
+        echo "Failed to update row $COMPONENT_ROW_ID"
+        exit 0
+      fi
+      ACTION_LOG+=("OK|Update Smartsheet row|exit=0|0s")
+
+      echo ""
+      echo "╔═════════════════════════════════════"
+      echo "║ FBC build status reported"
+      echo "║ Version:     $VERSION"
+      echo "║ Environment: $ENVIRONMENT"
+      echo "║ BundleID:    $BUNDLE_ID"
+      echo "║ Channel:     ${CHANNEL:-unknown}"
+      echo "║ Status:      $DISPLAY_STATUS"
+      echo "║ PipelineRun: $PR_NAME"
+      echo "╚═════════════════════════════════════"

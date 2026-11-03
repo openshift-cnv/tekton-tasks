@@ -1,0 +1,138 @@
+---
+description: Architecture and data flow for the update-bundle pipeline (OCI chart lifecycle, cross-step communication, credential management)
+globs: "pipelines/update-bundle.yaml"
+alwaysApply: false
+---
+
+# update-bundle Pipeline Architecture
+
+## Pipeline Overview
+
+The `update-bundle` pipeline processes HCO bundle registry snapshots from Konflux. It has **two steps** in a single Tekton task, sharing data via `/tekton/results/`.
+
+## Step Architecture
+
+```
+Step 1: update-bundle                    Step 2: push-release-chart
+┌──────────────────────────┐             ┌──────────────────────────────┐
+│ Phase 1: Fetch snapshot  │             │ Phase 1: Check snapshot type │
+│ Phase 2: Clone repo      │             │ Phase 2: Read results        │
+│ Phase 3: Validate commit │             │ Phase 3: Load configuration  │
+│ Phase 4: Update images   │             │ Phase 4: Registry login      │
+│ Phase 5: Commit & push   │             │ Phase 5: Pull skeleton chart │
+│ Phase 6: Prepare release │──results──▶ │ Phase 6: Hydrate Chart.yaml  │
+│          data            │             │ Phase 7: Hydrate values.yaml │
+└──────────────────────────┘             │ Phase 8: Inject snapshots    │
+                                         │ Phase 9: Lint chart          │
+  Results written:                       │ Phase 10: Package chart      │
+  - bundle-version                       │ Phase 11: Push to OCI        │
+  - snapshots-to-release                 └──────────────────────────────┘
+```
+
+## Cross-Step Data Flow
+
+Steps share data via Tekton results at `/tekton/results/`:
+
+| Result | Producer | Consumer | Format | Size Risk |
+|--------|----------|----------|--------|-----------|
+| `bundle-version` | Step 1 Phase 6 | Step 2 Phase 2 | Plain text (`4.20.8-rhel9.47`) | None |
+| `snapshots-to-release` | Step 1 Phase 6 | Step 2 Phase 8 | JSON object | Monitor: Tekton limits results to ~4KB each |
+
+Step 2 gates on snapshot type at Phase 1: if the snapshot name does not contain `hco-bundle-registry`, the step exits 0 immediately.
+
+## Credential Management
+
+### Secrets
+
+| Secret Name | Type | Used By | Purpose |
+|-------------|------|---------|---------|
+| `hco-updater-gitlab-token` | envFrom | Both steps | GitLab API token (`GITLAB_TOKEN` env var) |
+| `quay-builds-creds` | envFrom + volumeMount | Step 2 | Quay robot account credentials |
+
+### Quay Auth Pattern (Step 2)
+
+The `quay-builds-creds` secret is both:
+1. **Volume-mounted** at `/tmp/quay-builds-creds` (provides `.dockerconfigjson` file)
+2. **Injected via envFrom** (keys become env vars; `.dockerconfigjson` is skipped as invalid env name)
+
+The script reads credentials from the volume mount, NOT the env vars:
+```
+Volume mount → read .dockerconfigjson → jq extract username/password → helm registry login quay.io
+```
+
+The login is done **inline** (not through `exec_action`) because the password cannot be safely piped through `bash -c`. A single `helm registry login quay.io` covers ALL quay.io repositories.
+
+### Robot Account
+
+- Name: `openshift-virtualization+konflux_builds_bot`
+- Has write access to: `quay.io/openshift-virtualization/konflux-builds/v{XY}/*`
+- Has read access to: `quay.io/openshift-virtualization/release-chart/*`
+
+## OCI Chart Lifecycle (Skeleton → Hydrate → Push)
+
+### Design Principle
+
+The **skeleton chart** is OS-agnostic (`name: hco-bundle-registry`). The **hydrated chart** inherits the OS suffix from the bundle version, producing OS-specific artifacts.
+
+### Skeleton Chart
+
+- Registry: `quay.io/openshift-virtualization/release-chart/hco-bundle-registry`
+- Version: `0.0.0-skeleton` (configurable via pipeline param)
+- Contains: Chart.yaml, values.yaml, templates/ with placeholder values
+
+### Chart Name Hydration
+
+The chart name is derived from `BUNDLE_VERSION`:
+
+```
+BUNDLE_VERSION       OS_SUFFIX    HYDRATED_CHART_NAME
+4.20.8-rhel9.47  →  rhel9     →  hco-bundle-registry-rhel9
+4.22.1-rhel10.5  →  rhel10    →  hco-bundle-registry-rhel10
+4.12.36 (legacy) →  (none)    →  hco-bundle-registry
+```
+
+Extraction: `cut -d'-' -f2 | cut -d'.' -f1` with defensive guards for null/empty.
+
+### Hydration Fields
+
+| Chart.yaml Field | Source | Example |
+|------------------|--------|---------|
+| `name` | `CHART_NAME` + OS suffix | `hco-bundle-registry-rhel9` |
+| `version` | `SEMVER-releases.RELEASE_NUM` | `4.20.8-releases.47` |
+| `appVersion` | `v` + BUNDLE_VERSION | `v4.20.8-rhel9.47` |
+
+### Push Destination
+
+```
+oci://quay.io/openshift-virtualization/konflux-builds/v{XY}/{HYDRATED_CHART_NAME}:{CHART_VERSION}
+```
+
+Example: `oci://quay.io/openshift-virtualization/konflux-builds/v4-20/hco-bundle-registry-rhel9:4.20.8-releases.47`
+
+## Variable Derivation Map
+
+```
+BUNDLE_VERSION = "4.20.8-rhel9.47"  (from build-bundle.json → Tekton result)
+       │
+       ├──▶ SEMVER = "4.20.8"              (cut -d'-' -f1)
+       ├──▶ RELEASE_NUM = "47"             (grep -oE '[0-9]+$')
+       ├──▶ OS_SUFFIX = "rhel9"            (cut -d'-' -f2 | cut -d'.' -f1)
+       ├──▶ XY = "4-20"                    (cut -d'.' -f1,2 | tr '.' '-')
+       │
+       ├──▶ CHART_VERSION = "4.20.8-releases.47"
+       ├──▶ HYDRATED_CHART_NAME = "hco-bundle-registry-rhel9"
+       ├──▶ APP_VERSION = "v4.20.8-rhel9.47"
+       └──▶ TARGET_REGISTRY = "quay.io/openshift-virtualization/konflux-builds/v4-20"
+```
+
+## Known Gotchas
+
+1. **Double kubectl fetch (Step 1, Phase 1)**: The snapshot is fetched once via `exec_action` (for logging) and once directly (for data capture). `exec_action` runs in a subshell so its output cannot be captured by the caller. Future fix: write output to a temp file.
+
+2. **Token in git clone log (Step 1, Phase 2)**: `REPO_URL_WITH_AUTH` embeds the GitLab token and is logged by `exec_action`'s CMD line. Consider sanitizing the display URL.
+
+3. **jq null OS field**: The jq expression at Step 1 line 345 always produces a dash (`X.Y.Z-{os}.{release}`). If `.os` is null in `build-bundle.json`, BUNDLE_VERSION becomes `4.12.36-null.36`. The hydration code guards against `OS_SUFFIX == "null"`.
+
+4. **Tekton result size limit**: Individual results are capped at ~4KB. If `snapshots-to-release` JSON grows large (many components), it may exceed this. Monitor snapshot counts.
+
+5. **exec_action subshell environment**: `exec_action` runs commands via `timeout ... bash -c "..."`. The child process inherits `HOME` and all exported vars, but does NOT have access to unexported shell functions. Use `export -f` when passing functions.

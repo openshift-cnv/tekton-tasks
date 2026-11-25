@@ -289,7 +289,7 @@ spec:
                   image_name=$(echo "$image_name_sha" | cut -d'@' -f1)
 
                   # Virt-platform-autopilot should also be in the core-params
-                  if [[ ("$image_name" == *"-operator"* || "$image_name" == *"virt-platform-autopilot"*) && "$image_name" != *"-test-"* ]]; then
+                  if [[ ("$image_name" == *"-operator"* || "$image_name" == *"virt-platform-autopilot"*) && "$image_name" != *"-test-"* && "$image_name" != *"-test" ]]; then
                     json_file="components/hco-bundle-registry/core-params.json"
                   else
                     json_file="components/hco-bundle-registry/extra-params.json"
@@ -298,7 +298,7 @@ spec:
                 done
 
                 touch ${snapshots_file}
-                if [[ ! "$APPLICATION" == *"-test-"* ]]; then
+                if [[ "$APPLICATION" != *"-test-"* && "$APPLICATION" != *"-test" ]]; then
                   jq -n \
                     --slurpfile f "$snapshots_file" \
                     --arg app "$APPLICATION" \
@@ -337,7 +337,7 @@ spec:
                 fi
 
                 # Save Snapshot object for GC resilience (stripped, with velero label)
-                if [[ "$APPLICATION" != *"-test-"* ]]; then
+                if [[ "$APPLICATION" != *"-test-"* && "$APPLICATION" != *"-test" ]]; then
                   snapshot_objects_dir="components/hco-bundle-registry/snapshot-objects"
                   mkdir -p "$snapshot_objects_dir"
                   exec_action "Save Snapshot object for ${APPLICATION} (attempt ${attempt}/${MAX_PUSH_RETRIES})" 30 \

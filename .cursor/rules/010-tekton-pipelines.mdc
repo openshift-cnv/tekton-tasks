@@ -1,0 +1,140 @@
+---
+description: Guidelines for Tekton pipeline development with resilient execution patterns
+alwaysApply: true
+---
+
+# Tekton Tasks Repository Guidelines
+
+## Repository Overview
+
+This repository contains Tekton pipelines and tasks for OpenShift Virtualization CI/CD workflows. All pipelines follow the **Resilient Execution Layer** pattern for observability and debugging.
+
+## Key Patterns
+
+### Resilient Execution Layer
+
+Every pipeline step MUST include:
+
+1. **Execution Layer Header** - Initialize tracking at script start:
+```bash
+SCRIPT_START=$(date +%s)
+declare -a ACTION_LOG=()
+FINAL_EXIT_CODE=0
+```
+
+2. **exec_action() wrapper** - Wrap external commands with timeouts and structured logging:
+```bash
+exec_action "Action name" <timeout_secs> "<command>"
+```
+
+3. **execution_summary() trap** - Guarantee summary output on ANY exit:
+```bash
+trap execution_summary EXIT
+```
+
+4. **Fail-fast run logic** - Keep `set -eo pipefail` for business logic after the execution layer.
+
+### Timeout Guidelines
+
+| Command Type | Recommended Timeout |
+|-------------|---------------------|
+| kubectl/oc API calls | 60s |
+| git clone | 120s |
+| git pull/push | 60s |
+| helm pull | 120s |
+| helm push | 120s |
+| helm lint/package | 30s |
+| Registry login | 30s |
+| Validation checks | 30s |
+
+### Validation Requirements
+
+Before executing any command, validate:
+- Required parameters are not empty
+- Environment variables (tokens, credentials) exist
+- Files exist before reading them
+- JSON/YAML is valid before parsing
+
+### Output Formatting
+
+Use box-drawing characters for structured output:
+- `┌─────` Action start
+- `│` Output prefix  
+- `├─────` Status separator
+- `└─────` Action end
+- `╔═════` Summary header
+- `║` Summary lines
+- `╚═════` Summary footer
+
+### Credential Patterns
+
+#### Registry Auth (Quay OCI)
+
+For steps that pull/push OCI artifacts (Helm charts, images):
+1. Mount the docker config secret as a **volume** (provides `.dockerconfigjson` file)
+2. Extract username/password via `jq` from the mounted file
+3. Run `helm registry login <host>` **inline** (not through `exec_action`) -- passwords cannot be safely piped through `bash -c`
+4. A single `helm registry login quay.io` covers ALL quay.io repos the robot has access to
+
+#### Secret Injection
+
+- Use `envFrom` for tokens needed as env vars (e.g., `GITLAB_TOKEN`)
+- Use `volumeMounts` for structured credentials (e.g., `.dockerconfigjson`)
+- Never hardcode credentials in pipeline YAML
+
+### Helm OCI Chart Lifecycle
+
+When pipelines produce Helm charts via OCI:
+
+1. **Pull** a skeleton (template) chart from OCI registry
+2. **Hydrate** Chart.yaml fields (name, version, appVersion) from build metadata
+3. **Hydrate** values.yaml with runtime configuration
+4. **Lint** the hydrated chart (`helm lint .`)
+5. **Package** (`helm package .`) -- filename is `{Chart.yaml name}-{Chart.yaml version}.tgz`
+6. **Push** to target OCI registry (`helm push <file> oci://<registry>`)
+
+`helm package` derives the .tgz filename from `Chart.yaml`, not from shell variables. Always verify `PACKAGE_FILE` matches what `helm package` actually produces.
+
+### Cross-Step Data Sharing
+
+Steps within the same Tekton task share `/tekton/results/`:
+- Step N writes: `echo -n "$VALUE" > /tekton/results/<name>`
+- Step N+1 reads: `cat /tekton/results/<name>`
+- Size limit: ~4KB per result, ~12KB total. Monitor for large JSON payloads.
+
+## File Structure
+
+```
+tekton-tasks/
+├── pipelines/          # Full pipeline definitions
+│   └── *.yaml
+├── fbc/                # FBC-specific tasks
+│   └── *.yaml
+└── README.md
+```
+
+## Pipeline Parameters
+
+Always include a `debug` parameter for verbose output:
+```yaml
+- name: debug
+  type: string
+  default: "false"
+  description: Enable debug mode with verbose output (set -x)
+```
+
+## Testing Changes
+
+Before committing:
+1. Validate YAML syntax: `python3 -c "import yaml; yaml.safe_load(open('file.yaml'))"`
+2. Validate bash syntax: Extract script and run `bash -n script.sh`
+3. Test in a non-production namespace first
+
+## Commit Messages
+
+Format: `<type>(<scope>): <description>`
+
+Examples:
+- `feat(pipeline): add new release automation step`
+- `fix(update-bundle): handle empty snapshot gracefully`
+- `refactor(pipeline): improve error handling and observability`
